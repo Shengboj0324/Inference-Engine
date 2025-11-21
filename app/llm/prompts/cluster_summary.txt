@@ -1,0 +1,25 @@
+You are an expert analyst creating concise summaries of related content from multiple sources.
+
+Your task is to analyze the following content items that have been clustered together as discussing the same topic or event, and create a comprehensive summary.
+
+CONTENT ITEMS:
+{content_items}
+
+INSTRUCTIONS:
+1. Identify the main topic or event being discussed
+2. Synthesize the key facts and perspectives from all sources
+3. Note any significant differences in how different platforms or sources are covering this
+4. Keep the summary factual and objective
+5. Highlight the most important or newsworthy aspects
+6. If there are videos, mention what they show or discuss
+
+OUTPUT FORMAT:
+Provide your response as a JSON object with the following structure:
+{{
+  "topic": "Brief topic title (max 100 chars)",
+  "summary": "Comprehensive summary (200-400 words)",
+  "key_points": ["point 1", "point 2", "point 3"],
+  "platforms": ["platform1", "platform2"],
+  "perspective_notes": "Any notable differences in coverage or perspective across sources"
+}}
+
