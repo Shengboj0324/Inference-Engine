@@ -1,0 +1,215 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: social-media-radar-alerts
+  namespace: production
+  labels:
+    app: social-media-radar
+spec:
+  groups:
+    - name: social-media-radar.api
+      interval: 30s
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total[5m]))
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            component: api
+          annotations:
+            summary: "High error rate detected"
+            description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+        - alert: HighLatency
+          expr: |
+            histogram_quantile(0.95, 
+              sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint)
+            ) > 2
+          for: 5m
+          labels:
+            severity: warning
+            component: api
+          annotations:
+            summary: "High API latency detected"
+            description: "95th percentile latency is {{ $value }}s for endpoint {{ $labels.endpoint }}"
+
+        - alert: APIDown
+          expr: up{job="social-media-radar-api"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: api
+          annotations:
+            summary: "API is down"
+            description: "API instance {{ $labels.instance }} is down"
+
+    - name: social-media-radar.connectors
+      interval: 30s
+      rules:
+        - alert: ConnectorFailureRate
+          expr: |
+            (
+              sum(rate(connector_requests_total{status="error"}[10m])) by (platform)
+              /
+              sum(rate(connector_requests_total[10m])) by (platform)
+            ) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+            component: connector
+          annotations:
+            summary: "High connector failure rate"
+            description: "{{ $labels.platform }} connector failure rate is {{ $value | humanizePercentage }}"
+
+        - alert: ConnectorTimeout
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(connector_request_duration_seconds_bucket[5m])) by (le, platform)
+            ) > 30
+          for: 5m
+          labels:
+            severity: warning
+            component: connector
+          annotations:
+            summary: "Connector timeout detected"
+            description: "{{ $labels.platform }} connector 95th percentile duration is {{ $value }}s"
+
+    - name: social-media-radar.llm
+      interval: 30s
+      rules:
+        - alert: LLMHighErrorRate
+          expr: |
+            (
+              sum(rate(llm_requests_total{status="error"}[10m])) by (provider)
+              /
+              sum(rate(llm_requests_total[10m])) by (provider)
+            ) > 0.1
+          for: 10m
+          labels:
+            severity: critical
+            component: llm
+          annotations:
+            summary: "High LLM error rate"
+            description: "{{ $labels.provider }} error rate is {{ $value | humanizePercentage }}"
+
+        - alert: LLMHighTokenUsage
+          expr: |
+            sum(rate(llm_tokens_used[1h])) by (provider) > 1000000
+          for: 1h
+          labels:
+            severity: warning
+            component: llm
+          annotations:
+            summary: "High LLM token usage"
+            description: "{{ $labels.provider }} token usage is {{ $value }} tokens/hour"
+
+    - name: social-media-radar.database
+      interval: 30s
+      rules:
+        - alert: DatabaseConnectionPoolExhausted
+          expr: |
+            database_connections_active / database_connections_max > 0.9
+          for: 5m
+          labels:
+            severity: critical
+            component: database
+          annotations:
+            summary: "Database connection pool nearly exhausted"
+            description: "Connection pool usage is {{ $value | humanizePercentage }}"
+
+        - alert: SlowDatabaseQueries
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(database_query_duration_seconds_bucket[5m])) by (le, operation)
+            ) > 1
+          for: 5m
+          labels:
+            severity: warning
+            component: database
+          annotations:
+            summary: "Slow database queries detected"
+            description: "95th percentile query time for {{ $labels.operation }} is {{ $value }}s"
+
+    - name: social-media-radar.scraping
+      interval: 30s
+      rules:
+        - alert: ScrapingBlockedRate
+          expr: |
+            (
+              sum(rate(scraping_requests_total{status="blocked"}[10m])) by (domain)
+              /
+              sum(rate(scraping_requests_total[10m])) by (domain)
+            ) > 0.3
+          for: 10m
+          labels:
+            severity: warning
+            component: scraper
+          annotations:
+            summary: "High scraping block rate"
+            description: "{{ $labels.domain }} block rate is {{ $value | humanizePercentage }}"
+
+    - name: social-media-radar.output
+      interval: 30s
+      rules:
+        - alert: OutputGenerationFailures
+          expr: |
+            (
+              sum(rate(output_generation_total{status="error"}[10m])) by (format)
+              /
+              sum(rate(output_generation_total[10m])) by (format)
+            ) > 0.15
+          for: 10m
+          labels:
+            severity: warning
+            component: output
+          annotations:
+            summary: "High output generation failure rate"
+            description: "{{ $labels.format }} generation failure rate is {{ $value | humanizePercentage }}"
+
+        - alert: LowOutputQuality
+          expr: |
+            histogram_quantile(0.5,
+              sum(rate(output_quality_score_bucket[10m])) by (le, format)
+            ) < 0.6
+          for: 10m
+          labels:
+            severity: warning
+            component: output
+          annotations:
+            summary: "Low output quality detected"
+            description: "Median quality score for {{ $labels.format }} is {{ $value }}"
+
+    - name: social-media-radar.system
+      interval: 30s
+      rules:
+        - alert: HighMemoryUsage
+          expr: |
+            (
+              container_memory_usage_bytes{pod=~"social-media-radar.*"}
+              /
+              container_spec_memory_limit_bytes{pod=~"social-media-radar.*"}
+            ) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            component: system
+          annotations:
+            summary: "High memory usage"
+            description: "Pod {{ $labels.pod }} memory usage is {{ $value | humanizePercentage }}"
+
+        - alert: HighCPUUsage
+          expr: |
+            rate(container_cpu_usage_seconds_total{pod=~"social-media-radar.*"}[5m]) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            component: system
+          annotations:
+            summary: "High CPU usage"
+            description: "Pod {{ $labels.pod }} CPU usage is {{ $value | humanizePercentage }}"
+

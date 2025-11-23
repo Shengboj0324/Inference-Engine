@@ -1,0 +1,171 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: social-media-radar-celery-worker
+  namespace: production
+  labels:
+    app: social-media-radar
+    component: celery-worker
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: social-media-radar
+      component: celery-worker
+  template:
+    metadata:
+      labels:
+        app: social-media-radar
+        component: celery-worker
+    spec:
+      serviceAccountName: social-media-radar
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: celery-worker
+          image: social-media-radar:latest
+          imagePullPolicy: Always
+          command: ["celery", "-A", "app.ingestion.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+          env:
+            - name: ENVIRONMENT
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: social-media-radar-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: social-media-radar-secrets
+                  key: redis-url
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: social-media-radar-secrets
+                  key: encryption-key
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: social-media-radar-secrets
+                  key: openai-api-key
+            - name: S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: social-media-radar-config
+                  key: s3-endpoint
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: social-media-radar-secrets
+                  key: s3-access-key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: social-media-radar-secrets
+                  key: s3-secret-key
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: social-media-radar-celery-beat
+  namespace: production
+  labels:
+    app: social-media-radar
+    component: celery-beat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: social-media-radar
+      component: celery-beat
+  template:
+    metadata:
+      labels:
+        app: social-media-radar
+        component: celery-beat
+    spec:
+      serviceAccountName: social-media-radar
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: celery-beat
+          image: social-media-radar:latest
+          imagePullPolicy: Always
+          command: ["celery", "-A", "app.ingestion.celery_app", "beat", "--loglevel=info"]
+          env:
+            - name: ENVIRONMENT
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: social-media-radar-secrets
+                  key: redis-url
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "250m"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: social-media-radar-celery-worker
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: social-media-radar-celery-worker
+  minReplicas: 5
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 85
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+

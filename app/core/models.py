@@ -20,17 +20,23 @@ class MediaType(str, Enum):
 class SourcePlatform(str, Enum):
     """Supported source platforms."""
 
+    # Social Media
     REDDIT = "reddit"
     YOUTUBE = "youtube"
     TIKTOK = "tiktok"
     FACEBOOK = "facebook"
     INSTAGRAM = "instagram"
     WECHAT = "wechat"
+
+    # News Sources
     RSS = "rss"
     NEWSAPI = "newsapi"
-    NYT = "nytimes"
+    NYTIMES = "nytimes"
     WSJ = "wsj"
-    ABC = "abc"
+    ABC_NEWS = "abc_news"
+    ABC_NEWS_AU = "abc_news_au"
+    GOOGLE_NEWS = "google_news"
+    APPLE_NEWS = "apple_news"
 
 
 class ContentItem(BaseModel):

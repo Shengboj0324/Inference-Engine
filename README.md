@@ -12,13 +12,16 @@ Social Media Radar is a **compliance-first, multi-channel intelligence aggregati
 
 ### Key Features
 
-- 🔌 **Pluggable Connectors**: Reddit, YouTube, RSS, TikTok, and more
+- 🔌 **13 Platform Connectors**: Reddit, YouTube, TikTok, Facebook, Instagram, WeChat, NYTimes, WSJ, ABC News, Google News, Apple News, RSS
+- 🕷️ **Advanced Scraping**: Production-grade web scraping with anti-detection, proxy rotation, and compliance
 - 🔐 **Privacy-First**: Your data, your tokens, your control
 - 🤖 **AI-Powered**: Smart clustering, summarization, and relevance ranking
+- 🎨 **Multi-Format Output**: 14 output formats including text, images, videos, infographics, podcasts
 - 📊 **Cross-Platform Analysis**: See how different sources cover the same story
-- 🎯 **Personalized**: Tailored to your interests and preferences
+- 🎯 **Personalized**: Tailored to your interests and output preferences
 - 🔧 **MCP Integration**: Works with Model Context Protocol clients
-- 📦 **Self-Hosted**: Run it on your infrastructure
+- 📦 **Production-Ready**: Kubernetes deployment, monitoring, CI/CD
+- 🛡️ **Security Hardened**: Encryption, rate limiting, input validation
 
 ### How It Works
 
@@ -73,8 +76,26 @@ Your Sources → Ingestion → Normalization → AI Analysis → Daily Digest
 Social Media Radar is built on five core layers:
 
 ### 1. Ingestion & Connectors
+
+**Social Media Platforms (6)**:
+- Reddit (PRAW + OAuth 2.0)
+- YouTube (Data API v3 + OAuth 2.0)
+- TikTok (Research API + OAuth 2.0)
+- Facebook (Graph API v21.0 + OAuth 2.0)
+- Instagram (Graph API + OAuth 2.0)
+- WeChat (Official Account API + OAuth 2.0)
+
+**News Sources (7)**:
+- New York Times (Official API)
+- Wall Street Journal (RSS Feeds)
+- ABC News US & Australia (RSS Feeds)
+- Google News (RSS + Advanced Search)
+- Apple News (Web Scraping with Compliance)
+- Generic RSS/Atom Feeds
+
+**Features**:
 - Platform-specific connectors using official APIs
-- OAuth 2.0 authentication
+- OAuth 2.0 authentication for social platforms
 - Scheduled fetching with Celery
 
 ### 2. Normalization & Storage

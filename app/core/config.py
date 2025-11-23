@@ -1,6 +1,6 @@
 """Application configuration using Pydantic settings."""
 
-from typing import List
+from typing import List, Optional, Union
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     s3_bucket: str = Field(default="radar-content")
 
     # LLM Providers
-    openai_api_key: str | None = None
-    anthropic_api_key: str | None = None
+    openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
 
     # Embedding Configuration
     embedding_provider: str = Field(default="openai")
@@ -51,8 +51,8 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.7)
 
     # Local Model Settings
-    local_model_path: str | None = None
-    vllm_endpoint: str | None = None
+    local_model_path: Optional[str] = None
+    vllm_endpoint: Optional[str] = None
 
     # Security
     secret_key: str = Field(default="change-this-in-production")
@@ -92,7 +92,7 @@ class Settings(BaseSettings):
 
     @field_validator("cors_origins", mode="before")
     @classmethod
-    def parse_cors_origins(cls, v: str | List[str]) -> List[str]:
+    def parse_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
         """Parse CORS origins from string or list."""
         if isinstance(v, str):
             return [origin.strip() for origin in v.strip("[]").split(",")]
