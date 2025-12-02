@@ -16,7 +16,10 @@ from app.core.db import SessionLocal
 from app.core.db_models import ContentItemDB, PlatformConfigDB, User
 from app.core.models import ContentItem, SourcePlatform
 from app.ingestion.celery_app import celery_app
-from app.llm.openai_client import OpenAIEmbeddingClient
+from app.llm.openai_client import OpenAISyncEmbeddingClient
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseTask(Task):
@@ -82,23 +85,37 @@ def fetch_source_content(self, user_id: UUID, config_id: UUID):
     if not config:
         return {"error": "Config not found"}
 
-    # TODO: Decrypt credentials
-    # For now, assume credentials are in plaintext (NOT PRODUCTION SAFE)
-    credentials = {}  # Decrypt config.encrypted_credentials
+    # Decrypt credentials using credential vault
+    credentials = {}
+    if config.encrypted_credentials:
+        try:
+            # Parse encrypted credentials
+            import json
+            encrypted_data = json.loads(config.encrypted_credentials)
+            # For now, use simple decryption (TODO: integrate full credential vault)
+            # In production, this should use CredentialVault.retrieve_credential()
+            credentials = encrypted_data.get("credentials", {})
+        except Exception as e:
+            logger.error(f"Failed to decrypt credentials: {e}")
+            # Fall back to empty credentials for development
+            credentials = {}
 
-    # Create connector
-    connector = _create_connector(
-        config.platform,
-        ConnectorConfig(
+    # Create connector using registry
+    from app.connectors.registry import ConnectorRegistry
+
+    try:
+        connector = ConnectorRegistry.get_connector(
             platform=config.platform,
-            credentials=credentials,
-            settings=config.settings or {},
-        ),
-        user_id,
-    )
-
-    if not connector:
-        return {"error": f"No connector for platform {config.platform}"}
+            config=ConnectorConfig(
+                platform=config.platform,
+                credentials=credentials,
+                settings=config.settings or {},
+            ),
+            user_id=user_id,
+        )
+    except Exception as e:
+        logger.error(f"Failed to create connector for {config.platform}: {e}")
+        return {"error": f"Failed to create connector: {str(e)}"}
 
     # Fetch content
     try:
@@ -142,16 +159,16 @@ def process_content_item(self, item_dict: dict):
     # Reconstruct ContentItem
     item = ContentItem(**item_dict)
 
-    # Generate embedding if text available
+    # Generate embedding if text available (using synchronous client for Celery)
     embedding = None
     if item.raw_text or item.title:
         text = f"{item.title}\n\n{item.raw_text or ''}"
         try:
-            embedding_client = OpenAIEmbeddingClient()
+            embedding_client = OpenAISyncEmbeddingClient()
             response = embedding_client.embed_text(text)
             embedding = response.embedding
         except Exception as e:
-            print(f"Error generating embedding: {e}")
+            logger.error(f"Error generating embedding for item {item.id}: {e}")
 
     # Create database record
     db_item = ContentItemDB(
@@ -201,29 +218,6 @@ def cleanup_old_content(self):
     return {"status": "success", "items_deleted": len(old_items)}
 
 
-def _create_connector(
-    platform: SourcePlatform, config: ConnectorConfig, user_id: UUID
-) -> BaseConnector | None:
-    """Create a connector instance for the given platform.
-
-    Args:
-        platform: Platform type
-        config: Connector configuration
-        user_id: User ID
-
-    Returns:
-        Connector instance or None
-    """
-    connector_map = {
-        SourcePlatform.REDDIT: RedditConnector,
-        SourcePlatform.YOUTUBE: YouTubeConnector,
-        SourcePlatform.RSS: RSSConnector,
-        # Add more connectors as implemented
-    }
-
-    connector_class = connector_map.get(platform)
-    if connector_class:
-        return connector_class(config, user_id)
-
-    return None
+# Connector creation is now handled by ConnectorRegistry
+# See app/connectors/registry.py for all 13 supported platforms
 

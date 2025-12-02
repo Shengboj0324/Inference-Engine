@@ -1,7 +1,17 @@
-"""Enterprise-grade security infrastructure with military-grade encryption and protection."""
+"""Enterprise-grade security infrastructure with military-grade encryption and protection.
+
+This module provides comprehensive security features:
+- Military-grade encryption (AES-256-GCM + RSA-4096)
+- Intrusion detection and prevention
+- Rate limiting with token bucket algorithm
+- Security headers and CSRF protection
+- Data masking and sanitization
+- Comprehensive audit logging
+"""
 
 import hashlib
 import hmac
+import logging
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -17,6 +27,8 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from pydantic import BaseModel
 
 from app.core.errors import SecurityError
+
+logger = logging.getLogger(__name__)
 
 
 class EncryptionLevel(str):
@@ -69,16 +81,33 @@ class MilitaryGradeEncryption:
 
         Returns:
             Derived key (32 bytes)
+
+        Raises:
+            SecurityError: If password or salt is invalid
         """
-        kdf = Scrypt(
-            salt=salt,
-            length=32,
-            n=2**14,  # CPU/memory cost
-            r=8,      # Block size
-            p=1,      # Parallelization
-            backend=default_backend()
-        )
-        return kdf.derive(password.encode())
+        # Validate inputs
+        if not password:
+            raise SecurityError("Password cannot be empty")
+
+        if len(password) < 8:
+            raise SecurityError("Password must be at least 8 characters")
+
+        if not salt or len(salt) < 16:
+            raise SecurityError("Salt must be at least 16 bytes")
+
+        try:
+            kdf = Scrypt(
+                salt=salt,
+                length=32,
+                n=2**14,  # CPU/memory cost
+                r=8,      # Block size
+                p=1,      # Parallelization
+                backend=default_backend()
+            )
+            return kdf.derive(password.encode())
+        except Exception as e:
+            logger.error(f"Key derivation failed: {e}")
+            raise SecurityError(f"Key derivation failed: {e}")
 
     def encrypt_aes_gcm(self, plaintext: bytes, key: Optional[bytes] = None) -> Dict[str, bytes]:
         """Encrypt data using AES-256-GCM (authenticated encryption).
@@ -89,28 +118,45 @@ class MilitaryGradeEncryption:
 
         Returns:
             Dictionary with ciphertext, nonce, and tag
+
+        Raises:
+            SecurityError: If encryption fails or inputs are invalid
         """
+        # Validate inputs
+        if not plaintext:
+            raise SecurityError("Plaintext cannot be empty")
+
+        if len(plaintext) > 100 * 1024 * 1024:  # 100 MB limit
+            raise SecurityError("Plaintext too large (max 100 MB)")
+
         encryption_key = key or self.master_key
 
-        # Generate random nonce (12 bytes for GCM)
-        nonce = secrets.token_bytes(12)
+        if len(encryption_key) != 32:
+            raise SecurityError("Encryption key must be 32 bytes")
 
-        # Create cipher
-        cipher = Cipher(
-            algorithms.AES(encryption_key),
-            modes.GCM(nonce),
-            backend=default_backend()
-        )
-        encryptor = cipher.encryptor()
+        try:
+            # Generate random nonce (12 bytes for GCM)
+            nonce = secrets.token_bytes(12)
 
-        # Encrypt and get authentication tag
-        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+            # Create cipher
+            cipher = Cipher(
+                algorithms.AES(encryption_key),
+                modes.GCM(nonce),
+                backend=default_backend()
+            )
+            encryptor = cipher.encryptor()
 
-        return {
-            "ciphertext": ciphertext,
-            "nonce": nonce,
-            "tag": encryptor.tag
-        }
+            # Encrypt and get authentication tag
+            ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+
+            return {
+                "ciphertext": ciphertext,
+                "nonce": nonce,
+                "tag": encryptor.tag
+            }
+        except Exception as e:
+            logger.error(f"Encryption failed: {e}")
+            raise SecurityError(f"Encryption failed: {e}")
 
     def decrypt_aes_gcm(
         self,

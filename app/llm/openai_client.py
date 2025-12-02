@@ -14,6 +14,43 @@ from app.llm.client_base import (
 )
 
 
+class OpenAISyncEmbeddingClient:
+    """Synchronous OpenAI embedding client for use in Celery tasks."""
+
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        """Initialize synchronous OpenAI embedding client.
+
+        Args:
+            api_key: OpenAI API key (defaults to settings)
+            model: Model name (defaults to settings)
+        """
+        self.client = openai.OpenAI(api_key=api_key or settings.openai_api_key)
+        self.model = model or settings.embedding_model
+
+    def embed_text(self, text: str) -> EmbeddingResponse:
+        """Generate embedding for a single text (synchronous)."""
+        response = self.client.embeddings.create(input=text, model=self.model)
+
+        return EmbeddingResponse(
+            embedding=response.data[0].embedding,
+            model=response.model,
+            tokens_used=response.usage.total_tokens,
+        )
+
+    def embed_batch(self, texts: List[str]) -> List[EmbeddingResponse]:
+        """Generate embeddings for multiple texts (synchronous)."""
+        response = self.client.embeddings.create(input=texts, model=self.model)
+
+        return [
+            EmbeddingResponse(
+                embedding=item.embedding,
+                model=response.model,
+                tokens_used=response.usage.total_tokens // len(texts),
+            )
+            for item in response.data
+        ]
+
+
 class OpenAIEmbeddingClient(BaseEmbeddingClient):
     """OpenAI embedding client."""
 

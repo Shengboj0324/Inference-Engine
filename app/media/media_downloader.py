@@ -1,4 +1,4 @@
-"""Comprehensive media scraping and downloading system.
+"""Comprehensive media scraping and downloading system with robust error handling.
 
 Features:
 - Video downloading from all platforms
@@ -8,10 +8,14 @@ Features:
 - CDN integration
 - Thumbnail generation
 - Metadata extraction
+- Comprehensive validation
+- Resource management
+- Error recovery
 """
 
 import asyncio
 import hashlib
+import logging
 import mimetypes
 import os
 from datetime import datetime
@@ -25,8 +29,12 @@ import aiohttp
 from PIL import Image
 from pydantic import BaseModel
 
-from app.core.errors import MediaError
+from app.core.errors import MediaError, ValidationError
 from app.core.models import SourcePlatform
+from app.core.retry import retry_with_backoff
+from app.core.validation import URLValidator
+
+logger = logging.getLogger(__name__)
 
 
 class MediaType(str, Enum):
@@ -117,6 +125,7 @@ class MediaDownloader:
         for media_type in MediaType:
             (self.storage_path / media_type.value).mkdir(exist_ok=True)
 
+    @retry_with_backoff(max_retries=3, base_delay=2.0, retry_on=(MediaError,))
     async def download_video(
         self,
         url: str,
@@ -124,7 +133,7 @@ class MediaDownloader:
         quality: VideoQuality = VideoQuality.FULL_HD,
         extract_audio: bool = False
     ) -> MediaMetadata:
-        """Download video from URL.
+        """Download video from URL with validation and error handling.
 
         Args:
             url: Video URL
@@ -134,7 +143,19 @@ class MediaDownloader:
 
         Returns:
             Media metadata with local path
+
+        Raises:
+            MediaError: If download fails
+            ValidationError: If URL is invalid
         """
+        # Validate URL
+        try:
+            URLValidator(url=url)
+        except Exception as e:
+            raise ValidationError(f"Invalid video URL: {e}")
+
+        logger.info(f"Downloading video from {platform.value}: {url}")
+
         # Use yt-dlp for video downloading (supports most platforms)
         try:
             import yt_dlp
@@ -144,7 +165,11 @@ class MediaDownloader:
         # Generate unique ID
         media_id = uuid4()
         output_dir = self.storage_path / MediaType.VIDEO.value / str(media_id)
-        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise MediaError(f"Failed to create output directory: {e}")
 
         # Configure yt-dlp options
         ydl_opts = {
@@ -155,42 +180,64 @@ class MediaDownloader:
             "extract_flat": False,
             "writethumbnail": True,
             "writesubtitles": False,
+            "socket_timeout": 30,  # 30 second timeout
+            "retries": 3,  # Retry 3 times
         }
 
         # Download video
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-            # Get downloaded file path
-            downloaded_file = ydl.prepare_filename(info)
+                # Get downloaded file path
+                downloaded_file = ydl.prepare_filename(info)
 
-            # Extract metadata
-            metadata = MediaMetadata(
-                id=media_id,
-                platform=platform,
-                media_type=MediaType.VIDEO,
-                url=url,
-                title=info.get("title"),
-                description=info.get("description"),
-                duration=info.get("duration"),
-                width=info.get("width"),
-                height=info.get("height"),
-                file_size=info.get("filesize"),
-                format=info.get("ext"),
-                thumbnail_url=info.get("thumbnail"),
-                author=info.get("uploader"),
-                published_at=self._parse_upload_date(info.get("upload_date")),
-                local_path=downloaded_file
-            )
+                # Verify file exists
+                if not os.path.exists(downloaded_file):
+                    raise MediaError(f"Downloaded file not found: {downloaded_file}")
+
+                # Extract metadata
+                metadata = MediaMetadata(
+                    id=media_id,
+                    platform=platform,
+                    media_type=MediaType.VIDEO,
+                    url=url,
+                    title=info.get("title"),
+                    description=info.get("description"),
+                    duration=info.get("duration"),
+                    width=info.get("width"),
+                    height=info.get("height"),
+                    file_size=info.get("filesize") or os.path.getsize(downloaded_file),
+                    format=info.get("ext"),
+                    thumbnail_url=info.get("thumbnail"),
+                    author=info.get("uploader"),
+                    published_at=self._parse_upload_date(info.get("upload_date")),
+                    local_path=downloaded_file
+                )
+
+                logger.info(f"Video downloaded successfully: {metadata.title} ({metadata.file_size} bytes)")
+
+        except Exception as e:
+            logger.error(f"Video download failed: {e}")
+            raise MediaError(f"Failed to download video: {e}")
 
         # Extract audio if requested
         if extract_audio:
-            await self._extract_audio(downloaded_file, output_dir)
+            try:
+                await self._extract_audio(downloaded_file, output_dir)
+            except Exception as e:
+                logger.warning(f"Audio extraction failed: {e}")
+                # Don't fail the whole download if audio extraction fails
 
         # Upload to CDN if enabled
         if self.cdn_enabled:
-            cdn_url = await self._upload_to_cdn(downloaded_file, media_id)
-            metadata.download_url = cdn_url
+            try:
+                cdn_url = await self._upload_to_cdn(downloaded_file, media_id)
+                metadata.download_url = cdn_url
+                logger.info(f"Video uploaded to CDN: {cdn_url}")
+            except Exception as e:
+                logger.warning(f"CDN upload failed: {e}")
+                # Don't fail the whole download if CDN upload fails
 
         return metadata
 

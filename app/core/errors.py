@@ -279,3 +279,43 @@ class ScrapingError(BaseAppException):
             original_exception=original_exception,
         )
 
+
+class APIError(BaseAppException):
+    """API error."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        error_code: ErrorCode = ErrorCode.CONNECTOR_ERROR,
+        original_exception: Optional[Exception] = None,
+    ):
+        details = {}
+        if status_code:
+            details["status_code"] = status_code
+
+        super().__init__(
+            message=message,
+            error_code=error_code,
+            severity=ErrorSeverity.MEDIUM,
+            details=details,
+            original_exception=original_exception,
+        )
+
+
+class AuthenticationError(BaseAppException):
+    """Authentication error."""
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCode = ErrorCode.AUTHENTICATION_ERROR,
+        original_exception: Optional[Exception] = None,
+    ):
+        super().__init__(
+            message=message,
+            error_code=error_code,
+            severity=ErrorSeverity.HIGH,
+            original_exception=original_exception,
+        )
+

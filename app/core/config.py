@@ -1,12 +1,15 @@
-"""Application configuration using Pydantic settings."""
+"""Application configuration using Pydantic settings with comprehensive validation."""
 
+import os
+import secrets
 from typing import List, Optional, Union
-from pydantic import Field, field_validator
+
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    """Application settings loaded from environment variables with validation."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -14,6 +17,9 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    # Environment
+    environment: str = Field(default="development")
 
     # Database
     database_url: str = Field(
@@ -58,6 +64,11 @@ class Settings(BaseSettings):
     secret_key: str = Field(default="change-this-in-production")
     encryption_key: str = Field(default="change-this-32-byte-key-base64==")
 
+    # JWT Settings
+    jwt_algorithm: str = Field(default="HS256")
+    jwt_access_token_expire_minutes: int = Field(default=30)
+    jwt_refresh_token_expire_days: int = Field(default=7)
+
     # API Settings
     api_host: str = Field(default="0.0.0.0")
     api_port: int = Field(default=8000)
@@ -90,6 +101,15 @@ class Settings(BaseSettings):
     enable_auto_clustering: bool = Field(default=True)
     enable_personalization: bool = Field(default=True)
 
+    @field_validator("environment")
+    @classmethod
+    def validate_environment(cls, v: str) -> str:
+        """Validate environment setting."""
+        allowed = ["development", "staging", "production", "test"]
+        if v not in allowed:
+            raise ValueError(f"Environment must be one of {allowed}")
+        return v
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
@@ -97,6 +117,106 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [origin.strip() for origin in v.strip("[]").split(",")]
         return v
+
+    @field_validator("log_level")
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
+        """Validate log level."""
+        allowed = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        v_upper = v.upper()
+        if v_upper not in allowed:
+            raise ValueError(f"Log level must be one of {allowed}")
+        return v_upper
+
+    @field_validator("log_format")
+    @classmethod
+    def validate_log_format(cls, v: str) -> str:
+        """Validate log format."""
+        allowed = ["json", "plain"]
+        if v not in allowed:
+            raise ValueError(f"Log format must be one of {allowed}")
+        return v
+
+    @field_validator("llm_temperature")
+    @classmethod
+    def validate_temperature(cls, v: float) -> float:
+        """Validate LLM temperature."""
+        if not 0.0 <= v <= 2.0:
+            raise ValueError("Temperature must be between 0.0 and 2.0")
+        return v
+
+    @field_validator("cluster_min_similarity")
+    @classmethod
+    def validate_similarity(cls, v: float) -> float:
+        """Validate cluster similarity threshold."""
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("Similarity must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("api_port", "mcp_port")
+    @classmethod
+    def validate_port(cls, v: int) -> int:
+        """Validate port number."""
+        if not 1 <= v <= 65535:
+            raise ValueError("Port must be between 1 and 65535")
+        return v
+
+    @field_validator("api_workers")
+    @classmethod
+    def validate_workers(cls, v: int) -> int:
+        """Validate number of workers."""
+        if v < 1:
+            raise ValueError("Workers must be at least 1")
+        if v > 32:
+            raise ValueError("Workers should not exceed 32")
+        return v
+
+    @model_validator(mode="after")
+    def validate_production_settings(self) -> "Settings":
+        """Validate production-specific settings."""
+        if self.environment == "production":
+            # Check for default secrets
+            if self.secret_key == "change-this-in-production":
+                raise ValueError(
+                    "SECRET_KEY must be changed in production! "
+                    "Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+                )
+
+            if self.encryption_key == "change-this-32-byte-key-base64==":
+                raise ValueError(
+                    "ENCRYPTION_KEY must be changed in production! "
+                    "Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+                )
+
+            # Warn about localhost in production
+            if "localhost" in self.database_url:
+                import warnings
+                warnings.warn("Using localhost database in production!")
+
+            if "localhost" in self.redis_url:
+                import warnings
+                warnings.warn("Using localhost Redis in production!")
+
+        return self
+
+    @property
+    def is_production(self) -> bool:
+        """Check if running in production."""
+        return self.environment == "production"
+
+    @property
+    def is_development(self) -> bool:
+        """Check if running in development."""
+        return self.environment == "development"
+
+    @property
+    def is_testing(self) -> bool:
+        """Check if running in test mode."""
+        return self.environment == "test"
+
+
+# Global settings instance
+settings = Settings()
 
 
 # Global settings instance
