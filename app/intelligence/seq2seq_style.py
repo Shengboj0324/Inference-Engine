@@ -63,15 +63,6 @@ class Seq2SeqConfig:
 
 
 class ControlledSeq2Seq:
-    """Sequence-to-sequence model with style control.
-
-    Features:
-    - Transformer-based architecture (BART/T5)
-    - Style control via special tokens and embeddings
-    - Multi-task learning
-    - Advanced decoding strategies
-    """
-
     def __init__(self, config: Optional[Seq2SeqConfig] = None):
         """Initialize controlled seq2seq model.
 
