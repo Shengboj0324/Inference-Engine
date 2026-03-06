@@ -140,20 +140,48 @@ async def get_latest_digest_markdown(
 @router.get("/history")
 async def get_digest_history(
     limit: int = Query(default=10, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Get historical digests for the user.
 
     Args:
         limit: Number of historical digests to return
+        current_user: Authenticated user
+        db: Database session
 
     Returns:
         List of historical digests
     """
-    # TODO: Implement digest history
-    # - Query stored digests from database
-    # - Return list ordered by creation time
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Digest history not yet implemented",
-    )
+    try:
+        from app.core.db_models import DigestDB
+        from sqlalchemy import select, desc
+
+        # Query stored digests from database
+        result = await db.execute(
+            select(DigestDB)
+            .where(DigestDB.user_id == current_user.id)
+            .order_by(desc(DigestDB.created_at))
+            .limit(limit)
+        )
+        digests = result.scalars().all()
+
+        # Convert to response format
+        return [
+            {
+                "id": str(digest.id),
+                "title": digest.title or "Daily Digest",
+                "created_at": digest.created_at.isoformat(),
+                "summary": digest.summary,
+                "item_count": len(digest.items) if digest.items else 0,
+            }
+            for digest in digests
+        ]
+
+    except Exception as e:
+        logger.error(f"Failed to fetch digest history: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve digest history",
+        )
 

@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Set
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status
@@ -25,6 +25,42 @@ security = HTTPBearer()
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Token blacklist (in production, use Redis or database)
+# This is a simple in-memory implementation for now
+_token_blacklist: Set[str] = set()
+_blacklist_max_size = 10000  # Prevent memory exhaustion
+
+
+def add_token_to_blacklist(token: str) -> None:
+    """Add token to blacklist with size limit protection.
+
+    Args:
+        token: JWT token to blacklist
+    """
+    global _token_blacklist
+
+    # Prevent memory exhaustion
+    if len(_token_blacklist) >= _blacklist_max_size:
+        # Remove oldest 20% of tokens (FIFO approximation)
+        tokens_to_remove = list(_token_blacklist)[:_blacklist_max_size // 5]
+        _token_blacklist -= set(tokens_to_remove)
+        logger.warning(f"Token blacklist size limit reached, removed {len(tokens_to_remove)} tokens")
+
+    _token_blacklist.add(token)
+    logger.info(f"Token added to blacklist (total: {len(_token_blacklist)})")
+
+
+def is_token_blacklisted(token: str) -> bool:
+    """Check if token is blacklisted.
+
+    Args:
+        token: JWT token to check
+
+    Returns:
+        True if token is blacklisted
+    """
+    return token in _token_blacklist
 
 # JWT settings
 SECRET_KEY = settings.secret_key
@@ -215,14 +251,35 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/logout")
-async def logout():
+async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     """Logout user (invalidate token).
+
+    Args:
+        credentials: HTTP Bearer token
 
     Returns:
         Success message
     """
-    # TODO: Implement token invalidation
-    return {"message": "Logged out successfully"}
+    try:
+        token = credentials.credentials
+
+        # Add token to blacklist
+        add_token_to_blacklist(token)
+
+        logger.info("User logged out successfully")
+        return {
+            "message": "Logged out successfully",
+            "token_invalidated": True,
+        }
+
+    except Exception as e:
+        logger.error(f"Logout error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to logout",
+        )
 
 
 async def get_current_user(
@@ -252,6 +309,16 @@ async def get_current_user(
     try:
         # Decode JWT token
         token = credentials.credentials
+
+        # Check if token is blacklisted
+        if is_token_blacklisted(token):
+            logger.warning("Attempted use of blacklisted token")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been invalidated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         email: str = payload.get("email")

@@ -179,10 +179,15 @@ class CredentialVault:
             raise SecurityError("Credential is inactive")
         
         # Check MFA requirement
-        if credential.requires_mfa and not mfa_token:
-            raise SecurityError("MFA token required")
-        
-        # TODO: Verify MFA token if provided
+        if credential.requires_mfa:
+            if not mfa_token:
+                raise SecurityError("MFA token required")
+
+            # Verify MFA token
+            # Note: MFA verification should be implemented based on your MFA provider
+            # For now, we validate the token format
+            if not isinstance(mfa_token, str) or len(mfa_token) < 6:
+                raise SecurityError("Invalid MFA token format")
         
         # Parse encrypted data
         encrypted_data = json.loads(credential.encrypted_data)

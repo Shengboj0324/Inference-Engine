@@ -1,0 +1,72 @@
+config_version: 1.0.0
+experiment_name: quick-test
+model:
+  base_model: meta-llama/Meta-Llama-3.1-8B-Instruct
+  model_max_length: 512
+  trust_remote_code: false
+lora:
+  enabled: true
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules: null
+  bias: none
+  use_4bit: true
+  use_8bit: false
+  bnb_4bit_compute_dtype: bfloat16
+  bnb_4bit_quant_type: nf4
+  use_nested_quant: true
+training:
+  num_epochs: 1
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0002
+  weight_decay: 0.001
+  max_grad_norm: 1.0
+  warmup_ratio: 0.03
+  warmup_steps: 0
+  optimizer: paged_adamw_32bit
+  lr_scheduler: cosine
+  precision: bf16
+  gradient_checkpointing: true
+data:
+  train_file: data/training/sample_train.jsonl
+  val_file: data/training/sample_val.jsonl
+  test_file: null
+  max_examples: 100
+  quality_threshold: 0.5
+  val_split: 0.2
+  test_split: 0.0
+  shuffle_seed: 42
+checkpoint:
+  output_dir: checkpoints/quick-test
+  save_strategy: steps
+  save_steps: 50
+  save_total_limit: 2
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  resume_from_checkpoint: null
+logging:
+  logging_dir: logs/quick-test
+  logging_strategy: steps
+  logging_steps: 5
+  report_to:
+  - tensorboard
+  eval_strategy: steps
+  eval_steps: 50
+  log_level: debug
+reproducibility:
+  seed: 42
+  deterministic: true
+  save_environment: true
+  save_rng_state: true
+distributed:
+  enabled: false
+  backend: nccl
+  ddp_find_unused_parameters: false
+  ddp_bucket_cap_mb: 25
+  world_size: 1
+  rank: 0
+  local_rank: -1

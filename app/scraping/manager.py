@@ -127,11 +127,70 @@ class ScrapingManager:
         self._active_scrapers: Dict[str, BaseScraper] = {}
         self._proxy_index = 0
 
+        # Memory leak protection
+        self._max_circuit_breakers = 1000  # Prevent unbounded growth
+        self._last_cleanup = datetime.utcnow()
+        self._cleanup_interval = timedelta(minutes=10)
+
     def _get_circuit_breaker(self, domain: str) -> CircuitBreaker:
-        """Get or create circuit breaker for domain."""
+        """Get or create circuit breaker for domain.
+
+        Args:
+            domain: Domain name
+
+        Returns:
+            Circuit breaker for domain
+        """
+        # Periodic cleanup
+        self._cleanup_circuit_breakers()
+
         if domain not in self._circuit_breakers:
+            # Enforce max size limit
+            if len(self._circuit_breakers) >= self._max_circuit_breakers:
+                # Remove oldest closed circuit breakers
+                closed_breakers = [
+                    (d, cb) for d, cb in self._circuit_breakers.items()
+                    if cb.state == CircuitState.CLOSED
+                ]
+                if closed_breakers:
+                    # Remove 20% of closed breakers
+                    to_remove = max(1, len(closed_breakers) // 5)
+                    for domain_to_remove, _ in closed_breakers[:to_remove]:
+                        del self._circuit_breakers[domain_to_remove]
+                    logger.warning(
+                        f"Circuit breaker limit reached, removed {to_remove} closed breakers"
+                    )
+
             self._circuit_breakers[domain] = CircuitBreaker()
+
         return self._circuit_breakers[domain]
+
+    def _cleanup_circuit_breakers(self) -> None:
+        """Clean up old circuit breakers to prevent memory leaks."""
+        now = datetime.utcnow()
+
+        # Only cleanup periodically
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+
+        self._last_cleanup = now
+
+        # Remove circuit breakers that have been closed for a long time
+        domains_to_remove = []
+        for domain, cb in self._circuit_breakers.items():
+            if cb.state == CircuitState.CLOSED and cb.last_failure_time:
+                # Remove if no failures in last hour
+                if now - cb.last_failure_time > timedelta(hours=1):
+                    domains_to_remove.append(domain)
+
+        for domain in domains_to_remove:
+            del self._circuit_breakers[domain]
+
+        if domains_to_remove:
+            logger.info(
+                f"Cleaned up {len(domains_to_remove)} inactive circuit breakers. "
+                f"Remaining: {len(self._circuit_breakers)}"
+            )
 
     def _get_next_proxy(self) -> Optional[ProxyConfig]:
         """Get next proxy from pool using round-robin."""

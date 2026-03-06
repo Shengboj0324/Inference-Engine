@@ -168,15 +168,25 @@ async def connect_platform(
         Authorization URL for user to visit
     """
     # Get OAuth proxy service (injected via dependency in production)
-    # For now, create inline
     from app.core.config import settings
-    
-    # TODO: Load app credentials from settings
+    import os
+
+    # Load app credentials from environment variables
     app_credentials = {
-        # These would be loaded from environment variables
-        # For now, placeholder
+        "twitter": {
+            "client_id": os.getenv("TWITTER_CLIENT_ID", ""),
+            "client_secret": os.getenv("TWITTER_CLIENT_SECRET", ""),
+        },
+        "reddit": {
+            "client_id": os.getenv("REDDIT_CLIENT_ID", ""),
+            "client_secret": os.getenv("REDDIT_CLIENT_SECRET", ""),
+        },
+        "linkedin": {
+            "client_id": os.getenv("LINKEDIN_CLIENT_ID", ""),
+            "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET", ""),
+        },
     }
-    
+
     oauth_service = OAuthProxyService(
         credential_vault=None,  # Will be injected
         app_credentials=app_credentials,
@@ -219,15 +229,51 @@ async def oauth_callback(
     Returns:
         Success message and redirect to app
     """
-    # TODO: Get user password from session or request
-    # In production, this would be handled securely
-    user_password = "temp_password"  # Placeholder
-    
+    # Get user from session state
+    # The state parameter contains the user_id encoded during authorization
+    import json
+    import base64
+
+    try:
+        # Decode state to get user_id
+        state_data = json.loads(base64.b64decode(state))
+        user_id = state_data.get("user_id")
+
+        # Get user password from secure session or credential vault
+        # Note: In production, use session management or secure token exchange
+        from app.core.config import settings
+        user_password = settings.secret_key  # Use app secret for encryption
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid state parameter: {e}"
+        )
+
     vault = CredentialVault(db)
+
+    # Load app credentials from environment
+    import os
+    app_credentials = {
+        "twitter": {
+            "client_id": os.getenv("TWITTER_CLIENT_ID", ""),
+            "client_secret": os.getenv("TWITTER_CLIENT_SECRET", ""),
+        },
+        "reddit": {
+            "client_id": os.getenv("REDDIT_CLIENT_ID", ""),
+            "client_secret": os.getenv("REDDIT_CLIENT_SECRET", ""),
+        },
+        "linkedin": {
+            "client_id": os.getenv("LINKEDIN_CLIENT_ID", ""),
+            "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET", ""),
+        },
+    }
+
+    from app.core.config import settings
     oauth_service = OAuthProxyService(
         credential_vault=vault,
-        app_credentials={},  # Load from settings
-        base_redirect_uri=""
+        app_credentials=app_credentials,
+        base_redirect_uri=f"{settings.api_base_url}/api/v1/platforms/callback"
     )
     
     try:

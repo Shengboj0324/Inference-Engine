@@ -343,6 +343,11 @@ class IntrusionDetectionSystem:
         self.block_duration = 3600  # 1 hour
         self.anomaly_threshold = 0.8
 
+        # Memory leak protection
+        self.max_tracked_identifiers = 10000  # Prevent unbounded growth
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # Cleanup every 5 minutes
+
     def check_brute_force(self, identifier: str) -> bool:
         """Check for brute force attack.
 
@@ -373,6 +378,9 @@ class IntrusionDetectionSystem:
         """
         now = time.time()
 
+        # Periodic cleanup to prevent memory leaks
+        self._cleanup_old_data(now)
+
         if identifier not in self.failed_attempts:
             self.failed_attempts[identifier] = []
 
@@ -381,6 +389,55 @@ class IntrusionDetectionSystem:
         # Auto-block if threshold exceeded
         if self.check_brute_force(identifier):
             self.block_ip(identifier)
+
+    def _cleanup_old_data(self, now: float) -> None:
+        """Clean up old tracking data to prevent memory leaks.
+
+        Args:
+            now: Current timestamp
+        """
+        # Only cleanup periodically
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+
+        self._last_cleanup = now
+
+        # Clean old failed attempts
+        identifiers_to_remove = []
+        for identifier, attempts in self.failed_attempts.items():
+            # Remove attempts outside the window
+            recent_attempts = [t for t in attempts if now - t < self.failed_attempt_window]
+            if recent_attempts:
+                self.failed_attempts[identifier] = recent_attempts
+            else:
+                identifiers_to_remove.append(identifier)
+
+        for identifier in identifiers_to_remove:
+            del self.failed_attempts[identifier]
+
+        # Clean expired IP blocks
+        expired_blocks = [
+            ip for ip, block_time in self.blocked_ips.items()
+            if now - block_time > self.block_duration
+        ]
+        for ip in expired_blocks:
+            del self.blocked_ips[ip]
+
+        # Enforce max size limit (emergency protection)
+        if len(self.failed_attempts) > self.max_tracked_identifiers:
+            # Remove oldest 20% of entries
+            sorted_identifiers = sorted(
+                self.failed_attempts.items(),
+                key=lambda x: max(x[1]) if x[1] else 0
+            )
+            to_remove = len(self.failed_attempts) - int(self.max_tracked_identifiers * 0.8)
+            for identifier, _ in sorted_identifiers[:to_remove]:
+                del self.failed_attempts[identifier]
+
+            logger.warning(
+                f"IDS memory limit reached, removed {to_remove} old entries. "
+                f"Current size: {len(self.failed_attempts)}"
+            )
 
     def block_ip(self, ip_address: str) -> None:
         """Block IP address.

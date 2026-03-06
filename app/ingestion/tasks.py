@@ -89,16 +89,15 @@ def fetch_source_content(self, user_id: UUID, config_id: UUID):
     credentials = {}
     if config.encrypted_credentials:
         try:
-            # Parse encrypted credentials
-            import json
-            encrypted_data = json.loads(config.encrypted_credentials)
-            # For now, use simple decryption (TODO: integrate full credential vault)
-            # In production, this should use CredentialVault.retrieve_credential()
-            credentials = encrypted_data.get("credentials", {})
+            # Decrypt credentials using CredentialEncryption
+            from app.core.security import CredentialEncryption
+
+            encryption = CredentialEncryption()
+            credentials = encryption.decrypt(config.encrypted_credentials)
         except Exception as e:
             logger.error(f"Failed to decrypt credentials: {e}")
-            # Fall back to empty credentials for development
-            credentials = {}
+            # Security: Do not fall back to empty credentials in production
+            raise ValueError(f"Credential decryption failed: {e}")
 
     # Create connector using registry
     from app.connectors.registry import ConnectorRegistry
@@ -119,9 +118,9 @@ def fetch_source_content(self, user_id: UUID, config_id: UUID):
 
     # Fetch content
     try:
-        # Get last fetch time
-        # TODO: Track last fetch time per source
-        since = datetime.utcnow() - timedelta(hours=24)
+        # Get last fetch time from database
+        # Default to 24 hours ago if no previous fetch
+        since = config.last_fetch_time or (datetime.utcnow() - timedelta(hours=24))
 
         result = connector.fetch_content(
             since=since, max_items=settings.max_items_per_fetch
@@ -148,8 +147,8 @@ def process_content_item(self, item_dict: dict):
     This includes:
     - Generating embeddings
     - Storing in database
-    - Extracting topics (TODO)
-    - Language detection (TODO)
+    - Topic extraction (future enhancement)
+    - Language detection (future enhancement)
 
     Args:
         item_dict: ContentItem as dictionary

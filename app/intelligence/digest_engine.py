@@ -162,9 +162,21 @@ class DigestEngine:
         db: AsyncSession,
     ) -> List[ContentItem]:
         """Score items for relevance using user's interest profile."""
-        # TODO: Fetch user's interest profile from database
-        # For now, use default scorer
-        scorer = RelevanceScorer(interest_profile=None)
+        # Fetch user's interest profile from database
+        # Note: Interest profile is optional - defaults to general scoring
+        from app.core.db_models import User
+        from sqlalchemy import select
+
+        interest_profile = None
+        try:
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            if user and hasattr(user, 'interest_profile'):
+                interest_profile = user.interest_profile
+        except Exception as e:
+            logger.warning(f"Failed to fetch user interest profile: {e}")
+
+        scorer = RelevanceScorer(interest_profile=interest_profile)
 
         for item in items:
             item.relevance_score = scorer.score_item(item)
