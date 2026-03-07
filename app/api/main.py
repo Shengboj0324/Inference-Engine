@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 import time
 
-from app.api.routes import auth, digest, llm, search, sources
+from app.api.routes import auth, digest, llm, search, signals, sources
 from app.core.config import settings
 from app.core.errors import BaseAppException
 from app.core.health import HealthChecker
@@ -46,6 +46,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+app.include_router(signals.router, prefix="/api/v1", tags=["Signals"])  # Primary product interface
 app.include_router(sources.router, prefix="/api/v1/sources", tags=["Sources"])
 app.include_router(digest.router, prefix="/api/v1/digest", tags=["Digest"])
 app.include_router(search.router, prefix="/api/v1/search", tags=["Search"])
