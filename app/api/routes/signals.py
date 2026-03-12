@@ -29,7 +29,8 @@ from sqlalchemy import select, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.dependencies import get_current_user, get_db
+from app.api.routes.auth import get_current_user
+from app.core.db import get_db
 from app.core.db_models import ActionableSignalDB, User
 from app.core.signal_models import (
     ActionableSignal,
@@ -148,6 +149,7 @@ async def get_signal_queue(
                     SignalStatus.QUEUED,
                     SignalStatus.IN_PROGRESS,
                 ])
+            )
 
         # Sort by action_score (highest first)
         query = query.order_by(ActionableSignalDB.action_score.desc())
