@@ -214,6 +214,22 @@ class ActionableSignalDB(Base):
         index=True,
     )
 
+    # Link to inference layer (Phase 1 architecture)
+    signal_inference_id: Mapped[Optional[UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("signal_inferences.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Link to SignalInferenceDB for calibrated inference results"
+    )
+    normalized_observation_id: Mapped[Optional[UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("normalized_observations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Link to NormalizedObservationDB for source content"
+    )
+
     # Signal classification
     signal_type: Mapped[SignalType] = mapped_column(
         Enum(SignalType),
@@ -360,3 +376,180 @@ class ActionableSignalDB(Base):
         foreign_keys=[assigned_to],
     )
 
+
+
+
+
+# ============================================================================
+# NEW DOMAIN MODELS - Phase 1 Architecture
+# ============================================================================
+
+
+class RawObservationDB(Base):
+    """Raw observation database model - Layer 1.
+
+    Stores unprocessed platform data with minimal transformation.
+    """
+
+    __tablename__ = "raw_observations"
+    __table_args__ = (
+        UniqueConstraint('user_id', 'source_platform', 'source_id', name='uq_raw_user_platform_source'),
+    )
+
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    source_platform: Mapped[SourcePlatform] = mapped_column(
+        Enum(SourcePlatform), nullable=False, index=True
+    )
+    source_id: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Content
+    author: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    author_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    channel: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    channel_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    media_type: Mapped[MediaType] = mapped_column(Enum(MediaType), nullable=False)
+    media_urls: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list)
+
+    # Timestamps
+    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Platform-specific metadata
+    platform_metadata_: Mapped[Dict[str, Any]] = mapped_column(
+        "platform_metadata", JSON, default=dict
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship()
+
+
+class NormalizedObservationDB(Base):
+    """Normalized observation database model - Layer 2.
+
+    Stores normalized, enriched content ready for inference.
+    """
+
+    __tablename__ = "normalized_observations"
+
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    raw_observation_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("raw_observations.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    source_platform: Mapped[SourcePlatform] = mapped_column(
+        Enum(SourcePlatform), nullable=False, index=True
+    )
+    source_id: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Normalized content
+    author: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    channel: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    original_language: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    translated_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    media_type: Mapped[MediaType] = mapped_column(Enum(MediaType), nullable=False)
+    media_urls: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list)
+
+    # Timestamps
+    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    normalized_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    # Enrichment (stored as JSON for flexibility)
+    entities: Mapped[List[Dict[str, Any]]] = mapped_column(ARRAY(JSON), default=list)
+    topics: Mapped[List[str]] = mapped_column(ARRAY(String), default=list)
+    keywords: Mapped[List[str]] = mapped_column(ARRAY(String), default=list)
+    sentiment: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    sentiment_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Thread context (stored as JSON)
+    thread_context_: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        "thread_context", JSON, nullable=True
+    )
+
+    # Quality scores
+    quality: Mapped[str] = mapped_column(String(50), nullable=False, default="unknown")
+    quality_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    completeness_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    # Engagement features
+    engagement_velocity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    virality_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Embeddings
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(1536), nullable=True)
+
+    # Metadata
+    normalization_metadata_: Mapped[Dict[str, Any]] = mapped_column(
+        "normalization_metadata", JSON, default=dict
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship()
+    raw_observation: Mapped["RawObservationDB"] = relationship()
+
+
+class SignalInferenceDB(Base):
+    """Signal inference database model - Layer 3.
+
+    Stores ML/LLM interpretation results with calibrated confidence.
+    """
+
+    __tablename__ = "signal_inferences"
+
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    normalized_observation_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("normalized_observations.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+
+    # Inference results (stored as JSON for flexibility)
+    predictions_: Mapped[List[Dict[str, Any]]] = mapped_column(
+        "predictions", ARRAY(JSON), default=list
+    )
+    top_prediction_: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        "top_prediction", JSON, nullable=True
+    )
+
+    # Abstention
+    abstained: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    abstention_reason: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    abstention_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Rationale
+    rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    evidence_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Calibration metrics (stored as JSON)
+    calibration_metrics_: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        "calibration_metrics", JSON, nullable=True
+    )
+
+    # Model provenance
+    model_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    inference_method: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Timestamps
+    inferred_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    # Metadata
+    inference_metadata_: Mapped[Dict[str, Any]] = mapped_column(
+        "inference_metadata", JSON, default=dict
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship()
+    normalized_observation: Mapped["NormalizedObservationDB"] = relationship()
