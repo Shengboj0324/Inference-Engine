@@ -183,7 +183,7 @@ def process_content_item(self, item_dict: dict):
         topics=item.topics,
         lang=item.lang,
         embedding=embedding,
-        metadata=item.metadata,
+        metadata_=item.metadata,
     )
 
     db.add(db_item)

@@ -305,6 +305,7 @@ class PipelineOrchestrator:
                     source_id=item.source_id,
                     source_url=item.source_url,
                     author=item.author,
+                    channel=item.channel,
                     title=item.title,
                     raw_text=item.raw_text,
                     media_type=item.media_type,
@@ -314,7 +315,7 @@ class PipelineOrchestrator:
                     lang=item.lang,
                     topics=item.topics,
                     embedding=item.embedding,
-                    metadata=item.metadata,
+                    metadata_=item.metadata,
                 )
                 self.db.add(db_item)
             except Exception as e:
@@ -349,9 +350,17 @@ class PipelineOrchestrator:
                     recommended_action=signal.recommended_action,
                     suggested_channel=signal.suggested_channel,
                     suggested_tone=signal.suggested_tone,
+                    draft_response=signal.draft_response,
+                    draft_post=signal.draft_post,
+                    draft_dm=signal.draft_dm,
+                    positioning_angle=signal.positioning_angle,
                     status=signal.status,
+                    assigned_to=signal.assigned_to,
+                    created_at=signal.created_at,
                     expires_at=signal.expires_at,
-                    metadata=signal.metadata,
+                    acted_at=signal.acted_at,
+                    outcome_feedback=signal.outcome_feedback,
+                    metadata_=signal.metadata,
                 )
                 self.db.add(db_signal)
             except Exception as e:
