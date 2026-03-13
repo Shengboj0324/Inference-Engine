@@ -55,61 +55,92 @@ class ActionPipeline:
         observation: NormalizedObservation,
     ) -> Optional[ActionableSignal]:
         """Process a single signal inference into an actionable signal.
-        
+
         Args:
             inference: Signal inference from Phase 2
             observation: Normalized observation
-            
+
         Returns:
             ActionableSignal if worthy of action, None otherwise
         """
-        # Stage 1: Rank action
-        action = self.ranker.rank_action(inference, observation)
-        
-        if not action:
-            logger.debug(f"Inference {inference.id} not worthy of action")
+        try:
+            # Stage 1: Rank action
+            logger.debug(f"Stage 1: Ranking inference {inference.id}")
+            action = self.ranker.rank_action(inference, observation)
+
+            if not action:
+                logger.debug(f"Inference {inference.id} not worthy of action")
+                return None
+
+            logger.info(
+                f"Ranked action {action.id}: "
+                f"priority={action.priority.value}, "
+                f"score={action.priority_score:.2f}"
+            )
+
+            # Stage 2: Plan response
+            logger.debug(f"Stage 2: Planning response for action {action.id}")
+            action = await self.planner.plan_response(action, observation, inference)
+
+            # Validate drafts were generated
+            if not action.response_drafts:
+                logger.warning(
+                    f"No response drafts generated for action {action.id}. "
+                    f"Marking as requiring human review."
+                )
+                action.status = ActionStatus.PENDING_REVIEW
+                action.requires_human_review = True
+                action.safe_to_auto_respond = False
+                return action
+
+            logger.info(
+                f"Generated {len(action.response_drafts)} drafts for action {action.id}"
+            )
+
+            # Stage 3: Policy check all drafts
+            logger.debug(f"Stage 3: Policy checking {len(action.response_drafts)} drafts")
+            for draft in action.response_drafts:
+                violations = self.policy_checker.check_draft(draft, action, observation)
+                draft.policy_violations = violations
+
+                # Update action-level policy violations (avoid duplicates)
+                for violation in violations:
+                    # Check if violation with same description already exists
+                    if not any(
+                        v.policy_name == violation.policy_name and
+                        v.description == violation.description
+                        for v in action.policy_violations
+                    ):
+                        action.policy_violations.append(violation)
+
+            # Stage 4: Determine if safe to auto-respond
+            logger.debug(f"Stage 4: Determining auto-response safety")
+            action.safe_to_auto_respond = self._is_safe_to_auto_respond(action)
+
+            # Stage 5: Update status
+            logger.debug(f"Stage 5: Updating action status")
+            if action.safe_to_auto_respond:
+                action.status = ActionStatus.APPROVED
+            else:
+                action.status = ActionStatus.PENDING_REVIEW
+                action.requires_human_review = True
+
+            logger.info(
+                f"Action {action.id} ready: "
+                f"status={action.status.value}, "
+                f"safe_auto={action.safe_to_auto_respond}, "
+                f"violations={len(action.policy_violations)}"
+            )
+
+            return action
+
+        except Exception as e:
+            logger.error(
+                f"Error processing inference {inference.id}: {e}",
+                exc_info=True
+            )
+            # Return None on error - graceful degradation
             return None
-        
-        logger.info(
-            f"Ranked action {action.id}: "
-            f"priority={action.priority.value}, "
-            f"score={action.priority_score:.2f}"
-        )
-        
-        # Stage 2: Plan response
-        action = await self.planner.plan_response(action, observation, inference)
-        
-        logger.info(
-            f"Generated {len(action.response_drafts)} drafts for action {action.id}"
-        )
-        
-        # Stage 3: Policy check all drafts
-        for draft in action.response_drafts:
-            violations = self.policy_checker.check_draft(draft, action, observation)
-            draft.policy_violations = violations
-            
-            # Update action-level policy violations
-            for violation in violations:
-                if violation not in action.policy_violations:
-                    action.policy_violations.append(violation)
-        
-        # Stage 4: Determine if safe to auto-respond
-        action.safe_to_auto_respond = self._is_safe_to_auto_respond(action)
-        
-        # Stage 5: Update status
-        if action.safe_to_auto_respond:
-            action.status = ActionStatus.APPROVED
-        else:
-            action.status = ActionStatus.PENDING_REVIEW
-            action.requires_human_review = True
-        
-        logger.info(
-            f"Action {action.id} ready: "
-            f"status={action.status.value}, "
-            f"safe_auto={action.safe_to_auto_respond}"
-        )
-        
-        return action
     
     async def process_batch(
         self,
@@ -117,35 +148,53 @@ class ActionPipeline:
         observations: Dict[str, NormalizedObservation],
     ) -> List[ActionableSignal]:
         """Process a batch of signal inferences.
-        
+
         Args:
             inferences: List of signal inferences
             observations: Dict mapping observation ID to observation
-            
+
         Returns:
             List of actionable signals, sorted by priority
         """
         actions = []
-        
-        for inference in inferences:
-            observation = observations.get(str(inference.normalized_observation_id))
-            if not observation:
-                logger.warning(
-                    f"No observation found for inference {inference.id}"
+        errors = 0
+
+        logger.info(f"Processing batch of {len(inferences)} inferences")
+
+        for i, inference in enumerate(inferences):
+            try:
+                observation = observations.get(str(inference.normalized_observation_id))
+                if not observation:
+                    logger.warning(
+                        f"No observation found for inference {inference.id}"
+                    )
+                    continue
+
+                action = await self.process_inference(inference, observation)
+                if action:
+                    actions.append(action)
+
+                # Log progress every 10 items
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {i + 1}/{len(inferences)} inferences")
+
+            except Exception as e:
+                errors += 1
+                logger.error(
+                    f"Error processing inference {i+1}/{len(inferences)}: {e}",
+                    exc_info=True
                 )
                 continue
-            
-            action = await self.process_inference(inference, observation)
-            if action:
-                actions.append(action)
-        
+
         # Sort by priority score (descending)
         actions.sort(key=lambda a: a.priority_score, reverse=True)
-        
+
         logger.info(
-            f"Processed {len(inferences)} inferences -> {len(actions)} actions"
+            f"Batch processing complete: "
+            f"{len(inferences)} inferences -> {len(actions)} actions "
+            f"({errors} errors)"
         )
-        
+
         return actions
     
     def _is_safe_to_auto_respond(self, action: ActionableSignal) -> bool:

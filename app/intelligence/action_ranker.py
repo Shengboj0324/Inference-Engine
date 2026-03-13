@@ -11,11 +11,12 @@ Combines multiple signals to produce a calibrated priority score.
 
 import logging
 from typing import List, Dict, Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from app.domain.normalized_models import NormalizedObservation
 from app.domain.inference_models import SignalInference, SignalType
 from app.domain.action_models import ActionableSignal, ActionPriority, ActionStatus, ResponseChannel
+from app.core.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
 
@@ -343,8 +344,15 @@ class ActionRanker:
         ]:
             score = 0.2
 
-        # Boost for public visibility
-        if observation.source_platform.value.lower() in ['twitter', 'reddit', 'linkedin']:
+        # Boost for public visibility (high-reach platforms)
+        public_platforms = [
+            SourcePlatform.REDDIT,
+            SourcePlatform.YOUTUBE,
+            SourcePlatform.TIKTOK,
+            SourcePlatform.FACEBOOK,
+            SourcePlatform.INSTAGRAM,
+        ]
+        if observation.source_platform in public_platforms:
             score = min(1.0, score + 0.1)
 
         # Boost for high virality (public spread)

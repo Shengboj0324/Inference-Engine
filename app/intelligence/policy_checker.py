@@ -64,20 +64,24 @@ class PolicyChecker:
             "number one", "#1", "always works", "never fails",
             "100% effective", "cure", "miracle"
         ]
-        
+
         # Sensitive topics requiring review
         self.sensitive_topics = [
             "legal", "lawsuit", "regulation", "compliance",
             "security breach", "data leak", "hack",
             "discrimination", "harassment", "privacy violation"
         ]
-        
-        # Competitor mention patterns
+
+        # Competitor mention patterns (pre-compiled for efficiency)
         self.competitor_patterns = [
-            r"\bvs\b", r"\bversus\b", r"better than",
-            r"compared to", r"unlike", r"instead of"
+            re.compile(r"\bvs\b", re.IGNORECASE),
+            re.compile(r"\bversus\b", re.IGNORECASE),
+            re.compile(r"better than", re.IGNORECASE),
+            re.compile(r"compared to", re.IGNORECASE),
+            re.compile(r"unlike", re.IGNORECASE),
+            re.compile(r"instead of", re.IGNORECASE),
         ]
-        
+
         # Required disclaimers for certain signal types
         self.disclaimer_requirements = {
             SignalType.LEGAL_RISK: "legal disclaimer",
@@ -147,29 +151,35 @@ class PolicyChecker:
     
     def _check_safety_policy(self, draft: ResponseDraft) -> List[PolicyViolation]:
         """Check safety policy.
-        
+
         Args:
             draft: Response draft
-            
+
         Returns:
             List of violations
         """
         violations = []
+
+        # Null check
+        if not draft.content:
+            return violations
+
         content_lower = draft.content.lower()
-        
+
         # Check for sensitive topics
         for topic in self.sensitive_topics:
             if topic in content_lower:
-                violations.append(
-                    PolicyViolation(
-                        policy_name="safety_sensitive_topics",
-                        violation_type="sensitive_topic",
-                        severity="high",
-                        description=f"Contains sensitive topic: '{topic}'",
-                        blocking=True,
-                    )
+                violation = PolicyViolation(
+                    policy_name="safety_sensitive_topics",
+                    violation_type="sensitive_topic",
+                    severity="high",
+                    description=f"Contains sensitive topic: '{topic}'",
+                    blocking=True,
                 )
-        
+                # Avoid duplicates
+                if not any(v.description == violation.description for v in violations):
+                    violations.append(violation)
+
         return violations
 
     def _check_brand_policy(self, draft: ResponseDraft) -> List[PolicyViolation]:
@@ -182,33 +192,40 @@ class PolicyChecker:
             List of violations
         """
         violations = []
+
+        # Null check
+        if not draft.content:
+            return violations
+
         content_lower = draft.content.lower()
 
         # Check for prohibited claims
         for claim in self.prohibited_claims:
             if claim in content_lower:
-                violations.append(
-                    PolicyViolation(
-                        policy_name="brand_no_unsubstantiated_claims",
-                        violation_type="prohibited_claim",
-                        severity="medium",
-                        description=f"Contains prohibited claim: '{claim}'",
-                        blocking=False,
-                    )
+                violation = PolicyViolation(
+                    policy_name="brand_no_unsubstantiated_claims",
+                    violation_type="prohibited_claim",
+                    severity="medium",
+                    description=f"Contains prohibited claim: '{claim}'",
+                    blocking=False,
                 )
+                # Avoid duplicates
+                if not any(v.description == violation.description for v in violations):
+                    violations.append(violation)
 
-        # Check for competitor mentions
+        # Check for competitor mentions (using pre-compiled patterns)
         for pattern in self.competitor_patterns:
-            if re.search(pattern, content_lower):
-                violations.append(
-                    PolicyViolation(
-                        policy_name="brand_competitor_mention",
-                        violation_type="competitor_mention",
-                        severity="low",
-                        description="Contains competitor comparison - review tone",
-                        blocking=False,
-                    )
+            if pattern.search(content_lower):
+                violation = PolicyViolation(
+                    policy_name="brand_competitor_mention",
+                    violation_type="competitor_mention",
+                    severity="low",
+                    description="Contains competitor comparison - review tone",
+                    blocking=False,
                 )
+                # Avoid duplicates
+                if not any(v.policy_name == "brand_competitor_mention" for v in violations):
+                    violations.append(violation)
                 break  # Only flag once
 
         return violations
@@ -229,10 +246,16 @@ class PolicyChecker:
         """
         violations = []
 
+        # Null check
+        if not draft.content:
+            return violations
+
+        content_lower = draft.content.lower()
+
         # Check for required disclaimers
         required_disclaimer = self.disclaimer_requirements.get(action.signal_type)
         if required_disclaimer:
-            if required_disclaimer.lower() not in draft.content.lower():
+            if required_disclaimer.lower() not in content_lower:
                 violations.append(
                     PolicyViolation(
                         policy_name="legal_required_disclaimer",
@@ -245,7 +268,7 @@ class PolicyChecker:
 
         # Check for pricing mentions without disclaimers
         pricing_keywords = ["free", "discount", "price", "cost", "$", "€", "£"]
-        has_pricing = any(kw in draft.content.lower() for kw in pricing_keywords)
+        has_pricing = any(kw in content_lower for kw in pricing_keywords)
 
         if has_pricing:
             disclaimer_phrases = [
@@ -253,7 +276,7 @@ class PolicyChecker:
                 "see website", "contact sales"
             ]
             has_disclaimer = any(
-                phrase in draft.content.lower() for phrase in disclaimer_phrases
+                phrase in content_lower for phrase in disclaimer_phrases
             )
 
             if not has_disclaimer:
@@ -284,6 +307,20 @@ class PolicyChecker:
             List of violations
         """
         violations = []
+
+        # Null check and empty content check
+        if not draft.content or not draft.content.strip():
+            violations.append(
+                PolicyViolation(
+                    policy_name="quality_empty_content",
+                    violation_type="empty",
+                    severity="critical",
+                    description="Response is empty or whitespace-only",
+                    blocking=True,
+                )
+            )
+            return violations
+
         content_len = len(draft.content)
 
         # Check minimum length
@@ -319,18 +356,6 @@ class PolicyChecker:
                 )
             )
 
-        # Check for empty or whitespace-only content
-        if not draft.content.strip():
-            violations.append(
-                PolicyViolation(
-                    policy_name="quality_empty_content",
-                    violation_type="empty",
-                    severity="critical",
-                    description="Response is empty or whitespace-only",
-                    blocking=True,
-                )
-            )
-
         return violations
 
     def _check_tone_policy(
@@ -348,6 +373,11 @@ class PolicyChecker:
             List of violations
         """
         violations = []
+
+        # Null check
+        if not draft.content:
+            return violations
+
         content_lower = draft.content.lower()
 
         # Check for overly aggressive language

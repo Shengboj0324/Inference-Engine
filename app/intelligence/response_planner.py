@@ -10,7 +10,6 @@ This module implements response planning with:
 
 import logging
 from typing import List, Optional, Dict
-from uuid import uuid4
 
 from app.domain.normalized_models import NormalizedObservation
 from app.domain.inference_models import SignalInference, SignalType
@@ -21,6 +20,7 @@ from app.domain.action_models import (
     PolicyViolation,
 )
 from app.llm.router import get_router
+from app.llm.exceptions import LLMError
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +76,9 @@ class ResponsePlanner:
         """
         # Generate response drafts
         drafts = await self._generate_drafts(action, observation, inference)
-        
-        # Critique and rank drafts
-        ranked_drafts = await self._critique_and_rank_drafts(
+
+        # Critique and rank drafts (sync operation)
+        ranked_drafts = self._critique_and_rank_drafts(
             drafts, action, observation
         )
         
@@ -120,26 +120,30 @@ class ResponsePlanner:
             
             # Generate response
             try:
-                response = await self.llm_router.generate(
+                # Use generate_simple which returns string directly
+                content = await self.llm_router.generate_simple(
                     prompt=prompt,
                     max_tokens=500,
                     temperature=self.temperature,
                 )
-                
-                # Create draft
+
+                # Create draft (confidence will be computed later)
                 draft = ResponseDraft(
                     variant_id=f"v{i+1}_{tone}",
                     channel=action.recommended_channel,
-                    content=response.content.strip(),
+                    content=content.strip(),
                     tone=tone,
-                    confidence=0.8,  # Placeholder
+                    confidence=0.5,  # Will be updated by critique
                     generated_by=self.model_name,
                 )
-                
+
                 drafts.append(draft)
-                
+
+            except LLMError as e:
+                logger.error(f"LLM error generating draft variant {i+1}: {e}")
+                continue
             except Exception as e:
-                logger.error(f"Failed to generate draft variant {i+1}: {e}")
+                logger.error(f"Unexpected error generating draft variant {i+1}: {e}")
                 continue
         
         return drafts
@@ -189,13 +193,13 @@ Generate a {tone} response."""
         
         return f"{system}\n\n{user_message}"
 
-    async def _critique_and_rank_drafts(
+    def _critique_and_rank_drafts(
         self,
         drafts: List[ResponseDraft],
         action: ActionableSignal,
         observation: NormalizedObservation,
     ) -> List[ResponseDraft]:
-        """Critique and rank response drafts.
+        """Critique and rank response drafts (sync operation).
 
         Args:
             drafts: List of response drafts
