@@ -335,10 +335,11 @@ class EnrichmentService:
             if not self._embedding_client:
                 return None
 
-            response = await self._embedding_client.get_embedding(text)
-            if response:
-                logger.debug(f"Generated embedding of dimension {len(response)}")
-                return response
+            response = await self._embedding_client.embed_text(text)
+            vector = response.embedding
+            if vector:
+                logger.debug(f"Generated embedding of dimension {len(vector)}")
+                return vector
 
             return None
 

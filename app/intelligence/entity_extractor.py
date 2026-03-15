@@ -5,8 +5,15 @@ from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 from enum import Enum
 
-import spacy
-from spacy.tokens import Doc
+try:
+    import spacy
+    from spacy.tokens import Doc
+    _SPACY_AVAILABLE = True
+except ImportError:
+    spacy = None  # type: ignore[assignment]
+    Doc = None  # type: ignore[assignment,misc]
+    _SPACY_AVAILABLE = False
+
 from pydantic import BaseModel
 
 from app.core.cache import cached, get_cache_manager
@@ -94,6 +101,11 @@ class EntityExtractor:
 
     def _ensure_model(self):
         """Ensure spaCy model is loaded."""
+        if not _SPACY_AVAILABLE:
+            raise ImportError(
+                "spacy is not installed. Run: pip install spacy && "
+                "python -m spacy download en_core_web_sm"
+            )
         if self._nlp is None:
             try:
                 self._nlp = spacy.load(self.model_name)

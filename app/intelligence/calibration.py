@@ -64,10 +64,7 @@ class Calibrator:
         Returns:
             Signal inference with calibrated probabilities
         """
-        if not inference.predictions:
-            return inference
-        
-        # Apply calibration to each prediction
+        # Apply calibration to each prediction (skip loop when list is empty)
         for prediction in inference.predictions:
             raw_prob = prediction.probability
             
@@ -163,14 +160,18 @@ class Calibrator:
         """
         if not inference.top_prediction:
             return None
-        
-        # For now, return placeholder metrics
-        # In production, these would be computed from validation data
+
+        p = inference.top_prediction.probability
+        # ECE and Brier require a ground-truth label set; we cannot compute them
+        # for a single inference.  Set them to None — the evals module (app/evals/)
+        # computes these properly over a batch with known labels.
+        # Only the confidence interval (simple ±σ approximation) is meaningful here.
+        ci_half = min(0.15, p * (1 - p) ** 0.5)  # σ of Bernoulli, capped at 0.15
         return CalibrationMetrics(
-            expected_calibration_error=0.05,  # Placeholder
-            brier_score=0.1,  # Placeholder
-            confidence_interval_lower=max(0.0, inference.top_prediction.probability - 0.1),
-            confidence_interval_upper=min(1.0, inference.top_prediction.probability + 0.1),
+            expected_calibration_error=None,
+            brier_score=None,
+            confidence_interval_lower=max(0.0, p - ci_half),
+            confidence_interval_upper=min(1.0, p + ci_half),
         )
 
     def fit_temperature(
