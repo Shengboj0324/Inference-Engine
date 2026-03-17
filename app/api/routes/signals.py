@@ -21,9 +21,10 @@ Design principles:
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import AsyncGenerator, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -48,6 +49,12 @@ from app.domain.raw_models import RawObservation
 from app.intelligence.inference_pipeline import InferencePipeline
 
 logger = logging.getLogger(__name__)
+
+# Absolute path to calibration state — resolved at import time so it is
+# correct regardless of the process working directory.
+_CALIBRATION_STATE_PATH: Path = (
+    Path(__file__).resolve().parent.parent.parent / "training" / "calibration_state.json"
+)
 
 router = APIRouter(prefix="/signals", tags=["signals"])
 
@@ -995,38 +1002,54 @@ async def submit_feedback(
             detail=f"'{request.true_signal_type}' is not a valid SignalType value.",
         )
 
-    # Build the FeedbackStore with the current DB session factory and calibrator.
-    from app.intelligence.feedback_store import FeedbackStore
-    from app.intelligence.calibration import ConfidenceCalibrator
-
-    calibrator = ConfidenceCalibrator()
-    store = FeedbackStore(confidence_calibrator=calibrator)
-
     predicted_type: str = (
         signal_db.signal_type.value
         if hasattr(signal_db.signal_type, "value")
         else str(signal_db.signal_type)
     )
     predicted_confidence: float = float(signal_db.action_score or 0.5)
+    rec_id = uuid4()
+    rec_created_at = datetime.now(timezone.utc)
 
-    rec = await store.record(
+    # Persist feedback directly to the DB using the already-open session.
+    from app.core.db_models import SignalFeedbackDB
+    db_row = SignalFeedbackDB(
+        id=rec_id,
         signal_id=signal_id,
         predicted_type=predicted_type,
         true_type=request.true_signal_type,
         predicted_confidence=predicted_confidence,
         user_id=current_user.id,
+        created_at=rec_created_at,
     )
+    db.add(db_row)
+    await db.commit()
+
+    # Update ConfidenceCalibrator in-process so the scalar change is visible
+    # immediately to subsequent requests in the same worker process.
+    from app.intelligence.calibration import ConfidenceCalibrator
+    try:
+        calibrator = ConfidenceCalibrator(state_path=_CALIBRATION_STATE_PATH)
+        calibrator.update(
+            InferenceSignalType(predicted_type),
+            predicted_confidence,
+            predicted_type == request.true_signal_type,
+        )
+    except Exception as exc:
+        # Calibration update failure must never abort the feedback response.
+        logger.warning("Calibration update failed after feedback submission: %s", exc)
 
     logger.info(
-        "Feedback submitted: signal=%s predicted=%s true=%s user=%s",
+        "Feedback submitted: signal=%s predicted=%s true=%s user=%s id=%s",
         signal_id,
         predicted_type,
         request.true_signal_type,
         current_user.id,
+        rec_id,
     )
 
     return FeedbackResponse(
-        feedback_id=rec.id,
+        feedback_id=rec_id,
         signal_id=signal_id,
         predicted_type=predicted_type,
         true_type=request.true_signal_type,

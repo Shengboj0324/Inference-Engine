@@ -33,20 +33,13 @@ from app.domain.inference_models import SignalType
 from app.domain.normalized_models import NormalizedObservation
 from app.intelligence.candidate_retrieval import SignalCandidate
 from app.intelligence.context_memory import ContextMemoryStore
+from app.llm.router import _FRONTIER_SIGNAL_TYPES  # canonical definition, single source of truth
 
 logger = logging.getLogger(__name__)
 
 # Audit logger mirrors the one used by DataResidencyGuard so that risk events
 # appear in the same structured audit stream.
 _AUDIT_LOGGER = logging.getLogger("radar.data_residency.audit")
-
-# High-stakes signal types — mirrors LLMRouter._FRONTIER_SIGNAL_TYPES.
-_FRONTIER_SIGNAL_TYPES: frozenset = frozenset({
-    SignalType.CHURN_RISK,
-    SignalType.LEGAL_RISK,
-    SignalType.SECURITY_CONCERN,
-    SignalType.REPUTATION_RISK,
-})
 
 # Threshold for Step C risk escalation.
 _ESCALATION_SCORE_THRESHOLD: float = 0.5

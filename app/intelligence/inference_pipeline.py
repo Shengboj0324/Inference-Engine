@@ -21,23 +21,32 @@ from app.domain.inference_models import SignalInference
 from app.intelligence.normalization import NormalizationEngine
 from app.intelligence.candidate_retrieval import CandidateRetriever
 from app.intelligence.llm_adjudicator import LLMAdjudicator
-from app.intelligence.calibration import Calibrator
+from app.intelligence.calibration import Calibrator, ConfidenceCalibrator
 from app.intelligence.abstention import AbstentionDecider
+from app.intelligence.cot_reasoner import ChainOfThoughtReasoner
+from app.intelligence.orchestrator import MultiAgentOrchestrator
+from app.intelligence.context_memory import ContextMemoryStore
+from app.intelligence.deliberation import DeliberationEngine
 
 logger = logging.getLogger(__name__)
 
 
 class InferencePipeline:
     """End-to-end inference pipeline orchestrator.
-    
-    Chains together all Phase 2 components:
+
+    Chains together all pipeline components:
     - Normalization
     - Candidate retrieval
-    - LLM adjudication
-    - Calibration
+    - LLM adjudication (with optional E1–E6 enhancements)
+    - ECE calibration (aggregate-level, Stage D)
     - Abstention
+
+    The five enhancement components (E1–E3, E5–E6) are injected into
+    ``LLMAdjudicator`` and default to ``None``, preserving full backward
+    compatibility.  When ``None``, adjudication falls back to the original
+    single-call path.
     """
-    
+
     def __init__(
         self,
         normalization_engine: Optional[NormalizationEngine] = None,
@@ -45,37 +54,52 @@ class InferencePipeline:
         llm_adjudicator: Optional[LLMAdjudicator] = None,
         calibrator: Optional[Calibrator] = None,
         abstention_decider: Optional[AbstentionDecider] = None,
+        # Enhancement components (E1–E3, E5–E6) — all optional
+        confidence_calibrator: Optional[ConfidenceCalibrator] = None,
+        cot_reasoner: Optional[ChainOfThoughtReasoner] = None,
+        orchestrator: Optional[MultiAgentOrchestrator] = None,
+        context_memory: Optional[ContextMemoryStore] = None,
+        deliberation_engine: Optional[DeliberationEngine] = None,
     ):
         """Initialize inference pipeline.
-        
+
         Args:
-            normalization_engine: Normalization engine (creates default if None)
-            candidate_retriever: Candidate retriever (creates default if None)
-            llm_adjudicator: LLM adjudicator (creates default if None)
-            calibrator: Calibrator (creates default if None)
-            abstention_decider: Abstention decider (creates default if None)
+            normalization_engine: Normalization engine (creates default if None).
+            candidate_retriever: Candidate retriever (creates default if None).
+            llm_adjudicator: Pre-built LLM adjudicator.  When provided, the
+                five enhancement params below are ignored (the caller is
+                responsible for injecting them into the adjudicator).
+            calibrator: Aggregate ECE calibrator (creates default if None).
+            abstention_decider: Abstention decider (creates default if None).
+            confidence_calibrator: Per-SignalType temperature-scaling
+                calibrator (E2).  Applied inside adjudication, not after.
+            cot_reasoner: Chain-of-Thought reasoner (E1).
+            orchestrator: Multi-agent orchestrator (E3).
+            context_memory: Per-user vector memory store (E5).
+            deliberation_engine: Pre-adjudication deliberation engine (E6).
         """
         self.normalization_engine = normalization_engine or NormalizationEngine(
-            enable_translation=False,  # Disable for performance
-            enable_entity_extraction=False,  # Disable if spacy not available
+            enable_translation=False,
+            enable_entity_extraction=False,
             enable_embedding_generation=True,
         )
-        
-        self.candidate_retriever = candidate_retriever or CandidateRetriever(
-            top_k=5
-        )
-        
+
+        self.candidate_retriever = candidate_retriever or CandidateRetriever(top_k=5)
+
         self.llm_adjudicator = llm_adjudicator or LLMAdjudicator(
             model_name="gpt-4-turbo",
             temperature=0.3,
+            confidence_calibrator=confidence_calibrator,
+            cot_reasoner=cot_reasoner,
+            orchestrator=orchestrator,
+            context_memory=context_memory,
+            deliberation_engine=deliberation_engine,
         )
-        
-        self.calibrator = calibrator or Calibrator(
-            method="temperature"
-        )
-        
+
+        self.calibrator = calibrator or Calibrator(method="temperature")
+
         self.abstention_decider = abstention_decider or AbstentionDecider()
-        
+
         logger.info("InferencePipeline initialized with all components")
     
     async def run(

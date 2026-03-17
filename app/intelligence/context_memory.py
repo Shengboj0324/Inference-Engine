@@ -19,6 +19,7 @@ Usage::
 """
 
 import asyncio
+import dataclasses
 import logging
 import math
 from dataclasses import dataclass, field
@@ -201,7 +202,6 @@ class ContextMemoryStore:
         scored.sort(key=lambda t: t[0], reverse=True)
         results: List[MemoryRecord] = []
         for sim, rec in scored[:top_k]:
-            import dataclasses
             result = dataclasses.replace(rec, score=sim)
             results.append(result)
         return results

@@ -236,7 +236,7 @@ class LLMAdjudicator:
         return inference
 
     @staticmethod
-    def _format_memory_context(memories: List) -> str:
+    def _format_memory_context(memories: List[Any]) -> str:
         """Format retrieved memory records into a few-shot context block.
 
         Args:
