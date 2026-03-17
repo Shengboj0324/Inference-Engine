@@ -217,7 +217,12 @@ def _make_observation(**kwargs):
 
 
 def _make_candidate(signal_type, score=0.8):
-    return SignalCandidate(signal_type=signal_type, score=score, method="test")
+    return SignalCandidate(
+        signal_type=signal_type,
+        score=score,
+        reasoning="test reasoning",
+        source="test",
+    )
 
 
 def _valid_adjudication_json(**overrides):
