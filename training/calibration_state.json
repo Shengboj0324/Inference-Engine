@@ -1,0 +1,25 @@
+{
+  "version": "1.0",
+  "updated_at": "2026-03-17T00:00:00Z",
+  "scalars": {
+    "support_request": 1.0,
+    "feature_request": 1.0,
+    "bug_report": 1.0,
+    "complaint": 1.0,
+    "praise": 1.0,
+    "competitor_mention": 1.0,
+    "alternative_seeking": 1.0,
+    "price_sensitivity": 1.0,
+    "integration_request": 1.0,
+    "churn_risk": 1.0,
+    "security_concern": 1.0,
+    "legal_risk": 1.0,
+    "reputation_risk": 1.0,
+    "expansion_opportunity": 1.0,
+    "upsell_opportunity": 1.0,
+    "partnership_opportunity": 1.0,
+    "unclear": 1.0,
+    "not_actionable": 1.0
+  }
+}
+

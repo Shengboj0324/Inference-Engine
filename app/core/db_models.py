@@ -566,3 +566,39 @@ class SignalInferenceDB(Base):
     # Relationships
     user: Mapped["User"] = relationship()
     normalized_observation: Mapped["NormalizedObservationDB"] = relationship()
+
+
+class SignalFeedbackDB(Base):
+    """Signal-classification feedback record.
+
+    Stores human corrections to model predictions.  Used by
+    ``FeedbackStore`` to drive online calibration updates via
+    ``ConfidenceCalibrator.update()``.
+
+    Schema notes:
+        * Additive-only — no existing columns are modified.
+        * ``signal_id`` is a soft FK to ``actionable_signals.id`` declared
+          with ``ON DELETE CASCADE`` so rows are pruned when the parent
+          signal is deleted.
+    """
+
+    __tablename__ = "signal_feedback"
+
+    id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    signal_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("actionable_signals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    predicted_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    true_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    predicted_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    user_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow, index=True
+    )

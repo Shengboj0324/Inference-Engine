@@ -95,6 +95,33 @@ class AssignRequest(BaseModel):
     )
 
 
+class FeedbackRequest(BaseModel):
+    """Request body for ``POST /{signal_id}/feedback``.
+
+    The caller supplies the correct signal type for a previously classified
+    signal.  Requires ``TeamRole.ANALYST`` or higher.
+    """
+
+    true_signal_type: str = Field(
+        ...,
+        description="The correct SignalType value string (e.g. 'churn_risk').",
+    )
+    requester_role: TeamRole = Field(
+        ...,
+        description="Role of the requesting user.  Must be ANALYST or higher.",
+    )
+
+
+class FeedbackResponse(BaseModel):
+    """Response body for ``POST /{signal_id}/feedback``."""
+
+    feedback_id: UUID = Field(..., description="UUID of the created feedback record.")
+    signal_id: UUID = Field(..., description="UUID of the signal that was corrected.")
+    predicted_type: str
+    true_type: str
+    predicted_confidence: float
+
+
 class SignalStats(BaseModel):
     """Signal queue statistics."""
 
@@ -897,4 +924,111 @@ async def get_team_digest(
         by_type=by_type,
         unassigned_count=unassigned,
         high_urgency_count=high_urgency,
+    )
+
+
+@router.post(
+    "/{signal_id}/feedback",
+    response_model=FeedbackResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Submit a signal-classification correction",
+    description=(
+        "Record a human correction for a signal's predicted type and trigger "
+        "an online calibration update.  Requires TeamRole.ANALYST or higher."
+    ),
+)
+async def submit_feedback(
+    signal_id: UUID,
+    request: FeedbackRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> FeedbackResponse:
+    """Submit a signal-classification correction.
+
+    The endpoint validates that the target signal exists and belongs to the
+    current user, enforces ``TeamRole.ANALYST`` access, persists the feedback
+    record via ``FeedbackStore``, and triggers a one-step calibration update.
+
+    Args:
+        signal_id: UUID path parameter of the signal being corrected.
+        request: ``FeedbackRequest`` with ``true_signal_type`` and
+            ``requester_role``.
+        current_user: Authenticated user from JWT.
+        db: Async database session.
+
+    Returns:
+        ``FeedbackResponse`` containing the new feedback record's UUID and
+        the signal's predicted / true type pair.
+
+    Raises:
+        HTTPException 403: If the caller's role is below ``ANALYST``.
+        HTTPException 404: If the signal is not found for this user.
+        HTTPException 400: If ``true_signal_type`` is not a valid value.
+    """
+    # Enforce ANALYST-or-higher access gate.
+    if not TeamRole.has_role_at_least(request.requester_role, TeamRole.ANALYST):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="TeamRole.ANALYST or higher required to submit feedback.",
+        )
+
+    # Resolve the target signal and confirm ownership.
+    stmt = select(ActionableSignalDB).where(
+        ActionableSignalDB.id == signal_id,
+        ActionableSignalDB.user_id == current_user.id,
+    )
+    result = await db.execute(stmt)
+    signal_db = result.scalar_one_or_none()
+    if signal_db is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Signal {signal_id} not found.",
+        )
+
+    # Validate the submitted true_signal_type value.
+    from app.domain.inference_models import SignalType as InferenceSignalType
+    try:
+        InferenceSignalType(request.true_signal_type)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{request.true_signal_type}' is not a valid SignalType value.",
+        )
+
+    # Build the FeedbackStore with the current DB session factory and calibrator.
+    from app.intelligence.feedback_store import FeedbackStore
+    from app.intelligence.calibration import ConfidenceCalibrator
+
+    calibrator = ConfidenceCalibrator()
+    store = FeedbackStore(confidence_calibrator=calibrator)
+
+    predicted_type: str = (
+        signal_db.signal_type.value
+        if hasattr(signal_db.signal_type, "value")
+        else str(signal_db.signal_type)
+    )
+    predicted_confidence: float = float(signal_db.action_score or 0.5)
+
+    rec = await store.record(
+        signal_id=signal_id,
+        predicted_type=predicted_type,
+        true_type=request.true_signal_type,
+        predicted_confidence=predicted_confidence,
+        user_id=current_user.id,
+    )
+
+    logger.info(
+        "Feedback submitted: signal=%s predicted=%s true=%s user=%s",
+        signal_id,
+        predicted_type,
+        request.true_signal_type,
+        current_user.id,
+    )
+
+    return FeedbackResponse(
+        feedback_id=rec.id,
+        signal_id=signal_id,
+        predicted_type=predicted_type,
+        true_type=request.true_signal_type,
+        predicted_confidence=predicted_confidence,
     )

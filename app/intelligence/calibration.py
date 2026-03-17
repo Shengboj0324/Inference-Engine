@@ -7,18 +7,24 @@ This module implements Stage D of the inference pipeline:
 - Expected Calibration Error (ECE) computation
 - Brier score computation
 
-Raw model confidence is not trustworthy. This module adds a calibration layer
-to ensure that predicted probabilities match empirical frequencies.
+Also provides ``ConfidenceCalibrator`` — a per-``SignalType`` online
+temperature-scaling calibrator whose learned scalars are persisted in
+``training/calibration_state.json`` and updated via single gradient steps
+on binary cross-entropy loss.
 """
 
+import json
 import logging
-from typing import List, Optional, Tuple, Dict
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 import numpy as np
 from pydantic import BaseModel
 
-from app.domain.inference_models import SignalInference, CalibrationMetrics
+from app.domain.inference_models import SignalInference, CalibrationMetrics, SignalType
 
 logger = logging.getLogger(__name__)
 
@@ -329,4 +335,155 @@ class Calibrator:
         labels = np.array(labels)
 
         return float(np.mean((probabilities - labels) ** 2))
+
+
+# ---------------------------------------------------------------------------
+# ConfidenceCalibrator — per-SignalType online temperature scaling
+# ---------------------------------------------------------------------------
+
+#: Default path for the persisted calibration scalars.
+_DEFAULT_STATE_PATH: Path = Path("training/calibration_state.json")
+
+#: Minimum allowed temperature scalar (prevents division by zero / collapse).
+_T_MIN: float = 0.1
+
+#: Learning rate for the single-step gradient update in ``update()``.
+_LR: float = 0.01
+
+
+class ConfidenceCalibrator:
+    """Per-``SignalType`` post-hoc temperature-scaling calibrator.
+
+    Each ``SignalType`` has its own learned temperature scalar ``T`` (initialised
+    to ``1.0``).  ``calibrate()`` applies the logistic transform
+    ``sigmoid(raw_logit / T)`` to map a raw log-odds score to a calibrated
+    probability.  ``update()`` performs a single gradient-descent step on the
+    binary cross-entropy loss to adjust ``T`` given one labelled example.
+
+    Scalars are persisted to ``state_path`` (a JSON file) after every
+    ``update()`` call so they survive restarts.
+
+    Args:
+        state_path: Path to the JSON file that stores per-``SignalType``
+            temperature scalars.  Defaults to
+            ``training/calibration_state.json``.
+        learning_rate: Step size for the gradient update.  Defaults to
+            ``0.01``.
+    """
+
+    def __init__(
+        self,
+        state_path: Optional[Path] = None,
+        learning_rate: float = _LR,
+    ) -> None:
+        """Initialise and load persisted scalars.
+
+        Args:
+            state_path: Path to ``calibration_state.json``.
+            learning_rate: Gradient-descent step size for ``update()``.
+        """
+        self._state_path: Path = state_path or _DEFAULT_STATE_PATH
+        self._lr: float = learning_rate
+        self._scalars: Dict[str, float] = {}
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def calibrate(self, raw_logit: float, signal_type: SignalType) -> float:
+        """Return the calibrated probability for ``raw_logit``.
+
+        Applies ``sigmoid(raw_logit / T)`` where ``T`` is the learned
+        temperature for ``signal_type``.  When ``T == 1.0`` (default), the
+        result is identical to the plain logistic sigmoid.
+
+        Args:
+            raw_logit: Log-odds score from the LLM or upstream model.
+                Typically derived from the raw confidence probability via
+                ``logit = log(p / (1 - p))``.
+            signal_type: Signal type whose temperature scalar to apply.
+
+        Returns:
+            Calibrated probability in ``[0.0, 1.0]``.
+        """
+        t: float = max(_T_MIN, self._scalars.get(signal_type.value, 1.0))
+        return 1.0 / (1.0 + math.exp(-raw_logit / t))
+
+    def update(
+        self,
+        signal_type: SignalType,
+        predicted_prob: float,
+        true_label: bool,
+    ) -> None:
+        """Perform one gradient step on ``T`` using binary cross-entropy loss.
+
+        The gradient of NLL w.r.t. ``T`` is:
+        ``dL/dT = (p_cal - y) * (−logit / T²)``
+        where ``p_cal = sigmoid(logit / T)`` and ``y ∈ {0, 1}``.
+
+        The scalar is updated as ``T ← max(T_MIN, T − lr * dL/dT)`` and
+        immediately persisted to ``state_path``.
+
+        Args:
+            signal_type: Signal type whose temperature to update.
+            predicted_prob: Raw predicted probability (before calibration).
+            true_label: ``True`` if the prediction was correct.
+        """
+        epsilon: float = 1e-7
+        p: float = max(epsilon, min(1.0 - epsilon, predicted_prob))
+        logit: float = math.log(p / (1.0 - p))
+        t: float = max(_T_MIN, self._scalars.get(signal_type.value, 1.0))
+        p_cal: float = 1.0 / (1.0 + math.exp(-logit / t))
+        y: float = 1.0 if true_label else 0.0
+        gradient: float = (p_cal - y) * (-logit / (t * t))
+        new_t: float = max(_T_MIN, t - self._lr * gradient)
+        self._scalars[signal_type.value] = new_t
+        self._save()
+        logger.debug(
+            "ConfidenceCalibrator.update: signal_type=%s T: %.4f → %.4f",
+            signal_type.value,
+            t,
+            new_t,
+        )
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _load(self) -> None:
+        """Load scalars from ``state_path``.  Falls back to ``T=1.0`` for any
+        missing or unreadable state."""
+        try:
+            if self._state_path.exists():
+                with self._state_path.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                self._scalars = {k: float(v) for k, v in data.get("scalars", {}).items()}
+                logger.info(
+                    "ConfidenceCalibrator: loaded %d scalars from %s",
+                    len(self._scalars),
+                    self._state_path,
+                )
+            else:
+                logger.info(
+                    "ConfidenceCalibrator: state file not found at %s; using T=1.0 for all types",
+                    self._state_path,
+                )
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("ConfidenceCalibrator: failed to load state: %s", exc)
+            self._scalars = {}
+
+    def _save(self) -> None:
+        """Persist current scalars to ``state_path``."""
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload: Dict = {
+                "version": "1.0",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "scalars": self._scalars,
+            }
+            with self._state_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except OSError as exc:
+            logger.error("ConfidenceCalibrator: failed to save state: %s", exc)
 
