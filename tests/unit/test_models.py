@@ -313,3 +313,210 @@ class TestTeamRole:
         assert digest.by_type["churn_risk"] == 4
         assert digest.unassigned_count == 2
         assert digest.high_urgency_count == 4
+
+
+# ============================================================================
+# ConfidenceCalibrator tests (Enhancement 2)
+# ============================================================================
+
+import math
+import tempfile
+import json as _json
+from pathlib import Path
+
+from app.domain.inference_models import SignalType
+from app.intelligence.calibration import ConfidenceCalibrator
+
+
+class TestConfidenceCalibrator:
+    """Unit tests for ``ConfidenceCalibrator`` (per-SignalType temperature scaling)."""
+
+    def _make_calibrator(self, tmp_path: Path, scalars: dict = None) -> ConfidenceCalibrator:
+        """Build a calibrator with a temp state file."""
+        state_file = tmp_path / "calibration_state.json"
+        if scalars is not None:
+            state_file.write_text(
+                _json.dumps({"version": "1.0", "scalars": scalars}), encoding="utf-8"
+            )
+        return ConfidenceCalibrator(state_path=state_file)
+
+    def test_calibrate_identity_at_T1(self, tmp_path: Path) -> None:
+        """T=1.0 should leave sigmoid(logit) unchanged."""
+        cal = self._make_calibrator(tmp_path, {"churn_risk": 1.0})
+        raw_prob = 0.7
+        logit = math.log(raw_prob / (1 - raw_prob))
+        result = cal.calibrate(logit, SignalType.CHURN_RISK)
+        assert abs(result - raw_prob) < 1e-6
+
+    def test_calibrate_sharpens_at_low_T(self, tmp_path: Path) -> None:
+        """T<1.0 sharpens — a 0.7 probability should become higher."""
+        cal = self._make_calibrator(tmp_path, {"churn_risk": 0.5})
+        raw_prob = 0.7
+        logit = math.log(raw_prob / (1 - raw_prob))
+        sharpened = cal.calibrate(logit, SignalType.CHURN_RISK)
+        assert sharpened > raw_prob
+
+    def test_calibrate_flattens_at_high_T(self, tmp_path: Path) -> None:
+        """T>1.0 flattens — a 0.9 probability should come closer to 0.5."""
+        cal = self._make_calibrator(tmp_path, {"churn_risk": 3.0})
+        raw_prob = 0.9
+        logit = math.log(raw_prob / (1 - raw_prob))
+        flattened = cal.calibrate(logit, SignalType.CHURN_RISK)
+        assert flattened < raw_prob
+
+    def test_calibrate_missing_type_defaults_T1(self, tmp_path: Path) -> None:
+        """An unknown SignalType should fall back to T=1.0 (identity)."""
+        cal = self._make_calibrator(tmp_path, {})
+        raw_prob = 0.6
+        logit = math.log(raw_prob / (1 - raw_prob))
+        result = cal.calibrate(logit, SignalType.COMPLAINT)
+        assert abs(result - raw_prob) < 1e-6
+
+    def test_update_adjusts_T_on_wrong_prediction(self, tmp_path: Path) -> None:
+        """update() should move T when predicted label differs from true label."""
+        cal = self._make_calibrator(tmp_path, {"complaint": 1.0})
+        initial_t = cal._scalars.get("complaint", 1.0)
+        # Predicted 0.9 confidence but true_label=False
+        cal.update(SignalType.COMPLAINT, predicted_prob=0.9, true_label=False)
+        new_t = cal._scalars.get("complaint", 1.0)
+        assert new_t != initial_t
+
+    def test_state_roundtrip(self, tmp_path: Path) -> None:
+        """Scalars written by _save() are identical when reloaded by _load()."""
+        cal = self._make_calibrator(tmp_path, {"praise": 1.2})
+        cal.update(SignalType.PRAISE, predicted_prob=0.8, true_label=True)
+        saved_t = cal._scalars["praise"]
+
+        # Reload fresh instance from same file
+        cal2 = ConfidenceCalibrator(state_path=tmp_path / "calibration_state.json")
+        assert abs(cal2._scalars.get("praise", 0.0) - saved_t) < 1e-9
+
+    def test_update_does_not_go_below_t_min(self, tmp_path: Path) -> None:
+        """Temperature must never drop below the minimum (0.1)."""
+        cal = self._make_calibrator(tmp_path, {"bug_report": 0.11})
+        # Many aggressive updates should hit the floor
+        for _ in range(1000):
+            cal.update(SignalType.BUG_REPORT, predicted_prob=0.9, true_label=False)
+        assert cal._scalars["bug_report"] >= 0.1
+
+
+# ============================================================================
+# FeedbackStore tests (Enhancement 4)
+# ============================================================================
+
+import pytest as _pytest
+from uuid import uuid4 as _uuid4
+from app.intelligence.feedback_store import FeedbackRecord, FeedbackStore
+
+
+class TestFeedbackRecord:
+    """Tests for the ``FeedbackRecord`` dataclass."""
+
+    def test_fields_populated(self) -> None:
+        """All required fields are stored correctly."""
+        sid = _uuid4()
+        uid = _uuid4()
+        rec = FeedbackRecord(
+            signal_id=sid,
+            predicted_type="complaint",
+            true_type="churn_risk",
+            predicted_confidence=0.75,
+            user_id=uid,
+        )
+        assert rec.signal_id == sid
+        assert rec.predicted_type == "complaint"
+        assert rec.true_type == "churn_risk"
+        assert abs(rec.predicted_confidence - 0.75) < 1e-9
+        assert rec.user_id == uid
+
+    def test_id_is_uuid(self) -> None:
+        """Auto-generated id is a UUID."""
+        rec = FeedbackRecord(
+            signal_id=_uuid4(),
+            predicted_type="praise",
+            true_type="praise",
+            predicted_confidence=0.9,
+            user_id=_uuid4(),
+        )
+        from uuid import UUID
+        assert isinstance(rec.id, UUID)
+
+    def test_created_at_is_utc(self) -> None:
+        """created_at is timezone-aware."""
+        from datetime import timezone
+        rec = FeedbackRecord(
+            signal_id=_uuid4(),
+            predicted_type="feature_request",
+            true_type="feature_request",
+            predicted_confidence=0.8,
+            user_id=_uuid4(),
+        )
+        assert rec.created_at.tzinfo is not None
+
+
+class TestFeedbackStore:
+    """Tests for ``FeedbackStore`` (in-memory backend)."""
+
+    @_pytest.mark.asyncio
+    async def test_record_appends_to_memory(self) -> None:
+        """record() persists a FeedbackRecord in the in-memory list."""
+        store = FeedbackStore()
+        rec = await store.record(
+            signal_id=_uuid4(),
+            predicted_type="complaint",
+            true_type="churn_risk",
+            predicted_confidence=0.7,
+            user_id=_uuid4(),
+        )
+        assert isinstance(rec, FeedbackRecord)
+        recent = await store.get_recent(limit=10)
+        assert len(recent) == 1
+        assert recent[0].predicted_type == "complaint"
+
+    @_pytest.mark.asyncio
+    async def test_get_recent_respects_limit(self) -> None:
+        """get_recent(limit=N) returns at most N records."""
+        store = FeedbackStore()
+        for _ in range(5):
+            await store.record(
+                signal_id=_uuid4(),
+                predicted_type="praise",
+                true_type="praise",
+                predicted_confidence=0.9,
+                user_id=_uuid4(),
+            )
+        recent = await store.get_recent(limit=2)
+        assert len(recent) == 2
+
+    @_pytest.mark.asyncio
+    async def test_get_recent_newest_first(self) -> None:
+        """get_recent() returns records ordered newest first."""
+        store = FeedbackStore()
+        for label in ["a", "b", "c"]:
+            await store.record(
+                signal_id=_uuid4(),
+                predicted_type=label,
+                true_type=label,
+                predicted_confidence=0.5,
+                user_id=_uuid4(),
+            )
+        recent = await store.get_recent()
+        # Newest is last inserted → first in result
+        assert recent[0].predicted_type == "c"
+
+    @_pytest.mark.asyncio
+    async def test_calibrator_update_called(self, tmp_path: Path) -> None:
+        """record() calls calibrator.update() when a calibrator is injected."""
+        state_file = tmp_path / "calibration_state.json"
+        cal = ConfidenceCalibrator(state_path=state_file)
+        store = FeedbackStore(confidence_calibrator=cal)
+        before_t = cal._scalars.get("complaint", 1.0)
+        await store.record(
+            signal_id=_uuid4(),
+            predicted_type="complaint",
+            true_type="churn_risk",  # wrong → true_label=False
+            predicted_confidence=0.8,
+            user_id=_uuid4(),
+        )
+        after_t = cal._scalars.get("complaint", 1.0)
+        assert after_t != before_t

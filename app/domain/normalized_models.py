@@ -126,6 +126,17 @@ class NormalizedObservation(BaseModel):
     )
     virality_score: Optional[float] = Field(None, ge=0.0, le=1.0)
     
+    # Inference hints
+    confidence_required: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum confidence threshold required for this observation. "
+            "When > 0.85, ChainOfThoughtReasoner is activated in LLMAdjudicator."
+        ),
+    )
+
     # Embeddings
     embedding: Optional[List[float]] = Field(
         None,

@@ -6,24 +6,31 @@ This module implements Stage C of the inference pipeline:
 - Evidence extraction and rationale generation
 - Abstention support for uncertain cases
 - Retry logic with structured repair prompts
+- Optional Chain-of-Thought, multi-agent, and deliberation reasoning paths
+- Per-SignalType confidence calibration via ``ConfidenceCalibrator``
+- Per-user context-memory RAG retrieval via ``ContextMemoryStore``
+
+All optional components default to ``None`` so existing call-sites that do not
+inject them continue to work without any code changes.
 
 Follows the strict contract defined in app/domain/inference_models.py
 """
 
 import logging
 import json
-from typing import List, Optional, Dict, Any
+import math
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, ValidationError
 
 from app.domain.normalized_models import NormalizedObservation
 from app.domain.inference_models import (
+    AbstentionReason,
+    EvidenceSpan,
     SignalInference,
     SignalPrediction,
     SignalType,
-    AbstentionReason,
-    EvidenceSpan,
 )
 from app.intelligence.candidate_retrieval import SignalCandidate
 from app.llm.models import LLMMessage
@@ -49,32 +56,78 @@ class LLMAdjudicationOutput(BaseModel):
 
 class LLMAdjudicator:
     """LLM-based signal classification with structured outputs.
-    
-    This is Stage C of the inference pipeline as defined in the blueprint.
+
+    Stage C of the inference pipeline.  Supports three reasoning paths:
+    1. **single_call** — default; one prompt, one LLM call (existing behaviour).
+    2. **chain_of_thought** — four-turn CoT conversation via ``ChainOfThoughtReasoner``.
+    3. **multi_agent** — parallel per-candidate sub-tasks via ``MultiAgentOrchestrator``.
+
+    The active path is selected by ``DeliberationEngine`` (Enhancement 6) when
+    injected.  When none of the optional components are provided the adjudicator
+    behaves identically to the original implementation.
+
+    Args:
+        model_name: Model name passed to ``SignalInference.model_name``.
+        temperature: Sampling temperature for LLM calls.
+        max_retries: Maximum JSON-repair retries.
+        confidence_calibrator: Optional ``ConfidenceCalibrator``; calibrates
+            ``SignalPrediction.probability`` in ``_convert_to_inference``.
+        cot_reasoner: Optional ``ChainOfThoughtReasoner``; used when the
+            deliberation mode is ``"chain_of_thought"`` or CoT conditions met.
+        orchestrator: Optional ``MultiAgentOrchestrator``; used when the
+            deliberation mode is ``"multi_agent"`` or complexity thresholds hit.
+        context_memory: Optional ``ContextMemoryStore``; prepends retrieved
+            past observations as few-shot context in ``_build_prompt`` and
+            stores each successful inference after adjudication.
+        deliberation_engine: Optional ``DeliberationEngine``; runs before the
+            main LLM call to prune candidates and select the reasoning path.
     """
-    
+
     def __init__(
         self,
         model_name: str = "gpt-4-turbo",
         temperature: float = 0.3,
         max_retries: int = 3,
-    ):
-        """Initialize LLM adjudicator.
-        
+        confidence_calibrator: Optional[object] = None,
+        cot_reasoner: Optional[object] = None,
+        orchestrator: Optional[object] = None,
+        context_memory: Optional[object] = None,
+        deliberation_engine: Optional[object] = None,
+    ) -> None:
+        """Initialise the adjudicator.
+
         Args:
-            model_name: LLM model to use
-            temperature: Sampling temperature
-            max_retries: Maximum number of retries for malformed outputs
+            model_name: LLM model identifier (stored in ``SignalInference``).
+            temperature: Sampling temperature.
+            max_retries: JSON-repair retry budget.
+            confidence_calibrator: Optional ``ConfidenceCalibrator`` instance.
+            cot_reasoner: Optional ``ChainOfThoughtReasoner`` instance.
+            orchestrator: Optional ``MultiAgentOrchestrator`` instance.
+            context_memory: Optional ``ContextMemoryStore`` instance.
+            deliberation_engine: Optional ``DeliberationEngine`` instance.
         """
         self.model_name = model_name
         self.temperature = temperature
         self.max_retries = max_retries
-        
-        # Initialize LLM router
+        self._confidence_calibrator = confidence_calibrator
+        self._cot_reasoner = cot_reasoner
+        self._orchestrator = orchestrator
+        self._context_memory = context_memory
+        self._deliberation_engine = deliberation_engine
+
+        # Initialise LLM router.
         self.llm_router = get_router()
-        
+
         logger.info(
-            f"LLMAdjudicator initialized: model={model_name}, temp={temperature}"
+            "LLMAdjudicator initialized: model=%s temp=%s calibrator=%s cot=%s "
+            "orchestrator=%s memory=%s deliberation=%s",
+            model_name,
+            temperature,
+            "yes" if confidence_calibrator else "no",
+            "yes" if cot_reasoner else "no",
+            "yes" if orchestrator else "no",
+            "yes" if context_memory else "no",
+            "yes" if deliberation_engine else "no",
         )
     
     async def adjudicate(
@@ -82,54 +135,147 @@ class LLMAdjudicator:
         observation: NormalizedObservation,
         candidates: List[SignalCandidate],
     ) -> SignalInference:
-        """Adjudicate signal type for an observation.
-        
+        """Adjudicate signal type for an observation using the active reasoning path.
+
+        Execution flow:
+        1. ``DeliberationEngine`` (E6) prunes candidates and selects the mode.
+        2. ``ContextMemoryStore`` (E5) retrieves past observations for the user.
+        3. The selected reasoning path (single_call / CoT / multi_agent) runs.
+        4. ``ConfidenceCalibrator`` (E2) adjusts per-prediction probabilities.
+        5. ``ContextMemoryStore`` (E5) stores the result for future retrievals.
+
+        Every optional stage is ``None``-guarded with a ``try/except`` fallback
+        so any injection failure degrades gracefully to the single-call path.
+
         Args:
-            observation: Normalized observation
-            candidates: Candidate signal types from retrieval
-            
+            observation: Normalized observation to classify.
+            candidates: Candidate signal types from the retrieval stage.
+
         Returns:
-            Signal inference with structured predictions
+            Calibrated ``SignalInference`` produced by the active reasoning path.
         """
-        # Build prompt
-        prompt = self._build_prompt(observation, candidates)
+        # ── Step 1: Deliberation (E6) ─────────────────────────────────────
+        reasoning_mode: str = "single_call"
+        if self._deliberation_engine is not None:
+            try:
+                report = await self._deliberation_engine.deliberate(observation, candidates)
+                candidates = report.pruned_candidates
+                reasoning_mode = report.reasoning_mode
+            except Exception as exc:
+                logger.warning("Deliberation failed; using full candidate list: %s", exc)
 
-        # Determine the top-candidate signal type for tiered routing.
-        # High-stakes types (CHURN_RISK, LEGAL_RISK, etc.) will route to the
-        # frontier model; all others route to the fine-tuned model if configured.
-        top_candidate_type = candidates[0].signal_type if candidates else None
+        # ── Step 2: Context-memory retrieval (E5) ─────────────────────────
+        memory_context: str = ""
+        if self._context_memory is not None:
+            try:
+                memories = await self._context_memory.retrieve(
+                    user_id=observation.user_id,
+                    query_text=observation.normalized_text or "",
+                    top_k=3,
+                )
+                memory_context = self._format_memory_context(memories)
+            except Exception as exc:
+                logger.warning("Context-memory retrieval failed: %s", exc)
 
-        # Call LLM with retries (passes signal_type for tiered routing)
-        llm_output = await self._call_llm_with_retries(prompt, signal_type=top_candidate_type)
-        
-        # Parse and validate output
-        try:
-            adjudication = LLMAdjudicationOutput(**llm_output)
-        except ValidationError as e:
-            logger.error(f"Failed to validate LLM output: {e}")
-            # Return abstention
-            return self._create_abstention_inference(
-                observation,
-                AbstentionReason.MALFORMED_OUTPUT,
-                "LLM output failed validation"
+        top_candidate_type: Optional[SignalType] = (
+            candidates[0].signal_type if candidates else None
+        )
+
+        # ── Step 3: CoT trigger check (E1) ───────────────────────────────
+        cot_triggered: bool = (
+            (observation.confidence_required > 0.85)
+            or (
+                len(candidates) >= 2
+                and abs(candidates[0].score - candidates[1].score) < 0.1
             )
-        
-        # Convert to SignalInference
-        return self._convert_to_inference(observation, adjudication)
+        )
+
+        # ── Step 4: Routing to the selected reasoning path ────────────────
+        adjudication: Optional[LLMAdjudicationOutput] = None
+
+        if (reasoning_mode == "chain_of_thought" or cot_triggered) and self._cot_reasoner is not None:
+            try:
+                adjudication = await self._cot_reasoner.reason(
+                    observation, candidates, top_candidate_type
+                )
+            except Exception as exc:
+                logger.warning("CoT reasoning failed; falling back to single_call: %s", exc)
+
+        if adjudication is None and reasoning_mode == "multi_agent" and self._orchestrator is not None:
+            try:
+                adjudication = await self._orchestrator.orchestrate(
+                    observation, candidates, top_candidate_type
+                )
+            except Exception as exc:
+                logger.warning("Multi-agent orchestration failed; falling back to single_call: %s", exc)
+
+        if adjudication is None:
+            # Default: single-call path (original behaviour)
+            prompt = self._build_prompt(observation, candidates, memory_context=memory_context)
+            llm_output = await self._call_llm_with_retries(prompt, signal_type=top_candidate_type)
+            try:
+                adjudication = LLMAdjudicationOutput(**llm_output)
+            except ValidationError as exc:
+                logger.error("Failed to validate LLM output: %s", exc)
+                return self._create_abstention_inference(
+                    observation,
+                    AbstentionReason.MALFORMED_OUTPUT,
+                    "LLM output failed validation",
+                )
+
+        # ── Step 5: Convert + calibrate (E2) ─────────────────────────────
+        inference = self._convert_to_inference(observation, adjudication)
+
+        # ── Step 6: Store in context memory (E5) ─────────────────────────
+        if self._context_memory is not None and not inference.abstained:
+            try:
+                await self._context_memory.store(observation.user_id, observation, inference)
+            except Exception as exc:
+                logger.warning("Context-memory storage failed: %s", exc)
+
+        return inference
+
+    @staticmethod
+    def _format_memory_context(memories: List) -> str:
+        """Format retrieved memory records into a few-shot context block.
+
+        Args:
+            memories: ``MemoryRecord`` instances returned by ``ContextMemoryStore.retrieve()``.
+
+        Returns:
+            Formatted multi-line string for injection into ``_build_prompt``.
+        """
+        if not memories:
+            return ""
+        lines = ["### RELEVANT PAST OBSERVATIONS"]
+        for i, mem in enumerate(memories, 1):
+            lines.append(
+                f"{i}. [{mem.signal_type.value} | conf={mem.confidence:.2f}] "
+                f"{mem.normalized_text[:120]}..."
+            )
+        return "\n".join(lines)
     
     def _build_prompt(
         self,
         observation: NormalizedObservation,
         candidates: List[SignalCandidate],
+        memory_context: str = "",
     ) -> str:
         """Build few-shot prompt for LLM adjudication.
-        
+
+        When ``memory_context`` is non-empty (populated by ``ContextMemoryStore``
+        retrieval), a ``### RELEVANT PAST OBSERVATIONS`` section is prepended to
+        the user message so the LLM has in-context few-shot history.
+
         Args:
-            observation: Normalized observation
-            candidates: Candidate signal types
-            
+            observation: Normalized observation to classify.
+            candidates: Candidate signal types from the retrieval stage.
+            memory_context: Pre-formatted past-observation context from
+                ``ContextMemoryStore.retrieve()``; injected before the current
+                content when non-empty.
+
         Returns:
-            Prompt string
+            Fully assembled prompt string.
         """
         # Build signal-type glossary from dispatch table for injection into system prompt.
         signal_glossary = "\n".join(
@@ -173,23 +319,26 @@ ABSTENTION RULE: Set abstain=true and top type to "unclear" or "not_actionable" 
 - Your confidence is below 0.6
 - Multiple signal types are equally plausible and you cannot distinguish them
 - The content is in a language you cannot reliably translate"""
-        
+
         # Few-shot examples
         examples = self._get_few_shot_examples()
-        
+
+        # Memory context prefix (E5 — prepended when available)
+        memory_prefix = f"{memory_context}\n\n" if memory_context else ""
+
         # User message
-        user_message = f"""Analyze this content:
+        user_message = (
+            f"{memory_prefix}"
+            f"Analyze this content:\n\n"
+            f"Title: {observation.title or 'N/A'}\n"
+            f"Text: {observation.normalized_text[:1000] if observation.normalized_text else 'N/A'}\n"
+            f"Platform: {observation.source_platform.value}\n"
+            f"Language: {observation.original_language or 'unknown'}\n\n"
+            f"Candidate signals (from retrieval):\n"
+            f"{self._format_candidates(candidates)}\n\n"
+            f"Classify this content and output valid JSON."
+        )
 
-Title: {observation.title or 'N/A'}
-Text: {observation.normalized_text[:1000] if observation.normalized_text else 'N/A'}
-Platform: {observation.source_platform.value}
-Language: {observation.original_language or 'unknown'}
-
-Candidate signals (from retrieval):
-{self._format_candidates(candidates)}
-
-Classify this content and output valid JSON."""
-        
         # Combine
         full_prompt = f"{system}\n\n{examples}\n\n{user_message}"
         return full_prompt
@@ -379,34 +528,48 @@ Output:
         observation: NormalizedObservation,
         adjudication: LLMAdjudicationOutput,
     ) -> SignalInference:
-        """Convert LLM adjudication to SignalInference.
+        """Convert LLM adjudication to a calibrated ``SignalInference``.
+
+        When ``self._confidence_calibrator`` is set, each ``SignalPrediction``
+        probability is converted to a log-odds score and passed through
+        ``ConfidenceCalibrator.calibrate()`` before the ``SignalInference`` is
+        constructed.
 
         Args:
-            observation: Normalized observation
-            adjudication: LLM adjudication output
+            observation: Normalized observation.
+            adjudication: Structured LLM adjudication output.
 
         Returns:
-            Signal inference
+            Calibrated ``SignalInference``.
         """
-        # Parse predictions
-        predictions = []
+        # Parse predictions, applying per-type calibration (E2) when available.
+        predictions: List[SignalPrediction] = []
         for signal_type_str in adjudication.candidate_signal_types:
             try:
                 signal_type = SignalType(signal_type_str)
-                # Assign confidence based on position
-                if signal_type_str == adjudication.primary_signal_type:
-                    confidence = adjudication.confidence
+                raw_prob: float = (
+                    adjudication.confidence
+                    if signal_type_str == adjudication.primary_signal_type
+                    else adjudication.confidence * 0.5
+                )
+                # E2: apply per-SignalType temperature-scaling calibration.
+                if self._confidence_calibrator is not None:
+                    epsilon = 1e-7
+                    p = max(epsilon, min(1.0 - epsilon, raw_prob))
+                    raw_logit: float = math.log(p / (1.0 - p))
+                    calibrated_prob: float = self._confidence_calibrator.calibrate(
+                        raw_logit, signal_type
+                    )
                 else:
-                    confidence = adjudication.confidence * 0.5  # Lower for non-primary
-
+                    calibrated_prob = raw_prob
                 predictions.append(
                     SignalPrediction(
                         signal_type=signal_type,
-                        probability=confidence,
+                        probability=calibrated_prob,
                     )
                 )
             except ValueError:
-                logger.warning(f"Invalid signal type: {signal_type_str}")
+                logger.warning("Invalid signal type: %s", signal_type_str)
 
         # Get top prediction
         top_prediction = predictions[0] if predictions else None
