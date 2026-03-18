@@ -1,0 +1,17 @@
+algorithm,n,predicted_ms,sla_ok
+BloomFilter (total n ops),1000000,12930.0,False
+BloomFilter (total n ops),10000000,129300.0,False
+BloomFilter (total n ops),100000000,1293000.0,False
+BloomFilter (total n ops),1000000000,12930000.0,False
+ReservoirSampler,1000000,1016.0,False
+ReservoirSampler,10000000,10160.0,False
+ReservoirSampler,100000000,101600.0,False
+ReservoirSampler,1000000000,1016000.0,False
+ConfidenceCalibrator (no I/O),1000000,6466.0,False
+ConfidenceCalibrator (no I/O),10000000,64660.0,False
+ConfidenceCalibrator (no I/O),100000000,646600.0,False
+ConfidenceCalibrator (no I/O),1000000000,6466000.0,False
+BFS (degree-4 graph),1000000,227.0,True
+BFS (degree-4 graph),10000000,2270.0,False
+BFS (degree-4 graph),100000000,22700.0,False
+BFS (degree-4 graph),1000000000,227000.0,False
