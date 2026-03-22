@@ -13,7 +13,7 @@ This is the main integration point between Phase 4 (Ingestion) and Phase 3 (Work
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from uuid import UUID
 import asyncio
 
@@ -22,10 +22,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.models import ContentItem
 from app.core.signal_models import ActionableSignal
 from app.core.db_models import ContentItemDB, ActionableSignalDB
+from app.domain.raw_models import RawObservation
+from app.domain.normalized_models import NormalizedObservation
+from app.domain.inference_models import SignalInference
+from app.domain.action_models import ActionableSignal as DomainActionableSignal
 from app.ingestion.content_ingestor import ContentIngestor
 from app.ingestion.normalization_engine import NormalizationEngine
 from app.ingestion.enrichment_service import EnrichmentService
 from app.intelligence.signal_classifier import SignalClassifier
+from app.intelligence.inference_pipeline import InferencePipeline
+from app.intelligence.action_pipeline import ActionPipeline
 from app.workflows.orchestrator import WorkflowOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -97,25 +103,38 @@ class PipelineOrchestrator:
         enrichment_service: Optional[EnrichmentService] = None,
         signal_classifier: Optional[SignalClassifier] = None,
         workflow_orchestrator: Optional[WorkflowOrchestrator] = None,
+        inference_pipeline: Optional[InferencePipeline] = None,
+        action_pipeline: Optional[ActionPipeline] = None,
     ):
         """Initialize pipeline orchestrator.
 
         Args:
-            db_session: Database session
-            content_ingestor: Content ingestor instance (created if None)
-            normalization_engine: Normalization engine instance (created if None)
-            enrichment_service: Enrichment service instance (created if None)
-            signal_classifier: Signal classifier instance (created if None)
-            workflow_orchestrator: Workflow orchestrator instance (created if None)
+            db_session: Database session.
+            content_ingestor: Content ingestor instance (created if None).
+            normalization_engine: Legacy normalization engine (created if None).
+                Only used by the legacy ``run_full_pipeline()`` path.
+            enrichment_service: Enrichment service instance (created if None).
+                Only used by the legacy ``run_full_pipeline()`` path.
+            signal_classifier: Legacy signal classifier (created if None).
+                Only used by the legacy ``run_full_pipeline()`` path.
+            workflow_orchestrator: Workflow orchestrator instance (created if None).
+            inference_pipeline: New-stack InferencePipeline (created lazily if
+                None).  Used by ``run_unified_pipeline()``.
+            action_pipeline: New-stack ActionPipeline (created lazily if None).
+                Used by ``run_unified_pipeline()``.
         """
         self.db = db_session
 
-        # Initialize components
+        # Legacy components (kept for backward compatibility)
         self.content_ingestor = content_ingestor or ContentIngestor(db_session)
         self.normalization_engine = normalization_engine or NormalizationEngine()
         self.enrichment_service = enrichment_service or EnrichmentService()
         self.signal_classifier = signal_classifier or SignalClassifier()
         self.workflow_orchestrator = workflow_orchestrator or WorkflowOrchestrator()
+
+        # New canonical serving path components
+        self._inference_pipeline: Optional[InferencePipeline] = inference_pipeline
+        self._action_pipeline: Optional[ActionPipeline] = action_pipeline
 
         # Metrics
         self.metrics = PipelineMetrics()
@@ -413,3 +432,154 @@ class PipelineOrchestrator:
             Dictionary of metrics
         """
         return self.metrics.get_summary()
+
+    # ------------------------------------------------------------------
+    # New canonical serving path via InferencePipeline + ActionPipeline
+    # ------------------------------------------------------------------
+
+    @property
+    def inference_pipeline(self) -> InferencePipeline:
+        """Lazy-initialise and return the canonical InferencePipeline.
+
+        Returns:
+            The shared ``InferencePipeline`` instance.
+        """
+        if self._inference_pipeline is None:
+            self._inference_pipeline = InferencePipeline()
+            logger.info("PipelineOrchestrator: lazily created InferencePipeline")
+        return self._inference_pipeline
+
+    @property
+    def action_pipeline(self) -> ActionPipeline:
+        """Lazy-initialise and return the canonical ActionPipeline.
+
+        Returns:
+            The shared ``ActionPipeline`` instance.
+        """
+        if self._action_pipeline is None:
+            self._action_pipeline = ActionPipeline()
+            logger.info("PipelineOrchestrator: lazily created ActionPipeline")
+        return self._action_pipeline
+
+    async def run_unified_pipeline(
+        self,
+        user_id: UUID,
+        concurrency: int = 5,
+    ) -> Dict:
+        """Run the canonical intelligence serving path for a user.
+
+        This is the authoritative execution path that replaces the legacy
+        ``NormalizationEngine → EnrichmentService → SignalClassifier`` chain
+        with the new ``InferencePipeline → ActionPipeline`` stack.
+
+        Execution flow
+        --------------
+        1. Fetch content items via ``ContentIngestor``.
+        2. Bridge each ``ContentItem`` to a ``RawObservation`` (domain layer).
+        3. Run all observations through ``InferencePipeline`` concurrently.
+        4. Run all non-abstained inferences through ``ActionPipeline``.
+        5. Return a structured execution summary.
+
+        Args:
+            user_id: User ID to process content for.
+            concurrency: Maximum concurrent ``InferencePipeline.run()`` calls.
+
+        Returns:
+            Execution summary dict with keys ``items_fetched``,
+            ``inferences_produced``, ``actions_produced``,
+            ``abstentions``, ``duration_seconds``.
+
+        Raises:
+            Exception: Any un-recoverable error from the ingestor propagates;
+                per-item failures are logged and skipped.
+        """
+        logger.info("run_unified_pipeline: starting for user %s", user_id)
+        start_time = asyncio.get_event_loop().time()
+
+        # Stage 1: Fetch
+        content_items = await self.content_ingestor.fetch_from_sources(user_id)
+        logger.info("run_unified_pipeline: fetched %d items", len(content_items))
+
+        if not content_items:
+            return {
+                "status": "success",
+                "items_fetched": 0,
+                "inferences_produced": 0,
+                "actions_produced": 0,
+                "abstentions": 0,
+                "duration_seconds": asyncio.get_event_loop().time() - start_time,
+            }
+
+        # Stage 2: Bridge ContentItem → RawObservation
+        raw_observations: List[RawObservation] = [
+            self._content_item_to_raw_observation(item) for item in content_items
+        ]
+
+        # Stage 3: Inference (concurrently via InferencePipeline.run_batch)
+        pipeline_results: List[Tuple[NormalizedObservation, SignalInference]] = (
+            await self.inference_pipeline.run_batch(
+                raw_observations, concurrency=concurrency
+            )
+        )
+        logger.info("run_unified_pipeline: produced %d inferences", len(pipeline_results))
+
+        # Stage 4: Action ranking for non-abstained inferences
+        obs_by_id: Dict[str, NormalizedObservation] = {
+            str(norm.id): norm for norm, _ in pipeline_results
+        }
+        inferences: List[SignalInference] = [inf for _, inf in pipeline_results]
+        non_abstained = [inf for inf in inferences if not inf.abstained]
+        abstentions = len(inferences) - len(non_abstained)
+
+        actions: List[DomainActionableSignal] = await self.action_pipeline.process_batch(
+            non_abstained, obs_by_id
+        )
+        logger.info("run_unified_pipeline: produced %d actions", len(actions))
+
+        duration = asyncio.get_event_loop().time() - start_time
+        self.metrics.record_pipeline_run(
+            fetched=len(content_items),
+            normalized=len(pipeline_results),
+            signals=len(actions),
+        )
+
+        return {
+            "status": "success",
+            "items_fetched": len(content_items),
+            "inferences_produced": len(inferences),
+            "actions_produced": len(actions),
+            "abstentions": abstentions,
+            "duration_seconds": duration,
+        }
+
+    @staticmethod
+    def _content_item_to_raw_observation(item: ContentItem) -> RawObservation:
+        """Bridge a legacy ``ContentItem`` to a domain-layer ``RawObservation``.
+
+        Maps every overlapping field directly.  Platform-specific metadata
+        stored in ``ContentItem.metadata`` is passed through as
+        ``RawObservation.platform_metadata`` so that engagement signals
+        (upvotes, shares, etc.) remain available to the normalization engine.
+
+        Args:
+            item: Legacy ``ContentItem`` produced by ``ContentIngestor``.
+
+        Returns:
+            ``RawObservation`` ready for ``InferencePipeline.run()``.
+        """
+        return RawObservation(
+            id=item.id,
+            user_id=item.user_id,
+            source_platform=item.source_platform,
+            source_id=item.source_id,
+            source_url=item.source_url,
+            author=item.author,
+            channel=item.channel,
+            title=item.title,
+            raw_text=item.raw_text,
+            media_type=item.media_type,
+            media_urls=item.media_urls,
+            published_at=item.published_at,
+            fetched_at=item.fetched_at,
+            platform_metadata=item.metadata,
+        )

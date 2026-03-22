@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import numpy as np
 from sklearn.calibration import calibration_curve
@@ -141,4 +141,68 @@ class CalibrationEvaluator:
             n, self.n_bins, ece, brier, overconfidence_rate,
         )
         return report
+
+    def gate(
+        self,
+        report: CalibrationReport,
+        ece_threshold: float = 0.10,
+        brier_threshold: float = 0.25,
+    ) -> Tuple[bool, str]:
+        """Evaluate a ``CalibrationReport`` against deployment thresholds.
+
+        Intended to be called as a deployment gate — a release should only
+        proceed to production when this method returns ``(True, ...)``.
+
+        Threshold rationale
+        -------------------
+        * ``ece_threshold = 0.10``: ECE of 0.10 means that the average
+          gap between predicted confidence and observed accuracy is at most
+          10 percentage points — acceptable for a production classifier.
+          Below 0.05 is excellent; above 0.15 indicates systematic
+          overconfidence and is not acceptable for autonomous action.
+        * ``brier_threshold = 0.25``: The Brier score for a random classifier
+          on a balanced binary problem is 0.25.  Any model whose Brier score
+          exceeds this threshold is no better than random and must not be
+          deployed.
+
+        Args:
+            report: ``CalibrationReport`` produced by ``evaluate()``.
+            ece_threshold: Maximum allowed ECE (default 0.10).
+                Lower is stricter.
+            brier_threshold: Maximum allowed Brier score (default 0.25).
+                Lower is stricter.
+
+        Returns:
+            ``(passed, message)`` where ``passed`` is ``True`` if *all*
+            thresholds are met and ``message`` summarises the result.
+
+        Raises:
+            ValueError: If either threshold is not in ``[0.0, 1.0]``.
+        """
+        if not (0.0 <= ece_threshold <= 1.0):
+            raise ValueError(f"ece_threshold must be in [0, 1]; got {ece_threshold!r}")
+        if not (0.0 <= brier_threshold <= 1.0):
+            raise ValueError(f"brier_threshold must be in [0, 1]; got {brier_threshold!r}")
+
+        failures: List[str] = []
+        if report.ece > ece_threshold:
+            failures.append(
+                f"ECE {report.ece:.4f} exceeds threshold {ece_threshold:.4f}"
+            )
+        if report.brier_score > brier_threshold:
+            failures.append(
+                f"Brier {report.brier_score:.4f} exceeds threshold {brier_threshold:.4f}"
+            )
+
+        if failures:
+            message = "FAIL — " + "; ".join(failures)
+            logger.warning("CalibrationEvaluator.gate: %s", message)
+            return False, message
+
+        message = (
+            f"PASS — ECE={report.ece:.4f} (≤{ece_threshold:.4f}), "
+            f"Brier={report.brier_score:.4f} (≤{brier_threshold:.4f})"
+        )
+        logger.info("CalibrationEvaluator.gate: %s", message)
+        return True, message
 

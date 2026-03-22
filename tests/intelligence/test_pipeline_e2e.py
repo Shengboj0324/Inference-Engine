@@ -878,3 +878,175 @@ async def test_full_pipeline_batch_mixed_signals():
         f"Expected {expected_abstained} abstentions, got {n_abstained}"
     )
     assert n_actionable == 20 - expected_abstained
+
+
+
+# ---------------------------------------------------------------------------
+# ActionRanker unit tests: ranking order across 5 representative scenarios
+# ---------------------------------------------------------------------------
+
+def _make_inference(
+    signal_type: SignalType,
+    probability: float,
+    obs_id: Optional[UUID] = None,
+) -> SignalInference:
+    """Create a minimal ``SignalInference`` for ranker unit tests."""
+    oid = obs_id or uuid4()
+    pred = SignalPrediction(
+        signal_type=signal_type,
+        probability=probability,
+        evidence_spans=[],
+        rationale="unit-test",
+    )
+    return SignalInference(
+        normalized_observation_id=oid,
+        user_id=uuid4(),
+        predictions=[pred],
+        top_prediction=pred,
+        abstained=False,
+        rationale="unit-test",
+        model_name="test-model",
+        model_version="0.0",
+        inference_method="unit-test",
+    )
+
+
+def _make_observation(
+    platform: SourcePlatform = SourcePlatform.RSS,
+    engagement_velocity: Optional[float] = None,
+    virality_score: Optional[float] = None,
+    hours_old: float = 2.0,
+    obs_id: Optional[UUID] = None,
+) -> NormalizedObservation:
+    """Create a minimal ``NormalizedObservation`` for ranker unit tests."""
+    oid = obs_id or uuid4()
+    from datetime import timedelta
+    pub = datetime.now(timezone.utc) - timedelta(hours=hours_old)
+    return NormalizedObservation(
+        raw_observation_id=uuid4(),
+        user_id=uuid4(),
+        source_platform=platform,
+        source_id="unit-test",
+        source_url="https://example.com",
+        author="tester",
+        channel="test",
+        title="unit test",
+        normalized_text="unit test content",
+        media_type=MediaType.TEXT,
+        published_at=pub,
+        fetched_at=datetime.now(timezone.utc),
+        id=oid,
+        engagement_velocity=engagement_velocity,
+        virality_score=virality_score,
+        sentiment=SentimentPolarity.NEUTRAL,
+        quality=ContentQuality.MEDIUM,
+        quality_score=0.7,
+        completeness_score=0.8,
+    )
+
+
+class TestActionRankerOrder:
+    """Assert ranking order for representative signal-type / engagement combos."""
+
+    def setup_method(self):
+        from app.intelligence.action_ranker import ActionRanker
+        self.ranker = ActionRanker()
+
+    # Scenario 1: CHURN_RISK outranks FEATURE_REQUEST at equal confidence.
+    # CHURN_RISK has high urgency (0.9) + high risk (0.95) vs FEATURE_REQUEST
+    # urgency (0.3) + risk (0.2).
+    def test_churn_outranks_feature_request(self):
+        from app.intelligence.action_ranker import ActionRanker
+        ranker = ActionRanker()
+        obs_churn = _make_observation()
+        obs_feature = _make_observation()
+        inf_churn = _make_inference(SignalType.CHURN_RISK, 0.85, obs_churn.id)
+        inf_feature = _make_inference(SignalType.FEATURE_REQUEST, 0.85, obs_feature.id)
+        act_churn = ranker.rank_action(inf_churn, obs_churn)
+        act_feature = ranker.rank_action(inf_feature, obs_feature)
+        assert act_churn is not None
+        assert act_feature is not None
+        assert act_churn.priority_score > act_feature.priority_score, (
+            f"CHURN_RISK ({act_churn.priority_score:.3f}) should score higher than "
+            f"FEATURE_REQUEST ({act_feature.priority_score:.3f})"
+        )
+
+    # Scenario 2: High engagement_velocity boosts opportunity score above low-velocity.
+    def test_high_velocity_boosts_opportunity(self):
+        from app.intelligence.action_ranker import ActionRanker
+        ranker = ActionRanker()
+        obs_high = _make_observation(engagement_velocity=50.0)
+        obs_low = _make_observation(engagement_velocity=2.0)
+        inf_high = _make_inference(SignalType.COMPETITOR_MENTION, 0.80, obs_high.id)
+        inf_low = _make_inference(SignalType.COMPETITOR_MENTION, 0.80, obs_low.id)
+        act_high = ranker.rank_action(inf_high, obs_high)
+        act_low = ranker.rank_action(inf_low, obs_low)
+        assert act_high is not None and act_low is not None
+        assert act_high.opportunity_score > act_low.opportunity_score, (
+            "High engagement_velocity should produce a higher opportunity score"
+        )
+
+    # Scenario 3: Very fresh content (< 1 h) has higher urgency than stale (> 48 h).
+    def test_fresh_content_higher_urgency(self):
+        from app.intelligence.action_ranker import ActionRanker
+        ranker = ActionRanker()
+        obs_fresh = _make_observation(hours_old=0.5)
+        obs_stale = _make_observation(hours_old=72.0)
+        inf_fresh = _make_inference(SignalType.COMPLAINT, 0.75, obs_fresh.id)
+        inf_stale = _make_inference(SignalType.COMPLAINT, 0.75, obs_stale.id)
+        act_fresh = ranker.rank_action(inf_fresh, obs_fresh)
+        act_stale = ranker.rank_action(inf_stale, obs_stale)
+        assert act_fresh is not None and act_stale is not None
+        assert act_fresh.urgency_score > act_stale.urgency_score, (
+            "Fresh content should have higher urgency than stale content"
+        )
+
+    # Scenario 4: Public platform (Reddit) gives higher risk than low-visibility (RSS).
+    def test_public_platform_higher_risk(self):
+        from app.intelligence.action_ranker import ActionRanker
+        ranker = ActionRanker()
+        obs_reddit = _make_observation(platform=SourcePlatform.REDDIT)
+        obs_rss = _make_observation(platform=SourcePlatform.RSS)
+        inf_reddit = _make_inference(SignalType.REPUTATION_RISK, 0.80, obs_reddit.id)
+        inf_rss = _make_inference(SignalType.REPUTATION_RISK, 0.80, obs_rss.id)
+        act_reddit = ranker.rank_action(inf_reddit, obs_reddit)
+        act_rss = ranker.rank_action(inf_rss, obs_rss)
+        assert act_reddit is not None and act_rss is not None
+        assert act_reddit.risk_score > act_rss.risk_score, (
+            "Public platform (Reddit) should have higher risk score than RSS"
+        )
+
+    # Scenario 5: Below-threshold confidence produces no action.
+    # Verify that signals below min_confidence_threshold are filtered out.
+    def test_low_confidence_filtered_out(self):
+        from app.intelligence.action_ranker import ActionRanker, RankerConfig
+        ranker = ActionRanker(config=RankerConfig(min_confidence_threshold=0.7))
+        obs = _make_observation()
+        inf = _make_inference(SignalType.CHURN_RISK, 0.60, obs.id)  # below 0.7
+        action = ranker.rank_action(inf, obs)
+        assert action is None, (
+            "Signal with confidence 0.60 should be filtered out when threshold is 0.70"
+        )
+
+    # Scenario 6: batch ranking returns highest-priority first.
+    def test_batch_sorted_by_priority_score_descending(self):
+        from app.intelligence.action_ranker import ActionRanker
+        ranker = ActionRanker()
+        # CHURN_RISK > PRAISE in priority
+        obs_churn = _make_observation()
+        obs_praise = _make_observation()
+        inf_churn = _make_inference(SignalType.CHURN_RISK, 0.90, obs_churn.id)
+        inf_praise = _make_inference(SignalType.PRAISE, 0.90, obs_praise.id)
+        observations = {
+            str(obs_churn.id): obs_churn,
+            str(obs_praise.id): obs_praise,
+        }
+        # Submit praise first to ensure order is not insertion-order
+        actions = ranker.rank_batch([inf_praise, inf_churn], observations)
+        assert len(actions) == 2
+        assert actions[0].priority_score >= actions[1].priority_score, (
+            "rank_batch must return actions sorted by priority_score descending"
+        )
+        assert actions[0].signal_type == SignalType.CHURN_RISK, (
+            "CHURN_RISK should rank first over PRAISE"
+        )

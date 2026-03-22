@@ -110,7 +110,7 @@ class AbstentionDecider:
             if disagreement > self.thresholds.max_disagreement:
                 return (
                     True,
-                    AbstentionReason.CONFLICTING_SIGNALS,
+                    AbstentionReason.AMBIGUOUS_MULTI_LABEL,
                     f"Prediction disagreement {disagreement:.2f} exceeds threshold {self.thresholds.max_disagreement}"
                 )
         
@@ -128,31 +128,31 @@ class AbstentionDecider:
             if observation.quality_score < self.thresholds.min_quality:
                 return (
                     True,
-                    AbstentionReason.AMBIGUOUS_INTENT,
+                    AbstentionReason.SPAM_OR_NOISE,
                     f"Quality {observation.quality_score:.2f} below threshold {self.thresholds.min_quality}"
                 )
-        
+
         # Check for unsafe content
         if self._is_unsafe_content(observation):
             return (
                 True,
-                AbstentionReason.UNSAFE_CONTENT,
+                AbstentionReason.UNSAFE_TO_CLASSIFY,
                 "Content flagged as potentially unsafe"
             )
-        
+
         # Check for policy violations
         if self._has_policy_violation(observation):
             return (
                 True,
-                AbstentionReason.POLICY_VIOLATION,
+                AbstentionReason.UNSAFE_TO_CLASSIFY,
                 "Content violates policy constraints"
             )
-        
+
         # Check if out of scope
         if self._is_out_of_scope(observation, inference):
             return (
                 True,
-                AbstentionReason.OUT_OF_SCOPE,
+                AbstentionReason.OUT_OF_DISTRIBUTION,
                 "Content is out of scope for actionable signals"
             )
         

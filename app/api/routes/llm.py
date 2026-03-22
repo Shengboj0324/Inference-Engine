@@ -96,12 +96,16 @@ async def generate(request: GenerateRequest):
         # Get router
         router_instance = get_router()
 
-        # Generate
-        response = await router_instance.generate_simple(
-            prompt=request.prompt,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
+        # Build message list and delegate to generate() so we receive a full
+        # LLMResponse object (with model, provider, usage, latency fields).
+        # generate_simple() only returns a bare str and cannot populate the
+        # GenerateResponse metadata fields.
+        messages = [LLMMessage(role=MessageRole.USER, content=request.prompt)]
+        response = await router_instance.generate(
+            messages=messages,
             strategy=strategy,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
             enable_fallback=request.enable_fallback,
         )
 

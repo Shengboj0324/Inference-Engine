@@ -16,9 +16,11 @@ inject them continue to work without any code changes.
 Follows the strict contract defined in app/domain/inference_models.py
 """
 
+import asyncio
 import logging
 import json
 import math
+import re
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
@@ -464,6 +466,20 @@ Output:
         types to the frontier model and other types to the configured
         fine-tuned model (falling back to frontier when not configured).
 
+        Each retry applies exponential backoff (0.5 s × 2^attempt) so that
+        transient provider errors are not hammered immediately.  The message
+        list is reset to the original single-user-turn on each attempt; the
+        old "repair by appending" strategy is removed because appending a
+        malformed assistant turn often confuses the model further.
+
+        JSON is extracted with a brace-counting algorithm (``_extract_json``)
+        that correctly handles nested objects, unlike the previous
+        ``content[first_brace:last_brace]`` approach which could produce
+        invalid JSON when the response contained multiple ``{`` occurrences.
+        The extracted dict is validated against ``LLMAdjudicationOutput``
+        before being returned so callers always receive a schema-conformant
+        payload.
+
         Args:
             prompt: Prompt string built by ``_build_prompt``.
             signal_type: Top-candidate signal type from retrieval; used to
@@ -474,12 +490,21 @@ Output:
             Parsed JSON dict matching the ``LLMAdjudicationOutput`` schema.
 
         Raises:
-            ValueError: If a valid JSON response cannot be obtained after
-                ``self.max_retries`` attempts.
+            ValueError: If a valid, schema-conformant JSON response cannot be
+                obtained after ``self.max_retries`` attempts.
         """
         messages = [LLMMessage(role="user", content=prompt)]
 
         for attempt in range(self.max_retries):
+            # Exponential backoff before every retry (not before the first attempt)
+            if attempt > 0:
+                backoff_seconds = 0.5 * (2 ** (attempt - 1))  # 0.5 s, 1.0 s, 2.0 s …
+                logger.debug(
+                    "LLM adjudicator backoff: %.1f s before attempt %d/%d",
+                    backoff_seconds, attempt + 1, self.max_retries,
+                )
+                await asyncio.sleep(backoff_seconds)
+
             try:
                 # Route to appropriate model tier based on signal type
                 content = await self.llm_router.generate_for_signal(
@@ -490,38 +515,78 @@ Output:
                 )
                 content = content.strip()
 
-                # Try to find JSON in response
-                if "{" in content and "}" in content:
-                    start = content.index("{")
-                    end = content.rindex("}") + 1
-                    json_str = content[start:end]
+                # Brace-counting JSON extraction — correctly handles nested objects
+                parsed = self._extract_json(content)
+                if parsed is None:
+                    raise ValueError("No valid JSON object found in LLM response")
 
-                    # Parse JSON
-                    output = json.loads(json_str)
-                    return output
-                else:
-                    raise ValueError("No JSON found in response")
+                # Schema validation: raises ValidationError if the LLM output
+                # does not conform to LLMAdjudicationOutput before we return it.
+                LLMAdjudicationOutput(**parsed)
+                return parsed
 
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"Attempt {attempt + 1}/{self.max_retries} failed: {e}")
+            except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+                logger.warning(
+                    "LLM adjudication attempt %d/%d failed: %s",
+                    attempt + 1, self.max_retries, exc,
+                )
+                if attempt == self.max_retries - 1:
+                    raise ValueError(
+                        f"Failed to get valid JSON response after {self.max_retries} attempts: {exc}"
+                    ) from exc
 
-                if attempt < self.max_retries - 1:
-                    # Append repair instruction to message history
-                    messages = messages + [
-                        LLMMessage(role="assistant", content="(malformed output)"),
-                        LLMMessage(
-                            role="user",
-                            content=(
-                                "Your previous output was malformed. "
-                                "Output ONLY valid JSON — no prose, no markdown fences."
-                            ),
-                        ),
-                    ]
-                else:
-                    # Final attempt failed
-                    raise ValueError(f"Failed to get valid JSON after {self.max_retries} attempts")
+        raise ValueError("Unexpected exit from retry loop")  # pragma: no cover
 
-        raise ValueError("Unexpected error in LLM call")
+    @staticmethod
+    def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+        """Extract the outermost JSON object from *text* using brace counting.
+
+        This is strictly more correct than ``text[text.index('{'):text.rindex('}')+1]``
+        because that approach produces invalid JSON whenever the response
+        contains multiple top-level ``{`` tokens (e.g. markdown code fences
+        with a JSON block inside).
+
+        The algorithm tracks string-literal boundaries so that ``{`` / ``}``
+        inside quoted values are not counted as object delimiters.
+
+        Args:
+            text: Raw LLM output, possibly containing prose before or after
+                the JSON object.
+
+        Returns:
+            Parsed ``dict`` for the first complete JSON object found, or
+            ``None`` if no valid object is present.
+        """
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i, ch in enumerate(text[start:], start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
 
     def _convert_to_inference(
         self,

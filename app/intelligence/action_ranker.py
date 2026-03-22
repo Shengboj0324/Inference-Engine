@@ -9,9 +9,13 @@ This module implements multi-dimensional action ranking:
 Combines multiple signals to produce a calibrated priority score.
 """
 
+import json
 import logging
+from pathlib import Path
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
+
+from pydantic import BaseModel, Field
 
 from app.domain.normalized_models import NormalizedObservation
 from app.domain.inference_models import SignalInference, SignalType
@@ -19,6 +23,122 @@ from app.domain.action_models import ActionableSignal, ActionPriority, ActionSta
 from app.core.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
+
+#: Default path for the ``RankerConfig`` JSON file.
+_DEFAULT_RANKER_CONFIG_PATH: Path = Path("training/ranker_config.json")
+
+
+class RankerConfig(BaseModel):
+    """All tunable numeric thresholds and weights for :class:`ActionRanker`.
+
+    Externalising these values means operators can retune the ranker through
+    a config file edit + service reload, without touching source code.
+
+    Weight fields
+    -------------
+    ``opportunity_weight``, ``urgency_weight``, ``risk_weight`` must sum to 1.0.
+    ``ActionRanker.__init__`` normalises them if they do not.
+
+    Boost / penalty fields
+    ----------------------
+    All ``_boost`` and ``_penalty`` values are *additive* adjustments applied
+    after the base score is fetched from the dispatch table.  Scores are
+    clamped to [0.0, 1.0] after each adjustment.
+
+    Priority threshold fields
+    -------------------------
+    ``critical_threshold`` ≥ ``high_threshold`` ≥ ``medium_threshold`` ≥
+    ``low_threshold`` must hold.  ActionRanker does not enforce this at
+    construction time but scores will be mis-bucketed if the invariant is
+    violated.
+    """
+
+    # ── Combination weights ───────────────────────────────────────────────
+    opportunity_weight: float = Field(0.35, ge=0.0, le=1.0,
+        description="Weight of the opportunity dimension in priority score.")
+    urgency_weight: float = Field(0.30, ge=0.0, le=1.0,
+        description="Weight of the urgency dimension in priority score.")
+    risk_weight: float = Field(0.35, ge=0.0, le=1.0,
+        description="Weight of the risk dimension in priority score.")
+
+    # ── Confidence gate ───────────────────────────────────────────────────
+    min_confidence_threshold: float = Field(0.5, ge=0.0, le=1.0,
+        description="Minimum signal confidence to produce an ActionableSignal.")
+
+    # ── Priority level thresholds ─────────────────────────────────────────
+    # Rationale: four bands give operators enough granularity without creating
+    # too many queues for human reviewers to manage.
+    critical_threshold: float = Field(0.80, ge=0.0, le=1.0,
+        description="Priority score ≥ this → CRITICAL.")
+    high_threshold: float = Field(0.60, ge=0.0, le=1.0,
+        description="Priority score ≥ this → HIGH.")
+    medium_threshold: float = Field(0.40, ge=0.0, le=1.0,
+        description="Priority score ≥ this → MEDIUM.")
+    low_threshold: float = Field(0.20, ge=0.0, le=1.0,
+        description="Priority score ≥ this → LOW; below → MONITOR.")
+
+    # ── Opportunity dimension boosts ──────────────────────────────────────
+    opp_velocity_threshold: float = Field(10.0, ge=0.0,
+        description="engagement_velocity above this triggers an opportunity boost.")
+    opp_velocity_boost: float = Field(0.10, ge=0.0, le=1.0,
+        description="Additive boost when engagement_velocity > opp_velocity_threshold.")
+    opp_virality_threshold: float = Field(0.5, ge=0.0, le=1.0,
+        description="virality_score above this triggers an opportunity boost.")
+    opp_virality_boost: float = Field(0.10, ge=0.0, le=1.0,
+        description="Additive boost when virality_score > opp_virality_threshold.")
+
+    # ── Urgency dimension boosts / penalties ─────────────────────────────
+    # Freshness thresholds: content < 1 h old is very fresh; > 48 h is stale.
+    urg_fresh_hours_high: float = Field(1.0, ge=0.0,
+        description="Content younger than this (hours) gets urg_fresh_boost_high.")
+    urg_fresh_boost_high: float = Field(0.20, ge=0.0, le=1.0,
+        description="Urgency boost for very fresh content (< urg_fresh_hours_high).")
+    urg_fresh_hours_medium: float = Field(6.0, ge=0.0,
+        description="Content younger than this gets urg_fresh_boost_medium.")
+    urg_fresh_boost_medium: float = Field(0.10, ge=0.0, le=1.0,
+        description="Urgency boost for moderately fresh content.")
+    urg_stale_hours: float = Field(48.0, ge=0.0,
+        description="Content older than this (hours) gets urg_stale_penalty.")
+    urg_stale_penalty: float = Field(0.20, ge=0.0, le=1.0,
+        description="Urgency penalty for stale content (> urg_stale_hours).")
+    urg_velocity_threshold: float = Field(20.0, ge=0.0,
+        description="engagement_velocity above this triggers an urgency boost.")
+    urg_velocity_boost: float = Field(0.10, ge=0.0, le=1.0,
+        description="Additive urgency boost when velocity > urg_velocity_threshold.")
+
+    # ── Risk dimension boosts ─────────────────────────────────────────────
+    risk_public_platform_boost: float = Field(0.10, ge=0.0, le=1.0,
+        description="Risk boost for content on public platforms (Reddit, YouTube …).")
+    risk_virality_threshold: float = Field(0.70, ge=0.0, le=1.0,
+        description="virality_score above this triggers a risk boost.")
+    risk_virality_boost: float = Field(0.15, ge=0.0, le=1.0,
+        description="Additive risk boost for high-virality content.")
+
+    @classmethod
+    def from_file(cls, path: Path) -> "RankerConfig":
+        """Load a ``RankerConfig`` from a JSON file.
+
+        Fields not present in the file receive their class-level defaults.
+
+        Args:
+            path: Path to the JSON config file.
+
+        Returns:
+            ``RankerConfig`` instance.
+
+        Raises:
+            FileNotFoundError: If *path* does not exist.
+            ValueError: If the JSON cannot be parsed or fails Pydantic
+                validation.
+        """
+        if not path.exists():
+            raise FileNotFoundError(f"RankerConfig file not found: {path}")
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return cls(**data)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"Failed to parse RankerConfig from {path}: {exc}") from exc
 
 
 class ActionRanker:
@@ -89,43 +209,91 @@ class ActionRanker:
 
     def __init__(
         self,
-        opportunity_weight: float = 0.35,
-        urgency_weight: float = 0.30,
-        risk_weight: float = 0.35,
-        min_confidence_threshold: float = 0.5,
+        config: Optional[RankerConfig] = None,
+        config_path: Optional[Path] = None,
+        # Legacy keyword-argument shims — kept for backward compatibility.
+        # Prefer passing a RankerConfig instance.
+        opportunity_weight: Optional[float] = None,
+        urgency_weight: Optional[float] = None,
+        risk_weight: Optional[float] = None,
+        min_confidence_threshold: Optional[float] = None,
     ):
         """Initialize action ranker.
-        
+
+        Configuration precedence (highest to lowest):
+        1. Explicit ``config`` kwarg.
+        2. JSON file at ``config_path`` (or ``training/ranker_config.json``).
+        3. Legacy scalar kwargs (``opportunity_weight`` etc.) applied on top
+           of the default ``RankerConfig`` values.
+        4. ``RankerConfig`` class-level defaults.
+
         Args:
-            opportunity_weight: Weight for opportunity score
-            urgency_weight: Weight for urgency score
-            risk_weight: Weight for risk score
-            min_confidence_threshold: Minimum confidence to create action
+            config: Pre-built ``RankerConfig`` instance.
+            config_path: Path to a JSON ranker config file.  Defaults to
+                ``training/ranker_config.json`` when the file exists.
+            opportunity_weight: Opportunity dimension weight (legacy kwarg).
+            urgency_weight: Urgency dimension weight (legacy kwarg).
+            risk_weight: Risk dimension weight (legacy kwarg).
+            min_confidence_threshold: Minimum prediction confidence to produce
+                an ``ActionableSignal`` (legacy kwarg).
         """
-        self.opportunity_weight = opportunity_weight
-        self.urgency_weight = urgency_weight
-        self.risk_weight = risk_weight
-        self.min_confidence_threshold = min_confidence_threshold
-        
-        # Validate weights sum to 1.0
-        total_weight = opportunity_weight + urgency_weight + risk_weight
+        if config is not None:
+            self.config = config
+        else:
+            # Try loading from file
+            _path = config_path or _DEFAULT_RANKER_CONFIG_PATH
+            if _path.exists():
+                try:
+                    self.config = RankerConfig.from_file(_path)
+                    logger.info("ActionRanker: loaded RankerConfig from %s", _path)
+                except (FileNotFoundError, ValueError) as exc:
+                    logger.warning(
+                        "ActionRanker: could not load config from %s: %s; using defaults",
+                        _path, exc,
+                    )
+                    self.config = RankerConfig()
+            else:
+                self.config = RankerConfig()
+
+        # Apply legacy scalar overrides on top of the loaded/default config
+        overrides: dict = {}
+        if opportunity_weight is not None:
+            overrides["opportunity_weight"] = opportunity_weight
+        if urgency_weight is not None:
+            overrides["urgency_weight"] = urgency_weight
+        if risk_weight is not None:
+            overrides["risk_weight"] = risk_weight
+        if min_confidence_threshold is not None:
+            overrides["min_confidence_threshold"] = min_confidence_threshold
+        if overrides:
+            self.config = self.config.model_copy(update=overrides)
+
+        # Validate weights sum to 1.0; normalise if not
+        total_weight = (
+            self.config.opportunity_weight
+            + self.config.urgency_weight
+            + self.config.risk_weight
+        )
         if abs(total_weight - 1.0) > 0.01:
             logger.warning(
-                f"Weights sum to {total_weight}, not 1.0. "
-                f"Normalizing weights."
+                "ActionRanker: weights sum to %.4f (expected 1.0); normalising",
+                total_weight,
             )
-            self.opportunity_weight /= total_weight
-            self.urgency_weight /= total_weight
-            self.risk_weight /= total_weight
-        
+            self.config = self.config.model_copy(update={
+                "opportunity_weight": self.config.opportunity_weight / total_weight,
+                "urgency_weight": self.config.urgency_weight / total_weight,
+                "risk_weight": self.config.risk_weight / total_weight,
+            })
+
         # Initialise dispatch table eagerly (idempotent)
         self._init_dispatch()
 
         logger.info(
-            f"ActionRanker initialized: "
-            f"opp={self.opportunity_weight:.2f}, "
-            f"urg={self.urgency_weight:.2f}, "
-            f"risk={self.risk_weight:.2f}"
+            "ActionRanker initialised: opp=%.2f urg=%.2f risk=%.2f min_conf=%.2f",
+            self.config.opportunity_weight,
+            self.config.urgency_weight,
+            self.config.risk_weight,
+            self.config.min_confidence_threshold,
         )
     
     def rank_action(
@@ -152,23 +320,24 @@ class ActionRanker:
             logger.debug(f"No top prediction for inference {inference.id}")
             return None
         
-        if inference.top_prediction.probability < self.min_confidence_threshold:
+        if inference.top_prediction.probability < self.config.min_confidence_threshold:
             logger.debug(
-                f"Confidence {inference.top_prediction.probability:.2f} "
-                f"below threshold {self.min_confidence_threshold}"
+                "Confidence %.2f below threshold %.2f",
+                inference.top_prediction.probability,
+                self.config.min_confidence_threshold,
             )
             return None
-        
+
         # Compute scores
         opportunity_score = self._compute_opportunity_score(inference, observation)
         urgency_score = self._compute_urgency_score(inference, observation)
         risk_score = self._compute_risk_score(inference, observation)
-        
+
         # Compute overall priority score
         priority_score = (
-            self.opportunity_weight * opportunity_score +
-            self.urgency_weight * urgency_score +
-            self.risk_weight * risk_score
+            self.config.opportunity_weight * opportunity_score
+            + self.config.urgency_weight * urgency_score
+            + self.config.risk_weight * risk_score
         )
         
         # Determine priority level
@@ -257,11 +426,17 @@ class ActionRanker:
             inference.top_prediction.signal_type, self._OPPORTUNITY_DEFAULT
         )
 
-        # Engagement boosts (additive, clamped)
-        if observation.engagement_velocity and observation.engagement_velocity > 10:
-            score = min(1.0, score + 0.1)
-        if observation.virality_score and observation.virality_score > 0.5:
-            score = min(1.0, score + 0.1)
+        # Engagement boosts (additive, clamped to 1.0)
+        if (
+            observation.engagement_velocity is not None
+            and observation.engagement_velocity > self.config.opp_velocity_threshold
+        ):
+            score = min(1.0, score + self.config.opp_velocity_boost)
+        if (
+            observation.virality_score is not None
+            and observation.virality_score > self.config.opp_virality_threshold
+        ):
+            score = min(1.0, score + self.config.opp_virality_boost)
 
         return score
 
@@ -291,15 +466,18 @@ class ActionRanker:
             hours_old = (
                 datetime.now(timezone.utc) - observation.published_at
             ).total_seconds() / 3600
-            if hours_old < 1:
-                score = min(1.0, score + 0.2)
-            elif hours_old < 6:
-                score = min(1.0, score + 0.1)
-            elif hours_old > 48:
-                score = max(0.0, score - 0.2)
+            if hours_old < self.config.urg_fresh_hours_high:
+                score = min(1.0, score + self.config.urg_fresh_boost_high)
+            elif hours_old < self.config.urg_fresh_hours_medium:
+                score = min(1.0, score + self.config.urg_fresh_boost_medium)
+            elif hours_old > self.config.urg_stale_hours:
+                score = max(0.0, score - self.config.urg_stale_penalty)
 
-        if observation.engagement_velocity and observation.engagement_velocity > 20:
-            score = min(1.0, score + 0.1)
+        if (
+            observation.engagement_velocity is not None
+            and observation.engagement_velocity > self.config.urg_velocity_threshold
+        ):
+            score = min(1.0, score + self.config.urg_velocity_boost)
 
         return score
 
@@ -330,10 +508,13 @@ class ActionRanker:
             SourcePlatform.TIKTOK, SourcePlatform.FACEBOOK, SourcePlatform.INSTAGRAM,
         }
         if observation.source_platform in _PUBLIC_PLATFORMS:
-            score = min(1.0, score + 0.1)
+            score = min(1.0, score + self.config.risk_public_platform_boost)
 
-        if observation.virality_score and observation.virality_score > 0.7:
-            score = min(1.0, score + 0.15)
+        if (
+            observation.virality_score is not None
+            and observation.virality_score > self.config.risk_virality_threshold
+        ):
+            score = min(1.0, score + self.config.risk_virality_boost)
 
         return score
 
@@ -346,13 +527,13 @@ class ActionRanker:
         Returns:
             ActionPriority enum
         """
-        if priority_score >= 0.8:
+        if priority_score >= self.config.critical_threshold:
             return ActionPriority.CRITICAL
-        elif priority_score >= 0.6:
+        elif priority_score >= self.config.high_threshold:
             return ActionPriority.HIGH
-        elif priority_score >= 0.4:
+        elif priority_score >= self.config.medium_threshold:
             return ActionPriority.MEDIUM
-        elif priority_score >= 0.2:
+        elif priority_score >= self.config.low_threshold:
             return ActionPriority.LOW
         else:
             return ActionPriority.MONITOR

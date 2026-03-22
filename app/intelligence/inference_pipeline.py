@@ -12,6 +12,7 @@ This is the main entry point for the Phase 2 inference system.
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Optional
 from uuid import UUID
 
@@ -85,6 +86,32 @@ class InferencePipeline:
         )
 
         self.candidate_retriever = candidate_retriever or CandidateRetriever(top_k=5)
+
+        # Auto-load ConfidenceCalibrator from the training artifact when no
+        # explicit instance is supplied and the state file exists on disk.
+        # This closes the gap between the training run (which writes
+        # training/calibration_state.json) and the serving path (which must
+        # use those learned temperature scalars rather than defaulting to T=1.0).
+        if confidence_calibrator is None:
+            _default_state = Path("training/calibration_state.json")
+            if _default_state.exists():
+                try:
+                    confidence_calibrator = ConfidenceCalibrator(state_path=_default_state)
+                    logger.info(
+                        "InferencePipeline: loaded ConfidenceCalibrator from %s",
+                        _default_state,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "InferencePipeline: failed to load ConfidenceCalibrator from %s: %s",
+                        _default_state, exc,
+                    )
+            else:
+                logger.info(
+                    "InferencePipeline: calibration_state.json not found at %s; "
+                    "ConfidenceCalibrator will default to T=1.0 for all signal types",
+                    _default_state,
+                )
 
         self.llm_adjudicator = llm_adjudicator or LLMAdjudicator(
             model_name="gpt-4-turbo",
