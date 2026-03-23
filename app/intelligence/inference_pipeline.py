@@ -13,7 +13,7 @@ This is the main entry point for the Phase 2 inference system.
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 from uuid import UUID
 
 from app.domain.raw_models import RawObservation
@@ -134,7 +134,7 @@ class InferencePipeline:
         raw_observation: RawObservation,
         skip_normalization: bool = False,
         normalized_observation: Optional[NormalizedObservation] = None,
-    ) -> tuple[NormalizedObservation, SignalInference]:
+    ) -> Tuple[NormalizedObservation, SignalInference]:
         """Run the complete inference pipeline.
         
         Args:
@@ -196,7 +196,7 @@ class InferencePipeline:
         self,
         raw_observations: list[RawObservation],
         concurrency: int = 5,
-    ) -> list[tuple[NormalizedObservation, SignalInference]]:
+    ) -> List[Tuple[NormalizedObservation, SignalInference]]:
         """Run pipeline on a batch of observations concurrently.
 
         Processes observations concurrently up to ``concurrency`` at a time using
@@ -220,7 +220,7 @@ class InferencePipeline:
 
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def _run_one(raw_obs: RawObservation) -> Optional[tuple[NormalizedObservation, SignalInference]]:
+        async def _run_one(raw_obs: RawObservation) -> Optional[Tuple[NormalizedObservation, SignalInference]]:
             async with semaphore:
                 try:
                     return await self.run(raw_obs)

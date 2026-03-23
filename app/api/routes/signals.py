@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import AsyncGenerator, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, and_, or_
@@ -184,7 +184,11 @@ async def get_signal_queue(
 
         # Apply filters
         if signal_types:
-            query = query.where(ActionableSignalDB.signal_type.in_(signal_types))
+            # Pass string values explicitly so the DB driver receives the correct
+            # scalar type regardless of which SQLAlchemy backend / dialect is in use.
+            query = query.where(
+                ActionableSignalDB.signal_type.in_([s.value for s in signal_types])
+            )
 
         query = query.where(
             and_(
@@ -702,6 +706,7 @@ async def _sse_inference_generator(
 async def stream_signal_inference(
     raw_observation: RawObservation,
     request: Request,
+    current_user: User = Depends(get_current_user),  # authentication required
 ) -> StreamingResponse:
     """Stream signal inference results for a single raw observation via SSE.
 
@@ -709,12 +714,17 @@ async def stream_signal_inference(
     through the full :class:`~app.intelligence.inference_pipeline.InferencePipeline`,
     and streams back structured events as ``text/event-stream``.
 
+    Requires a valid Bearer token (same as all other signal endpoints).
+    Unauthenticated requests are rejected with HTTP 401 before any LLM call
+    is made, preventing unauthorised LLM spend.
+
     Client must handle three event types: ``start``, ``result``, and ``error``,
     followed by a terminal ``done`` event.
 
     Args:
         raw_observation: The raw social-media observation to classify.
         request: Injected FastAPI request (used for disconnect detection).
+        current_user: Authenticated user from JWT (injected by dependency).
 
     Returns:
         ``StreamingResponse`` with ``Content-Type: text/event-stream``.
@@ -858,6 +868,9 @@ async def assign_signal(
         )
 
 
+_TEAM_DIGEST_PAGE_SIZE = 500  # Hard cap to prevent full-table-scan OOM
+
+
 @router.get("/team", response_model=TeamDigest)
 async def get_team_digest(
     team_id: UUID = Query(..., description="Team UUID to generate digest for"),
@@ -865,10 +878,16 @@ async def get_team_digest(
         ..., description="Role of the requesting user (VIEWER, ANALYST, MANAGER)"
     ),
     days: int = Query(default=7, ge=1, le=90, description="Digest window in days"),
+    offset: int = Query(default=0, ge=0, description="Pagination offset (signals skipped)"),
+    response: Response = None,  # type: ignore[assignment]  # injected by FastAPI
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Return a team signal digest with counts by status and type.
+
+    The query is capped at **500 signals per page** to prevent full-table-scan
+    OOM on large teams.  When the result set is truncated, a ``Link`` response
+    header with ``rel="next"`` is included so callers can fetch the next page.
 
     VIEWERs receive a read-only subset of fields (``total_signals``,
     ``by_status``, ``by_type``).  ``unassigned_count`` and
@@ -879,26 +898,46 @@ async def get_team_digest(
         requester_role: Role claimed by the caller.  Determines which fields
             are populated in the response.
         days: Number of days back from now to include in the digest window.
+        offset: Number of signals to skip (for pagination).
+        response: FastAPI response object — used to set ``Link`` header.
         current_user: Authenticated user.
         db: Database session.
 
     Returns:
-        :class:`~app.core.signal_models.TeamDigest` for the requested team.
+        :class:`~app.core.signal_models.TeamDigest` for the requested page.
     """
     from datetime import timedelta
 
     now = datetime.utcnow()
     period_start = now - timedelta(days=days)
 
-    # Fetch all signals for this team within the window
-    query = select(ActionableSignalDB).where(
-        and_(
-            ActionableSignalDB.team_id == team_id,
-            ActionableSignalDB.created_at >= period_start,
+    # Fetch at most _TEAM_DIGEST_PAGE_SIZE + 1 rows so we can detect truncation
+    # without a separate COUNT query.
+    query = (
+        select(ActionableSignalDB)
+        .where(
+            and_(
+                ActionableSignalDB.team_id == team_id,
+                ActionableSignalDB.created_at >= period_start,
+            )
         )
+        .order_by(ActionableSignalDB.created_at.asc())
+        .limit(_TEAM_DIGEST_PAGE_SIZE + 1)
+        .offset(offset)
     )
     result = await db.execute(query)
-    signals = result.scalars().all()
+    rows = result.scalars().all()
+
+    # Detect whether there is a next page.
+    truncated = len(rows) > _TEAM_DIGEST_PAGE_SIZE
+    signals = rows[:_TEAM_DIGEST_PAGE_SIZE]
+
+    if truncated and response is not None:
+        next_offset = offset + _TEAM_DIGEST_PAGE_SIZE
+        response.headers["Link"] = (
+            f'</api/v1/signals/team?team_id={team_id}'
+            f'&days={days}&offset={next_offset}>; rel="next"'
+        )
 
     by_status: dict = {}
     by_type: dict = {}
@@ -1055,3 +1094,20 @@ async def submit_feedback(
         true_type=request.true_signal_type,
         predicted_confidence=predicted_confidence,
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Route ordering correction
+# ---------------------------------------------------------------------------
+# FastAPI/Starlette matches routes in registration order. The parameterised
+# route GET /{signal_id} was registered before the literal routes GET /stats
+# and GET /team. This means "stats" and "team" would match /{signal_id}
+# (UUID validation then raises HTTP 422) instead of their dedicated handlers.
+#
+# Fix: reorder the router's route list so that every fully-literal GET path
+# is moved to the front, ahead of any parameterised path.
+_literal_get_paths = frozenset({"/queue", "/stats", "/team", "/stream"})
+_literal_first = [r for r in router.routes if getattr(r, "path", None) in _literal_get_paths]
+_rest = [r for r in router.routes if r not in _literal_first]
+router.routes[:] = _literal_first + _rest

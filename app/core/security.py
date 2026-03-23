@@ -12,61 +12,117 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from app.core.config import settings
 
 
+_SALT_BYTES = 16  # Length of the per-encryption random salt
+_KDF_ITERATIONS = 100_000
+
+
 class CredentialEncryption:
-    """Encrypt and decrypt sensitive credentials."""
+    """Encrypt and decrypt sensitive credentials using per-credential random salts.
+
+    Wire format
+    -----------
+    The stored string is the URL-safe base64 encoding of::
+
+        <16-byte random salt> || <Fernet token bytes>
+
+    A fresh 16-byte salt is generated for every ``encrypt()`` call.  The salt is
+    prepended to the Fernet ciphertext before base64-encoding so that ``decrypt()``
+    can always recover the exact key that was used, without any separate salt
+    storage.
+
+    Key derivation
+    --------------
+    PBKDF2-HMAC-SHA256 with 100,000 iterations derives a 32-byte AES key from
+    the master secret and the per-credential salt.  This means that two calls to
+    ``encrypt()`` with identical plaintext produce completely different ciphertexts
+    and use completely different derived keys — eliminating both the static-salt
+    weakness and Fernet token reuse.
+
+    Backward-compatibility note
+    ---------------------------
+    Values encrypted with the previous scheme (static salt, no prepended bytes)
+    cannot be decrypted by this version.  Those records must be re-encrypted on
+    next write.
+    """
 
     def __init__(self, encryption_key: Optional[str] = None):
-        """Initialize encryption.
+        """Initialise with the master encryption secret.
 
         Args:
-            encryption_key: Base64-encoded encryption key
+            encryption_key: Raw secret string.  Defaults to
+                ``settings.encryption_key``.  The value is *not* used directly
+                as a Fernet key; it is used as master key material fed into
+                PBKDF2 with a per-call random salt.
         """
-        key = encryption_key or settings.encryption_key
+        raw = encryption_key or settings.encryption_key
+        # Normalise to bytes; stored for use in per-call KDF invocations.
+        self._master_key: bytes = raw.encode()
 
-        # Derive Fernet key from encryption key
-        if len(key) < 32:
-            # Derive key using PBKDF2HMAC
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=b"social_media_radar_salt",  # In production, use random salt per user
-                iterations=100000,
-            )
-            derived_key = kdf.derive(key.encode())
-            fernet_key = base64.urlsafe_b64encode(derived_key)
-        else:
-            fernet_key = key.encode()
+    def _derive_fernet_key(self, salt: bytes) -> Fernet:
+        """Derive a Fernet cipher from the master key and a given salt.
 
-        self.cipher = Fernet(fernet_key)
+        Args:
+            salt: 16-byte random salt specific to one encryption operation.
+
+        Returns:
+            A configured :class:`~cryptography.fernet.Fernet` instance.
+        """
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=_KDF_ITERATIONS,
+        )
+        fernet_key = base64.urlsafe_b64encode(kdf.derive(self._master_key))
+        return Fernet(fernet_key)
 
     def encrypt(self, data: Dict[str, Any]) -> str:
-        """Encrypt credentials dictionary.
+        """Encrypt a credentials dictionary.
+
+        A fresh 16-byte random salt is generated on every call, ensuring that
+        two invocations with identical ``data`` produce distinct ciphertexts.
 
         Args:
-            data: Credentials to encrypt
+            data: Credentials to encrypt (must be JSON-serialisable).
 
         Returns:
-            Encrypted string
+            URL-safe base64 string encoding ``<salt><fernet_token>``.
         """
         import json
 
+        salt = secrets.token_bytes(_SALT_BYTES)
+        cipher = self._derive_fernet_key(salt)
         json_data = json.dumps(data)
-        encrypted = self.cipher.encrypt(json_data.encode())
-        return base64.urlsafe_b64encode(encrypted).decode()
+        fernet_token: bytes = cipher.encrypt(json_data.encode())
+        # Prepend the salt so decrypt() can always recover it.
+        return base64.urlsafe_b64encode(salt + fernet_token).decode()
 
     def decrypt(self, encrypted_data: str) -> Dict[str, Any]:
-        """Decrypt credentials.
+        """Decrypt credentials produced by :meth:`encrypt`.
 
         Args:
-            encrypted_data: Encrypted string
+            encrypted_data: URL-safe base64 string from :meth:`encrypt`.
 
         Returns:
-            Decrypted credentials dictionary
+            Decrypted credentials dictionary.
+
+        Raises:
+            ValueError: If ``encrypted_data`` is too short to contain a salt.
+            cryptography.fernet.InvalidToken: If the ciphertext is corrupt or
+                the wrong key is supplied.
         """
         import json
 
-        decoded = base64.urlsafe_b64decode(encrypted_data.encode())
-        decrypted = self.cipher.decrypt(decoded)
+        raw = base64.urlsafe_b64decode(encrypted_data.encode())
+        if len(raw) <= _SALT_BYTES:
+            raise ValueError(
+                f"Encrypted data is too short ({len(raw)} bytes); "
+                f"expected at least {_SALT_BYTES + 1} bytes."
+            )
+        salt = raw[:_SALT_BYTES]
+        fernet_token = raw[_SALT_BYTES:]
+        cipher = self._derive_fernet_key(salt)
+        decrypted = cipher.decrypt(fernet_token)
         return json.loads(decrypted.decode())
 
 

@@ -59,11 +59,4 @@ prometheus-client>=0.19.0
 sentry-sdk>=1.40.0
 locust>=2.20.0
 
-# Development dependencies
-pytest>=8.0.0
-pytest-asyncio>=0.23.3
-pytest-cov>=4.1.0
-black>=24.1.0
-ruff>=0.1.14
-mypy>=1.8.0
-httpx>=0.26.0
+# Development dependencies are in requirements-dev.txt

@@ -30,17 +30,19 @@ COPY pyproject.toml ./
 # Configure poetry to not create virtual environment
 RUN poetry config virtualenvs.create false
 
-# Install dependencies (without lock file for flexibility)
-RUN poetry install --no-interaction --no-ansi --no-root || \
-    (echo "Poetry install failed, trying with pip..." && \
-     poetry export -f requirements.txt --output requirements.txt --without-hashes && \
-     pip install --no-cache-dir -r requirements.txt)
+# Install production dependencies only.
+# --only main  → skip dev/test extras (pytest, black, ruff, mypy, etc.)
+# --no-root    → skip installing the project package itself at this stage
+#                (the source tree is not yet COPY'd in).
+# No pip fallback: if poetry install fails the build fails loudly, ensuring
+# reproducible images that always match pyproject.toml + poetry.lock.
+RUN poetry install --no-interaction --no-ansi --no-root --only main
 
 # Copy application code
 COPY . .
 
-# Install the application
-RUN poetry install --no-interaction --no-ansi || true
+# Install the project package (editable) without re-resolving dependencies.
+RUN poetry install --no-interaction --no-ansi --only-root
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app

@@ -1,0 +1,12 @@
+# Development-only dependencies.
+# Install with:  pip install -r requirements-dev.txt
+# This file extends the production requirements.
+-r requirements.txt
+
+pytest>=8.0.0
+pytest-asyncio>=0.23.3
+pytest-cov>=4.1.0
+black>=24.1.0
+ruff>=0.1.14
+mypy>=1.8.0
+

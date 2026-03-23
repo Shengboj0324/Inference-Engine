@@ -1,10 +1,13 @@
 """Authentication routes."""
 
+import hashlib
 import logging
+import time
 from datetime import datetime, timedelta
-from typing import Optional, Set
+from typing import Optional
 from uuid import UUID
 
+import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, Header, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
@@ -26,46 +29,99 @@ security = HTTPBearer()
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Token blacklist (in production, use Redis or database)
-# This is a simple in-memory implementation for now
-_token_blacklist: Set[str] = set()
-_blacklist_max_size = 10000  # Prevent memory exhaustion
+# ---------------------------------------------------------------------------
+# Redis-backed token blacklist
+# ---------------------------------------------------------------------------
+# Each revoked token is stored in Redis as  blacklist:<sha256(token)>  with
+# a TTL equal to the remaining lifetime of the JWT so that entries expire
+# automatically — no manual housekeeping needed.
+#
+# If Redis is temporarily unavailable the blacklist check fails *open*
+# (allows the request) and the add silently logs a warning.  This is an
+# acceptable trade-off: a brief Redis outage does not lock out all users.
+# ---------------------------------------------------------------------------
+
+_redis_client: Optional[aioredis.Redis] = None
+_BLACKLIST_PREFIX = "blacklist:"
 
 
-def add_token_to_blacklist(token: str) -> None:
-    """Add token to blacklist with size limit protection.
+def _get_redis() -> aioredis.Redis:
+    """Return the module-level Redis client, creating it on first call."""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+    return _redis_client
+
+
+def _blacklist_key(token: str) -> str:
+    """Return the Redis key for a token (hashed to keep key size bounded)."""
+    return _BLACKLIST_PREFIX + hashlib.sha256(token.encode()).hexdigest()
+
+
+async def add_token_to_blacklist(token: str) -> None:
+    """Revoke a JWT by storing its hash in Redis with an appropriate TTL.
+
+    The TTL is the remaining valid lifetime of the token as decoded from its
+    ``exp`` claim.  If the token is already expired the key is not stored
+    (nothing to revoke).  Falls back gracefully if Redis is unavailable.
 
     Args:
-        token: JWT token to blacklist
+        token: Raw JWT string to revoke.
     """
-    global _token_blacklist
+    # Compute TTL from the token's exp claim.
+    ttl_seconds: int = settings.jwt_access_token_expire_minutes * 60  # safe default
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+        exp = payload.get("exp")
+        if exp is not None:
+            remaining = int(exp) - int(time.time())
+            if remaining <= 0:
+                logger.debug("Token already expired; skipping blacklist entry.")
+                return
+            ttl_seconds = remaining
+    except JWTError:
+        pass  # Malformed/expired token — still try to blacklist with the default TTL.
 
-    # Prevent memory exhaustion
-    if len(_token_blacklist) >= _blacklist_max_size:
-        # Remove oldest 20% of tokens (FIFO approximation)
-        tokens_to_remove = list(_token_blacklist)[:_blacklist_max_size // 5]
-        _token_blacklist -= set(tokens_to_remove)
-        logger.warning(f"Token blacklist size limit reached, removed {len(tokens_to_remove)} tokens")
-
-    _token_blacklist.add(token)
-    logger.info(f"Token added to blacklist (total: {len(_token_blacklist)})")
+    try:
+        redis = _get_redis()
+        await redis.setex(_blacklist_key(token), ttl_seconds, "1")
+        logger.info("Token added to Redis blacklist (TTL=%ds)", ttl_seconds)
+    except Exception as exc:
+        logger.warning("Redis blacklist add failed (fail-open): %s", exc)
 
 
-def is_token_blacklisted(token: str) -> bool:
-    """Check if token is blacklisted.
+async def is_token_blacklisted(token: str) -> bool:
+    """Return True if the token has been revoked.
+
+    Falls back gracefully (returns False) if Redis is unavailable so that
+    a transient Redis outage does not lock out all authenticated users.
 
     Args:
-        token: JWT token to check
+        token: Raw JWT string to check.
 
     Returns:
-        True if token is blacklisted
+        True if the token is in the blacklist, False otherwise.
     """
-    return token in _token_blacklist
+    try:
+        redis = _get_redis()
+        exists = await redis.exists(_blacklist_key(token))
+        return exists > 0
+    except Exception as exc:
+        logger.warning("Redis blacklist check failed (fail-open): %s", exc)
+        return False
 
-# JWT settings
+# JWT settings — read from the central Settings object so that the
+# jwt_access_token_expire_minutes environment variable is actually honoured.
+# The previous hardcoded 7-day value contradicted the 30-minute default in
+# config.py and made stolen tokens valid far longer than operators expected.
 SECRET_KEY = settings.secret_key
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ALGORITHM = settings.jwt_algorithm
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.jwt_access_token_expire_minutes
 
 
 class UserCreate(BaseModel):
@@ -265,8 +321,8 @@ async def logout(
     try:
         token = credentials.credentials
 
-        # Add token to blacklist
-        add_token_to_blacklist(token)
+        # Add token to Redis blacklist (async, fail-open)
+        await add_token_to_blacklist(token)
 
         logger.info("User logged out successfully")
         return {
@@ -310,8 +366,8 @@ async def get_current_user(
         # Decode JWT token
         token = credentials.credentials
 
-        # Check if token is blacklisted
-        if is_token_blacklisted(token):
+        # Check if token is blacklisted (async, fail-open)
+        if await is_token_blacklisted(token):
             logger.warning("Attempted use of blacklisted token")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

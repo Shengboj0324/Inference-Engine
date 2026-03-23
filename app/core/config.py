@@ -237,10 +237,6 @@ class Settings(BaseSettings):
         return self.environment == "test"
 
 
-# Global settings instance
-settings = Settings()
-
-
-# Global settings instance
+# Global settings instance (singleton — constructed once at import time)
 settings = Settings()
 

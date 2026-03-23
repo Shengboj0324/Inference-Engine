@@ -34,9 +34,13 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
 
     # Relationships
@@ -73,9 +77,13 @@ class InterestProfile(Base):
     interest_embedding: Mapped[Optional[List[float]]] = mapped_column(
         Vector(1536), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
 
     # Relationships
@@ -95,11 +103,17 @@ class PlatformConfigDB(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     encrypted_credentials: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     settings: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
-    last_fetch_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    last_fetch_time: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Relationships
     user: Mapped["User"] = relationship(back_populates="platform_configs")
@@ -134,7 +148,9 @@ class ContentItemDB(Base):
 
     # Timestamps
     published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
 
     # Enrichment
     topics: Mapped[List[str]] = mapped_column(ARRAY(String), default=list)
@@ -158,7 +174,7 @@ class ClusterDB(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
 
     # Cluster metadata
@@ -351,18 +367,18 @@ class ActionableSignalDB(Base):
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         nullable=False,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc),
         index=True,  # For time-based queries
     )
     expires_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         nullable=True,
         index=True,  # For SLA monitoring
     )
     acted_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         nullable=True,
     )
 
@@ -430,8 +446,10 @@ class RawObservationDB(Base):
     media_urls: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list)
 
     # Timestamps
-    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
 
     # Platform-specific metadata
     platform_metadata_: Mapped[Dict[str, Any]] = mapped_column(
@@ -476,7 +494,9 @@ class NormalizedObservationDB(Base):
     # Timestamps
     published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    normalized_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    normalized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
 
     # Enrichment (stored as JSON for flexibility)
     entities: Mapped[List[Dict[str, Any]]] = mapped_column(ARRAY(JSON), default=list)
@@ -556,7 +576,9 @@ class SignalInferenceDB(Base):
     inference_method: Mapped[str] = mapped_column(String(100), nullable=False)
 
     # Timestamps
-    inferred_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    inferred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
 
     # Metadata
     inference_metadata_: Mapped[Dict[str, Any]] = mapped_column(

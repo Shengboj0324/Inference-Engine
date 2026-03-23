@@ -159,3 +159,18 @@ class NormalizedObservation(BaseModel):
     
     model_config = ConfigDict(validate_assignment=True)
 
+    @property
+    def merged_text(self) -> str:
+        """Return a single string combining the title and normalized body text.
+
+        Used by ``CandidateRetriever._retrieve_by_entities()`` so that keyword
+        and entity patterns are matched against the full content rather than
+        either field in isolation.
+
+        Returns:
+            Space-joined concatenation of ``title`` and ``normalized_text``
+            (whichever are non-empty).
+        """
+        parts = [p for p in (self.title, self.normalized_text) if p]
+        return " ".join(parts)
+
