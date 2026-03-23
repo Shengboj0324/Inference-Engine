@@ -1,5 +1,6 @@
 """FastAPI application entry point."""
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -15,17 +16,62 @@ from app.core.health import HealthChecker
 from app.core.monitoring import MetricsCollector
 from app.monitoring.health import HealthMonitor
 
+logger = logging.getLogger(__name__)
+
+
+async def _probe_redis() -> None:
+    """Verify Redis connectivity on startup.
+
+    Attempts a ``PING`` to the Redis instance configured in
+    ``settings.redis_url``.  If the ping fails, a ``CRITICAL`` log entry is
+    written and a :class:`RuntimeError` is raised so that container
+    orchestrators (Kubernetes, ECS, Docker Compose ``healthcheck``) see the
+    process exit with a non-zero status and withhold traffic until a
+    subsequent restart succeeds.
+
+    Raises:
+        RuntimeError: If Redis is unreachable at startup.
+    """
+    import redis.asyncio as aioredis
+
+    client: aioredis.Redis = aioredis.from_url(
+        settings.redis_url,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    try:
+        pong = await client.ping()
+        if not pong:
+            raise ConnectionError("Redis PING returned a falsy response.")
+        logger.info("Redis connectivity confirmed (PING → PONG) at %s", settings.redis_url)
+    except Exception as exc:
+        logger.critical(
+            "STARTUP FAILURE — cannot reach Redis at %s: %s. "
+            "Ensure Redis is running and REDIS_URL is correctly configured.",
+            settings.redis_url,
+            exc,
+        )
+        raise RuntimeError(
+            f"Redis unavailable at startup ({settings.redis_url}): {exc}"
+        ) from exc
+    finally:
+        await client.aclose()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
-    import logging
-    logger = logging.getLogger(__name__)
-
-    # Startup
+    # ── Startup ────────────────────────────────────────────────────────────
     logger.info("Starting Social Media Radar API...")
+
+    # Redis connectivity probe — raises RuntimeError and aborts startup if
+    # Redis is unreachable, preventing orchestrators from routing traffic to
+    # an API instance that cannot honour its blacklist contract.
+    await _probe_redis()
+
     yield
-    # Shutdown
+
+    # ── Shutdown ───────────────────────────────────────────────────────────
     logger.info("Shutting down Social Media Radar API...")
 
 

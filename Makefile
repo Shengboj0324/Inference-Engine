@@ -34,7 +34,7 @@ help:
 	@echo "  make clean         Remove generated files"
 
 install:
-	poetry install --no-dev
+	poetry install --only main
 
 dev-install:
 	poetry install

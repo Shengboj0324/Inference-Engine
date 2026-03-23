@@ -147,7 +147,7 @@ class ContentItemDB(Base):
     media_urls: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list)
 
     # Timestamps
-    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -492,8 +492,8 @@ class NormalizedObservationDB(Base):
     media_urls: Mapped[List[str]] = mapped_column(ARRAY(Text), default=list)
 
     # Timestamps
-    published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     normalized_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )

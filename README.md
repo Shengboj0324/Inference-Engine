@@ -236,15 +236,43 @@ pip show asyncpg numpy | grep -E "^(Name|Version)"
 # numpy should be >= 1.24
 ```
 
-### Step 3 — Set environment variables
+### Step 3 — Configure environment variables
 
-The following variables must be present in the shell (or in a `.env` file loaded by `python-dotenv`):
+Copy the example configuration and fill in your values:
 
 ```bash
-export OPENAI_API_KEY="sk-..."          # Required for LLM adjudication
+cp .env.example .env
+```
+
+Open `.env` and set at minimum:
+
+| Variable | Description |
+|---|---|
+| `SECRET_KEY` | Random secret — generate with `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| `ENCRYPTION_KEY` | Random secret — generate the same way |
+| `OPENAI_API_KEY` | Required for LLM adjudication (`sk-…`) |
+| `ANTHROPIC_API_KEY` | Optional — enables Anthropic routing tier |
+| `DATABASE_URL` | Postgres connection string (pre-filled for Docker Compose) |
+
+> **Docker Compose users:** the inline `environment:` blocks in `docker-compose.yml` override the database/Redis/MinIO URLs automatically to use Docker-internal hostnames. You only need to set the secrets and API keys in `.env`.
+
+**One-command local stack (Docker Compose):**
+
+```bash
+cp .env.example .env   # edit .env — add SECRET_KEY, ENCRYPTION_KEY, OPENAI_API_KEY
+docker compose up
+```
+
+This starts Postgres (with pgvector), Redis, MinIO, runs all migrations, and launches the API on `http://localhost:8000`.
+
+**Manual / bare-metal setup:**
+
+```bash
+export OPENAI_API_KEY="sk-..."
 export DATABASE_URL="postgresql+asyncpg://user:pass@localhost:5432/smr"
-export SECRET_KEY="<random 64-char hex string>"
-export ANTHROPIC_API_KEY="sk-ant-..."  # Optional; enables Anthropic routing tier
+export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export ENCRYPTION_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export ANTHROPIC_API_KEY="sk-ant-..."  # Optional
 ```
 
 ### Step 4 — Database setup

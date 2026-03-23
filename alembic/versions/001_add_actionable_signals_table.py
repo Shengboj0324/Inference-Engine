@@ -22,7 +22,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = '001_signals'
-down_revision: Union[str, None] = None
+down_revision: Union[str, None] = '000_initial'  # depends on base schema
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -91,7 +91,15 @@ def upgrade() -> None:
         
         # Ownership
         sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=False, index=True),
-        
+
+        # Links to inference layer (Phase 1)
+        sa.Column('signal_inference_id', postgresql.UUID(as_uuid=True), nullable=True, index=True),
+        sa.Column('normalized_observation_id', postgresql.UUID(as_uuid=True), nullable=True, index=True),
+
+        # Team collaboration
+        sa.Column('team_id', postgresql.UUID(as_uuid=True), nullable=True, index=True),
+        sa.Column('assigned_role', sa.String(50), nullable=True),
+
         # Signal classification
         sa.Column('signal_type', signal_type_enum, nullable=False, index=True),
         
@@ -141,11 +149,27 @@ def upgrade() -> None:
         # Foreign keys
         sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
         sa.ForeignKeyConstraint(['assigned_to'], ['users.id'], ondelete='SET NULL'),
+        sa.ForeignKeyConstraint(['signal_inference_id'], ['signal_inferences.id'], ondelete='SET NULL'),
+        sa.ForeignKeyConstraint(['normalized_observation_id'], ['normalized_observations.id'], ondelete='SET NULL'),
+    )
+
+    # signal_feedback — human corrections for online calibration
+    op.create_table(
+        'signal_feedback',
+        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column('signal_id', postgresql.UUID(as_uuid=True), nullable=False, index=True),
+        sa.Column('predicted_type', sa.String(50), nullable=False),
+        sa.Column('true_type', sa.String(50), nullable=False),
+        sa.Column('predicted_confidence', sa.Float(), nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=False, index=True),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), index=True),
+        sa.ForeignKeyConstraint(['signal_id'], ['actionable_signals.id'], ondelete='CASCADE'),
     )
 
 
 def downgrade() -> None:
-    """Drop actionable_signals table and related enums."""
+    """Drop actionable_signals, signal_feedback, and related enums."""
+    op.drop_table('signal_feedback')
     op.drop_table('actionable_signals')
     
     # Drop enum types

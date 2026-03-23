@@ -906,9 +906,9 @@ async def get_team_digest(
     Returns:
         :class:`~app.core.signal_models.TeamDigest` for the requested page.
     """
-    from datetime import timedelta
+    from datetime import timedelta, timezone as _tz
 
-    now = datetime.utcnow()
+    now = datetime.now(_tz.utc)
     period_start = now - timedelta(days=days)
 
     # Fetch at most _TEAM_DIGEST_PAGE_SIZE + 1 rows so we can detect truncation

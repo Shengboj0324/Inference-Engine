@@ -57,6 +57,5 @@ beautifulsoup4>=4.12.3
 lxml>=5.1.0
 prometheus-client>=0.19.0
 sentry-sdk>=1.40.0
-locust>=2.20.0
 
-# Development dependencies are in requirements-dev.txt
+# Development dependencies (pytest, black, ruff, mypy, locust) are in requirements-dev.txt

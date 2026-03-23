@@ -104,7 +104,7 @@ class CredentialVault:
         Returns:
             Key version string (e.g., "v1_2024_11")
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         return f"v1_{now.year}_{now.month:02d}"
 
     async def store_credential(
@@ -145,7 +145,7 @@ class CredentialVault:
                 for k, v in encrypted.items()
             }),
             key_version=self.key_version,
-            rotation_due=datetime.utcnow() + self.rotation_interval,
+            rotation_due=datetime.now(timezone.utc) + self.rotation_interval,
             requires_mfa=requires_mfa
         )
         
@@ -211,7 +211,7 @@ class CredentialVault:
             raise SecurityError(f"Failed to decrypt credential: {e}")
         
         # Update access tracking
-        credential.last_accessed = datetime.utcnow()
+        credential.last_accessed = datetime.now(timezone.utc)
         credential.access_count = str(int(credential.access_count) + 1)
         await self.db.commit()
         
@@ -249,8 +249,8 @@ class CredentialVault:
             for k, v in encrypted.items()
         })
         credential.key_version = self._get_current_key_version()
-        credential.rotation_due = datetime.utcnow() + self.rotation_interval
-        credential.updated_at = datetime.utcnow()
+        credential.rotation_due = datetime.now(timezone.utc) + self.rotation_interval
+        credential.updated_at = datetime.now(timezone.utc)
         
         await self.db.commit()
 
@@ -320,7 +320,7 @@ class CredentialVault:
         query = select(EncryptedCredential).where(
             EncryptedCredential.user_id == user_id,
             EncryptedCredential.is_active == True,
-            EncryptedCredential.rotation_due < datetime.utcnow()
+            EncryptedCredential.rotation_due < datetime.now(timezone.utc)
         )
         
         result = await self.db.execute(query)
