@@ -62,13 +62,13 @@ def upgrade() -> None:
     op.create_table(
         "users",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("email", sa.String(255), nullable=False, unique=True, index=True),
+        sa.Column("email", sa.String(255), nullable=False),
         sa.Column("hashed_password", sa.String(255), nullable=False),
         sa.Column("is_active", sa.Boolean(), nullable=False, server_default="true"),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
     )
-    op.create_index("ix_users_email", "users", ["email"], unique=True)
+    op.create_index("ix_users_email", "users", ["email"], unique=True, if_not_exists=True)
 
     # ── interest_profiles ─────────────────────────────────────────────────
     op.create_table(
@@ -123,9 +123,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("user_id", "source_platform", "source_id", name="uq_user_platform_source"),
     )
-    op.create_index("ix_content_items_user_id", "content_items", ["user_id"])
-    op.create_index("ix_content_items_source_platform", "content_items", ["source_platform"])
-    op.create_index("ix_content_items_published_at", "content_items", ["published_at"])
+    op.create_index("ix_content_items_user_id", "content_items", ["user_id"], if_not_exists=True)
+    op.create_index("ix_content_items_source_platform", "content_items", ["source_platform"], if_not_exists=True)
+    op.create_index("ix_content_items_published_at", "content_items", ["published_at"], if_not_exists=True)
 
     # ── clusters ──────────────────────────────────────────────────────────
     op.create_table(
@@ -143,8 +143,8 @@ def upgrade() -> None:
         sa.Column("perspective_summary", sa.Text(), nullable=True),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
     )
-    op.create_index("ix_clusters_user_id", "clusters", ["user_id"])
-    op.create_index("ix_clusters_created_at", "clusters", ["created_at"])
+    op.create_index("ix_clusters_user_id", "clusters", ["user_id"], if_not_exists=True)
+    op.create_index("ix_clusters_created_at", "clusters", ["created_at"], if_not_exists=True)
 
 
     # ── raw_observations ──────────────────────────────────────────────────
@@ -169,9 +169,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("user_id", "source_platform", "source_id", name="uq_raw_user_platform_source"),
     )
-    op.create_index("ix_raw_observations_user_id", "raw_observations", ["user_id"])
-    op.create_index("ix_raw_observations_source_platform", "raw_observations", ["source_platform"])
-    op.create_index("ix_raw_observations_published_at", "raw_observations", ["published_at"])
+    op.create_index("ix_raw_observations_user_id", "raw_observations", ["user_id"], if_not_exists=True)
+    op.create_index("ix_raw_observations_source_platform", "raw_observations", ["source_platform"], if_not_exists=True)
+    op.create_index("ix_raw_observations_published_at", "raw_observations", ["published_at"], if_not_exists=True)
 
     # ── normalized_observations ───────────────────────────────────────────
     op.create_table(
@@ -209,10 +209,10 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["raw_observation_id"], ["raw_observations.id"], ondelete="CASCADE"),
     )
-    op.create_index("ix_normalized_obs_raw_id", "normalized_observations", ["raw_observation_id"])
-    op.create_index("ix_normalized_obs_user_id", "normalized_observations", ["user_id"])
-    op.create_index("ix_normalized_obs_platform", "normalized_observations", ["source_platform"])
-    op.create_index("ix_normalized_obs_normalized_at", "normalized_observations", ["normalized_at"])
+    op.create_index("ix_normalized_obs_raw_id", "normalized_observations", ["raw_observation_id"], if_not_exists=True)
+    op.create_index("ix_normalized_obs_user_id", "normalized_observations", ["user_id"], if_not_exists=True)
+    op.create_index("ix_normalized_obs_platform", "normalized_observations", ["source_platform"], if_not_exists=True)
+    op.create_index("ix_normalized_obs_normalized_at", "normalized_observations", ["normalized_at"], if_not_exists=True)
 
     # ── signal_inferences ─────────────────────────────────────────────────
     op.create_table(
@@ -238,10 +238,10 @@ def upgrade() -> None:
             ["normalized_observation_id"], ["normalized_observations.id"], ondelete="CASCADE"
         ),
     )
-    op.create_index("ix_signal_inferences_norm_obs_id", "signal_inferences", ["normalized_observation_id"])
-    op.create_index("ix_signal_inferences_user_id", "signal_inferences", ["user_id"])
-    op.create_index("ix_signal_inferences_abstained", "signal_inferences", ["abstained"])
-    op.create_index("ix_signal_inferences_inferred_at", "signal_inferences", ["inferred_at"])
+    op.create_index("ix_signal_inferences_norm_obs_id", "signal_inferences", ["normalized_observation_id"], if_not_exists=True)
+    op.create_index("ix_signal_inferences_user_id", "signal_inferences", ["user_id"], if_not_exists=True)
+    op.create_index("ix_signal_inferences_abstained", "signal_inferences", ["abstained"], if_not_exists=True)
+    op.create_index("ix_signal_inferences_inferred_at", "signal_inferences", ["inferred_at"], if_not_exists=True)
 
 
 # ---------------------------------------------------------------------------
