@@ -14,25 +14,41 @@ from prometheus_client import REGISTRY, Counter, Gauge, Histogram, Summary
 # Helpers — safe to call on every module import (including uvicorn reloads)
 # ---------------------------------------------------------------------------
 
+def _lookup(name: str) -> object:
+    """Return an already-registered collector by name.
+
+    prometheus_client stores Counters under both ``<name>`` and ``<base>``
+    (where base strips the ``_total`` suffix).  Try both so this works for
+    Counter, Histogram and Gauge alike.
+    """
+    c = REGISTRY._names_to_collectors  # type: ignore[attr-defined]
+    if name in c:
+        return c[name]
+    base = name[: -len("_total")] if name.endswith("_total") else name
+    if base in c:
+        return c[base]
+    raise KeyError(f"prometheus metric {name!r} not found in registry")
+
+
 def _counter(name: str, doc: str, labels: tuple = ()) -> Counter:
     try:
         return Counter(name, doc, list(labels))
     except ValueError:
-        return REGISTRY._names_to_collectors[name]  # type: ignore[return-value]
+        return _lookup(name)  # type: ignore[return-value]
 
 
 def _histogram(name: str, doc: str, labels: tuple = ()) -> Histogram:
     try:
         return Histogram(name, doc, list(labels))
     except ValueError:
-        return REGISTRY._names_to_collectors[name]  # type: ignore[return-value]
+        return _lookup(name)  # type: ignore[return-value]
 
 
 def _gauge(name: str, doc: str) -> Gauge:
     try:
         return Gauge(name, doc)
     except ValueError:
-        return REGISTRY._names_to_collectors[name]  # type: ignore[return-value]
+        return _lookup(name)  # type: ignore[return-value]
 
 logger = logging.getLogger(__name__)
 
