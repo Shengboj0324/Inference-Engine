@@ -174,14 +174,6 @@ class SignalClassifier:
         self,
         item: ContentItem,
     ) -> List[Tuple[SignalType, float]]:
-        """Fast pattern matching for initial filtering.
-
-        Args:
-            item: Content item to match
-
-        Returns:
-            List of (signal_type, confidence) tuples, sorted by confidence
-        """
         matches: List[Tuple[SignalType, float]] = []
 
         # Combine title and text for matching
