@@ -1,16 +1,3 @@
-"""Signal classification service - converts content into actionable signals.
-
-This module implements the core classification logic that transforms raw content
-into business-actionable signals. It uses a two-stage approach:
-1. Fast pattern matching for initial filtering
-2. LLM-based classification for precision
-
-Design principles:
-- High precision over recall (better to miss signals than false positives)
-- Fast initial filtering to minimize LLM costs
-- Confidence scoring for all classifications
-- Extensible pattern library
-"""
 
 import logging
 import re
@@ -144,18 +131,6 @@ class SignalClassifier:
         item: ContentItem,
         user_id: UUID,
     ) -> Optional[ActionableSignal]:
-        """Classify content item into actionable signal.
-
-        This is the main entry point for signal classification. It runs the
-        full classification pipeline and returns a signal if one is detected.
-
-        Args:
-            item: Content item to classify
-            user_id: User ID for signal ownership
-
-        Returns:
-            ActionableSignal if detected, None otherwise
-        """
         # Stage 1: Pattern matching for quick filtering
         pattern_matches = self._pattern_match(item)
         if not pattern_matches:
