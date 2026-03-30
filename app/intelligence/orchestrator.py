@@ -345,16 +345,19 @@ class VectorSearchTool:
                 )
                 rows = (await session.execute(stmt)).scalars().all()
 
+            import numpy as np
+            q_arr = np.array(query_vec, dtype=np.float32)
+            q_norm = np.linalg.norm(q_arr)
+
             results: List[VectorSearchResult] = []
             for row in rows:
-                import numpy as np
-                similarity = 1.0  # placeholder when distance unavailable
+                similarity = 0.0  # default when embedding unavailable
                 try:
-                    q = np.array(query_vec, dtype=np.float32)
-                    r = np.array(row.embedding, dtype=np.float32)
-                    denom = (np.linalg.norm(q) * np.linalg.norm(r))
+                    r_arr = np.array(row.embedding, dtype=np.float32)
+                    r_norm = np.linalg.norm(r_arr)
+                    denom = q_norm * r_norm
                     if denom > 0:
-                        similarity = float(np.dot(q, r) / denom)
+                        similarity = float(np.dot(q_arr, r_arr) / denom)
                 except Exception:
                     pass
                 results.append(VectorSearchResult(
@@ -364,6 +367,11 @@ class VectorSearchTool:
                     platform=str(row.source_platform),
                     published_at=row.published_at,
                 ))
+            # Enhancement 1 — re-sort by numpy cosine similarity (descending).
+            # The pgvector ORDER BY is an approximation; re-sorting here ensures
+            # the final list is always in strict similarity order regardless of
+            # any DB-side quantisation or HNSW approximation artefacts.
+            results.sort(key=lambda r: r.similarity, reverse=True)
             return results
         except Exception as exc:
             logger.warning("VectorSearchTool.search failed: %s", exc)
@@ -509,6 +517,18 @@ class ResearchCriticAgent:
                         "Broaden the research scope to industry-wide trends rather than "
                         "signal-specific details."
                     ]
+
+            # Enhancement 3 — Correction strategies completeness guarantee.
+            # The LLM may return fewer correction_strategies than filtered_gaps
+            # (e.g., it generates 1 for 3 filtered gaps, or none at all).
+            # Pad to ensure len(corrections) >= len(filtered) so downstream
+            # callers can always zip filtered_gaps and correction_strategies 1-to-1
+            # without index errors or silent silences.
+            _FALLBACK_CORRECTION = (
+                "Broaden the research scope to related market trends or industry benchmarks."
+            )
+            while len(corrections) < len(filtered):
+                corrections.append(_FALLBACK_CORRECTION)
 
             logger.info(
                 "ResearchCriticAgent: step=%d quality=%.2f relevant=%d filtered=%d corrections=%d",
@@ -755,6 +775,7 @@ class MultiAgentOrchestrator:
         vector_search_tool: Optional[VectorSearchTool] = None,
         user_id: Optional[UUID] = None,
         temporal_signals: Optional[List[Dict[str, Any]]] = None,
+        time_budget_seconds: Optional[float] = None,
     ) -> DeepResearchReport:
         """Run recursive LLM analysis on an actionable signal.
 
@@ -825,6 +846,20 @@ class MultiAgentOrchestrator:
         for depth in range(max_depth):
             if not pending_questions:
                 break
+            # Enhancement 2 — Circuit Breaker: exit gracefully when the wall-clock
+            # budget is exceeded rather than hanging or returning a timeout error.
+            # The partial report assembled so far is still returned so callers
+            # always receive a usable (albeit incomplete) research output.
+            if time_budget_seconds is not None:
+                elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+                if elapsed > time_budget_seconds:
+                    logger.warning(
+                        "DeepResearch: time budget %.1fs exceeded at depth=%d "
+                        "(elapsed=%.2fs); returning partial report with %d steps",
+                        time_budget_seconds, depth, elapsed, len(steps),
+                    )
+                    pending_questions.insert(0, pending_questions[0] if pending_questions else "")
+                    break
             question = pending_questions.pop(0)
 
             # --- Vector search for this question (Req 2) ---

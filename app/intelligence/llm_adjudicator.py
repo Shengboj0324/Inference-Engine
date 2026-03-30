@@ -288,8 +288,16 @@ class LLMAdjudicator:
         if user_context is None:
             return ""
         sp = user_context.strategic_priorities
-        # Only inject when the user has actually set priorities
-        if not sp.competitors and not sp.focus_areas and sp.tone == "neutral":
+        # Only inject the block when the user has customised at least one priority.
+        # Weights are non-default when they differ from 1.0 (the system baseline).
+        _all_defaults = (
+            not sp.competitors
+            and not sp.focus_areas
+            and sp.tone == "neutral"
+            and sp.urgency_weight == 1.0
+            and sp.impact_weight == 1.0
+        )
+        if _all_defaults:
             return ""
         lines = ["### STRATEGIC PRIORITIES"]
         lines.append(
