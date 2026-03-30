@@ -148,7 +148,49 @@ class NormalizedObservation(BaseModel):
         default_factory=dict,
         description="Normalization process metadata: model versions, confidence scores"
     )
-    
+
+    # ------------------------------------------------------------------
+    # Compliance & audit fields (Phase 2)
+    # ------------------------------------------------------------------
+
+    # PII hygiene
+    pii_scrubbed: bool = Field(
+        False,
+        description=(
+            "True when DataResidencyGuard._scrub_text() detected and removed PII "
+            "from normalized_text before it was forwarded to any LLM provider."
+        ),
+    )
+    pii_entity_count: int = Field(
+        0,
+        ge=0,
+        description="Number of individual PII tokens replaced during scrubbing.",
+    )
+
+    # Source-level audit trail — records the complete processing chain so that
+    # compliance teams can reconstruct which model touched which content and when.
+    audit_trail: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Immutable processing chain: normalization model versions, "
+            "per-stage timestamps, data lineage (raw → normalized → inference), "
+            "and automated compliance flags (pii_clean, language_detected, etc.)."
+        ),
+    )
+
+    # Sentiment drift — signed delta vs. the rolling baseline for the same
+    # (source_platform, author/channel) pair.  None when no baseline exists.
+    sentiment_drift_score: Optional[float] = Field(
+        None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "Δ sentiment relative to rolling baseline for this author/channel. "
+            "Positive = more positive than baseline; negative = more negative. "
+            "Magnitudes ≥ 0.3 are flagged as material drift."
+        ),
+    )
+
     @field_validator('quality_score', 'completeness_score')
     @classmethod
     def validate_score_range(cls, v: float) -> float:

@@ -306,6 +306,58 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
         )
 
 
+async def get_current_user_from_token(
+    token: str,
+    db: AsyncSession,
+) -> User:
+    """Authenticate a raw JWT token string and return the User ORM object.
+
+    This variant is used by WebSocket endpoints, which cannot carry
+    ``Authorization`` headers and must pass the token as a query parameter.
+
+    Args:
+        token: Raw JWT access token string.
+        db: Async database session.
+
+    Returns:
+        :class:`~app.core.db_models.User` ORM instance.
+
+    Raises:
+        HTTPException 401: If the token is invalid or the user cannot be found.
+        HTTPException 403: If the account is inactive.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError as exc:
+        logger.warning("WebSocket JWT validation error: %s", exc)
+        raise credentials_exception
+
+    try:
+        result = await db.execute(select(User).where(User.id == UUID(user_id)))
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise credentials_exception
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is inactive",
+            )
+        return user
+    except (ValueError, HTTPException):
+        raise
+    except Exception as exc:
+        logger.error("Error loading user for WebSocket auth: %s", exc)
+        raise credentials_exception
+
+
 @router.post("/logout")
 async def logout(
     credentials: HTTPAuthorizationCredentials = Depends(security),

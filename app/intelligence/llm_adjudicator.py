@@ -33,6 +33,7 @@ from app.domain.inference_models import (
     SignalInference,
     SignalPrediction,
     SignalType,
+    UserContext,
 )
 from app.intelligence.candidate_retrieval import SignalCandidate
 from app.llm.models import LLMMessage
@@ -136,13 +137,16 @@ class LLMAdjudicator:
         self,
         observation: NormalizedObservation,
         candidates: List[SignalCandidate],
+        user_context: Optional[UserContext] = None,
     ) -> SignalInference:
         """Adjudicate signal type for an observation using the active reasoning path.
 
         Execution flow:
         1. ``DeliberationEngine`` (E6) prunes candidates and selects the mode.
         2. ``ContextMemoryStore`` (E5) retrieves past observations for the user.
-        3. The selected reasoning path (single_call / CoT / multi_agent) runs.
+        3. The selected reasoning path (single_call / CoT / multi_agent) runs,
+           with ``user_context`` injected into the prompt to weight urgency /
+           impact against the user's strategic priorities.
         4. ``ConfidenceCalibrator`` (E2) adjusts per-prediction probabilities.
         5. ``ContextMemoryStore`` (E5) stores the result for future retrievals.
 
@@ -152,6 +156,10 @@ class LLMAdjudicator:
         Args:
             observation: Normalized observation to classify.
             candidates: Candidate signal types from the retrieval stage.
+            user_context: Optional per-user strategic priorities.  When present
+                the adjudication prompt is enriched with competitor names, focus
+                areas, and score-weight hints so urgency/impact reflect the
+                user's actual business context rather than generic heuristics.
 
         Returns:
             Calibrated ``SignalInference`` produced by the active reasoning path.
@@ -213,7 +221,12 @@ class LLMAdjudicator:
 
         if adjudication is None:
             # Default: single-call path (original behaviour)
-            prompt = self._build_prompt(observation, candidates, memory_context=memory_context)
+            prompt = self._build_prompt(
+                observation,
+                candidates,
+                memory_context=memory_context,
+                user_context=user_context,
+            )
             llm_output = await self._call_llm_with_retries(prompt, signal_type=top_candidate_type)
             try:
                 adjudication = LLMAdjudicationOutput(**llm_output)
@@ -256,12 +269,66 @@ class LLMAdjudicator:
                 f"{mem.normalized_text[:120]}..."
             )
         return "\n".join(lines)
-    
+
+    @staticmethod
+    def _format_strategic_priorities(user_context: Optional["UserContext"]) -> str:
+        """Return a ``### STRATEGIC PRIORITIES`` block for prompt injection.
+
+        Returns an empty string when *user_context* is ``None`` or all priority
+        fields hold their default values (i.e., the user has not customised
+        anything) so the prompt stays compact.
+
+        Args:
+            user_context: Caller-supplied ``UserContext``; may be ``None``.
+
+        Returns:
+            Multi-line block for insertion before "Analyze this content", or
+            an empty string when no customisation is active.
+        """
+        if user_context is None:
+            return ""
+        sp = user_context.strategic_priorities
+        # Only inject when the user has actually set priorities
+        if not sp.competitors and not sp.focus_areas and sp.tone == "neutral":
+            return ""
+        lines = ["### STRATEGIC PRIORITIES"]
+        lines.append(
+            "The analyst reviewing this signal has the following business context. "
+            "Use it to weight urgency_score and impact_score accordingly:"
+        )
+        if sp.competitors:
+            competitors_str = ", ".join(sp.competitors)
+            lines.append(
+                f"- Tracked competitors: {competitors_str}. "
+                "Content mentioning any of these is HIGHER urgency for this user."
+            )
+        if sp.focus_areas:
+            areas_str = ", ".join(sp.focus_areas)
+            lines.append(
+                f"- Focus areas: {areas_str}. "
+                "Signals directly related to these areas have HIGHER impact."
+            )
+        if sp.tone != "neutral":
+            lines.append(
+                f"- Preferred response tone: {sp.tone}. "
+                "Reflect this in suggested_actions."
+            )
+        if sp.urgency_weight != 1.0:
+            lines.append(
+                f"- Urgency weight multiplier: {sp.urgency_weight:.2f}x (apply to your urgency assessment)."
+            )
+        if sp.impact_weight != 1.0:
+            lines.append(
+                f"- Impact weight multiplier: {sp.impact_weight:.2f}x (apply to your impact assessment)."
+            )
+        return "\n".join(lines)
+
     def _build_prompt(
         self,
         observation: NormalizedObservation,
         candidates: List[SignalCandidate],
         memory_context: str = "",
+        user_context: Optional["UserContext"] = None,
     ) -> str:
         """Build few-shot prompt for LLM adjudication.
 
@@ -269,12 +336,19 @@ class LLMAdjudicator:
         retrieval), a ``### RELEVANT PAST OBSERVATIONS`` section is prepended to
         the user message so the LLM has in-context few-shot history.
 
+        When ``user_context`` is provided, a ``### STRATEGIC PRIORITIES`` block
+        is inserted that instructs the model to weight ``urgency_score`` and
+        ``impact_score`` against the user's tracked competitors, focus areas, and
+        preferred tone.  The block is omitted when priorities are all defaults so
+        the prompt remains compact for standard users.
+
         Args:
             observation: Normalized observation to classify.
             candidates: Candidate signal types from the retrieval stage.
             memory_context: Pre-formatted past-observation context from
                 ``ContextMemoryStore.retrieve()``; injected before the current
                 content when non-empty.
+            user_context: Optional per-user priorities for score weighting.
 
         Returns:
             Fully assembled prompt string.
@@ -328,9 +402,14 @@ ABSTENTION RULE: Set abstain=true and top type to "unclear" or "not_actionable" 
         # Memory context prefix (E5 — prepended when available)
         memory_prefix = f"{memory_context}\n\n" if memory_context else ""
 
+        # Strategic priorities block (Req 1 — injected only when non-default)
+        priorities_block = self._format_strategic_priorities(user_context)
+        priorities_prefix = f"{priorities_block}\n\n" if priorities_block else ""
+
         # User message
         user_message = (
             f"{memory_prefix}"
+            f"{priorities_prefix}"
             f"Analyze this content:\n\n"
             f"Title: {observation.title or 'N/A'}\n"
             f"Text: {observation.normalized_text[:1000] if observation.normalized_text else 'N/A'}\n"

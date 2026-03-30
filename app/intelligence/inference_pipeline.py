@@ -11,14 +11,18 @@ This is the main entry point for the Phase 2 inference system.
 """
 
 import asyncio
+import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 from uuid import UUID
 
+import redis.asyncio as aioredis
+
 from app.domain.raw_models import RawObservation
 from app.domain.normalized_models import NormalizedObservation
-from app.domain.inference_models import SignalInference
+from app.domain.inference_models import SignalInference, UserContext
 from app.intelligence.normalization import NormalizationEngine
 from app.intelligence.candidate_retrieval import CandidateRetriever
 from app.intelligence.llm_adjudicator import LLMAdjudicator
@@ -61,6 +65,8 @@ class InferencePipeline:
         orchestrator: Optional[MultiAgentOrchestrator] = None,
         context_memory: Optional[ContextMemoryStore] = None,
         deliberation_engine: Optional[DeliberationEngine] = None,
+        # Redis signal publisher
+        redis_url: Optional[str] = None,
     ):
         """Initialize inference pipeline.
 
@@ -78,7 +84,19 @@ class InferencePipeline:
             orchestrator: Multi-agent orchestrator (E3).
             context_memory: Per-user vector memory store (E5).
             deliberation_engine: Pre-adjudication deliberation engine (E6).
+            redis_url: Redis connection URL for the WebSocket signal broadcaster.
+                When set, every non-abstained inference result is published to
+                ``signals:{user_id}`` so ``WebSocketConnectionManager`` clients
+                receive live updates.  Reads ``settings.redis_url`` by default.
         """
+        # Lazily resolve redis_url from settings when not explicitly provided.
+        if redis_url is None:
+            try:
+                from app.core.config import settings as _settings
+                redis_url = _settings.redis_url
+            except Exception:
+                redis_url = None
+        self._redis_url: Optional[str] = redis_url
         self.normalization_engine = normalization_engine or NormalizationEngine(
             enable_translation=False,
             enable_entity_extraction=False,
@@ -134,14 +152,18 @@ class InferencePipeline:
         raw_observation: RawObservation,
         skip_normalization: bool = False,
         normalized_observation: Optional[NormalizedObservation] = None,
+        user_context: Optional[UserContext] = None,
     ) -> Tuple[NormalizedObservation, SignalInference]:
         """Run the complete inference pipeline.
-        
+
         Args:
             raw_observation: Raw observation from connector
             skip_normalization: Skip normalization if already done
             normalized_observation: Pre-normalized observation (if skip_normalization=True)
-            
+            user_context: Optional per-user strategic priorities injected into
+                Stage 3 (LLM Adjudication) to bias urgency / impact scoring
+                against the user's tracked competitors and focus areas.
+
         Returns:
             Tuple of (normalized_observation, signal_inference)
         """
@@ -160,9 +182,11 @@ class InferencePipeline:
         candidates = self.candidate_retriever.retrieve_candidates(normalized)
         logger.debug(f"Retrieved {len(candidates)} candidates")
         
-        # Stage 3: LLM Adjudication
+        # Stage 3: LLM Adjudication (user_context injects strategic priorities)
         logger.debug("Stage 3: LLM Adjudication")
-        inference = await self.llm_adjudicator.adjudicate(normalized, candidates)
+        inference = await self.llm_adjudicator.adjudicate(
+            normalized, candidates, user_context=user_context
+        )
         logger.debug(f"LLM adjudication complete: abstained={inference.abstained}")
         
         # Stage 4: Calibration
@@ -182,20 +206,170 @@ class InferencePipeline:
             inference.abstention_reason = reason
             inference.rationale = f"{inference.rationale or ''}\n\nAbstention: {explanation}"
             logger.debug(f"Abstention triggered: {reason.value if reason else 'unknown'}")
-        
+
         logger.info(
             f"Pipeline complete for {raw_observation.id}: "
             f"signal={inference.top_prediction.signal_type.value if inference.top_prediction else 'none'}, "
             f"confidence={inference.top_prediction.probability if inference.top_prediction else 0.0:.2f}, "
             f"abstained={inference.abstained}"
         )
-        
+
+        # Stage 6: Publish to Redis for WebSocket broadcast (non-blocking)
+        if not inference.abstained and raw_observation.user_id:
+            asyncio.ensure_future(
+                self._publish_to_redis(raw_observation.user_id, inference)
+            )
+
+        # Stage 7: High-confidence thread expansion (Req 4, non-blocking)
+        # Fires a high-priority Celery task when the classified probability
+        # exceeds the ingestion threshold so the full conversation thread is
+        # ingested asynchronously.
+        if not inference.abstained and inference.top_prediction is not None:
+            self._maybe_trigger_thread_expansion(raw_observation, inference)
+
         return normalized, inference
+
+    @staticmethod
+    def _maybe_trigger_thread_expansion(
+        raw_observation: "RawObservation",
+        inference: "SignalInference",
+    ) -> None:
+        """Fire ``expand_conversation_thread`` when thresholds are exceeded.
+
+        Thresholds (Req 4):
+        - ``top_prediction.probability > 0.8`` (maps to confidence_score)
+        - The signal type is inherently high-impact (CHURN_RISK, COMPETITOR_MENTION,
+          ALTERNATIVE_SEEKING, EXPANSION_OPPORTUNITY, UPSELL_OPPORTUNITY) **or** the
+          prediction has high confidence AND the probability > 0.85, acting as a
+          proxy for impact_score when the DB score is not yet available.
+
+        All failures are logged at WARNING level and swallowed — thread expansion
+        is strictly a value-add operation and must never block the critical path.
+
+        Args:
+            raw_observation: The raw observation that produced the inference.
+            inference: The classified ``SignalInference``.
+        """
+        from app.domain.inference_models import SignalType
+        _HIGH_IMPACT_TYPES = {
+            SignalType.CHURN_RISK,
+            SignalType.COMPETITOR_MENTION,
+            SignalType.ALTERNATIVE_SEEKING,
+            SignalType.EXPANSION_OPPORTUNITY,
+            SignalType.UPSELL_OPPORTUNITY,
+            SignalType.REPUTATION_RISK,
+        }
+        _CONFIDENCE_THRESHOLD = 0.8
+        _HIGH_IMPACT_PROXY_THRESHOLD = 0.85
+
+        pred = inference.top_prediction
+        if pred is None or pred.probability < _CONFIDENCE_THRESHOLD:
+            return
+        is_high_impact = (
+            pred.signal_type in _HIGH_IMPACT_TYPES
+            or pred.probability >= _HIGH_IMPACT_PROXY_THRESHOLD
+        )
+        if not is_high_impact:
+            return
+        # Celery task import is deferred to avoid circular imports at module load
+        try:
+            from app.ingestion.tasks import expand_conversation_thread
+            expand_conversation_thread.apply_async(
+                kwargs={
+                    "signal_id": str(raw_observation.id),
+                    "source_id": raw_observation.source_id or "",
+                    "platform": raw_observation.source_platform.value
+                    if hasattr(raw_observation.source_platform, "value")
+                    else str(raw_observation.source_platform),
+                    "user_id": str(raw_observation.user_id) if raw_observation.user_id else "",
+                },
+                queue="high_priority",
+            )
+            logger.info(
+                "InferencePipeline: thread expansion queued for obs=%s type=%s conf=%.3f",
+                raw_observation.id,
+                pred.signal_type.value,
+                pred.probability,
+            )
+        except Exception as exc:
+            logger.warning(
+                "InferencePipeline: failed to queue thread expansion for obs=%s: %s",
+                raw_observation.id, exc,
+            )
+
+    async def _publish_to_redis(
+        self,
+        user_id: UUID,
+        inference: SignalInference,
+    ) -> None:
+        """Publish a non-abstained inference result to the user's Redis channel.
+
+        The message is consumed by :class:`WebSocketConnectionManager` in
+        ``app/api/routes/signals.py`` and forwarded to every WebSocket client
+        subscribed to ``signals:{user_id}``.
+
+        The payload is a JSON object with ``type="signal"`` so the WebSocket
+        client can distinguish signal events from keepalive pings:
+
+        .. code-block:: json
+
+            {
+              "type": "signal",
+              "data": {
+                "inference_id": "<uuid>",
+                "signal_type": "<value>",
+                "confidence": 0.91,
+                "rationale": "...",
+                "timestamp": "<iso8601>"
+              }
+            }
+
+        Failures are logged at WARNING level and never propagate to callers —
+        a Redis outage must never degrade inference correctness.
+
+        Args:
+            user_id: UUID of the user who owns this observation.
+            inference: Completed, non-abstained ``SignalInference``.
+        """
+        if not self._redis_url:
+            return
+        top = inference.top_prediction
+        if not top:
+            return
+        channel = f"signals:{user_id}"
+        payload = json.dumps({
+            "type": "signal",
+            "data": {
+                "inference_id": str(inference.id),
+                "signal_type": top.signal_type.value,
+                "confidence": round(top.probability, 4),
+                "rationale": (inference.rationale or "")[:300],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        })
+        try:
+            client: aioredis.Redis = aioredis.from_url(
+                self._redis_url, decode_responses=True
+            )
+            async with client:
+                await client.publish(channel, payload)
+            logger.debug(
+                "InferencePipeline: published signal %s to %s",
+                top.signal_type.value,
+                channel,
+            )
+        except Exception as exc:
+            logger.warning(
+                "InferencePipeline: Redis publish failed for user %s: %s",
+                user_id,
+                exc,
+            )
     
     async def run_batch(
         self,
         raw_observations: list[RawObservation],
         concurrency: int = 5,
+        user_context: Optional[UserContext] = None,
     ) -> List[Tuple[NormalizedObservation, SignalInference]]:
         """Run pipeline on a batch of observations concurrently.
 
@@ -223,7 +397,7 @@ class InferencePipeline:
         async def _run_one(raw_obs: RawObservation) -> Optional[Tuple[NormalizedObservation, SignalInference]]:
             async with semaphore:
                 try:
-                    return await self.run(raw_obs)
+                    return await self.run(raw_obs, user_context=user_context)
                 except Exception as e:
                     logger.error(
                         f"Error processing observation {raw_obs.id}: {e}",

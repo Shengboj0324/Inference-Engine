@@ -34,6 +34,21 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # ── Personalization ───────────────────────────────────────────────────────
+    # Free-form JSON blob storing the user's GTM strategic priorities.
+    # Schema (all keys optional):
+    #   {
+    #     "competitors":   ["Notion", "Coda"],        # surface forms to up-weight
+    #     "focus_areas":   ["permissions", "pricing"], # product/domain focus
+    #     "tone":          "assertive",                # preferred response tone
+    #     "urgency_weight": 1.4,                       # multiplier for urgency_score
+    #     "impact_weight":  1.2                        # multiplier for impact_score
+    #   }
+    # Null means "use system defaults".  Validated at read-time by UserContext.
+    strategic_priorities: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        JSON, nullable=True, default=None,
+        comment="User GTM priorities: competitors, focus_areas, tone, score weights",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

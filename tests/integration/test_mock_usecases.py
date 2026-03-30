@@ -131,9 +131,10 @@ def _build_pipeline_with_mocks(
     retr_mock.retrieve_candidates.return_value = []
     pipeline.candidate_retriever = retr_mock
 
-    # LLM adjudicator mock
+    # LLM adjudicator mock — accept **kwargs to stay compatible when new
+    # optional parameters (e.g. user_context) are added to adjudicate().
     adj_mock = MagicMock()
-    async def _adjudicate(normalized, candidates):
+    async def _adjudicate(normalized, candidates, **kwargs):
         return _make_inference(normalized, signal_type, probability, abstained, abstention_reason)
     adj_mock.adjudicate = _adjudicate
     pipeline.llm_adjudicator = adj_mock

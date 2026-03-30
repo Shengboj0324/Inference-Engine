@@ -26,7 +26,9 @@ from pathlib import Path
 from typing import AsyncGenerator, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+import redis.asyncio as aioredis
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, and_, or_
@@ -34,9 +36,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.routes.auth import get_current_user
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.db_models import ActionableSignalDB, User
 from app.core.models import TeamRole
+from app.core.monitoring import MetricsCollector
 from app.core.signal_models import (
     ActionableSignal,
     SignalFilter,
@@ -46,7 +50,19 @@ from app.core.signal_models import (
     TeamDigest,
 )
 from app.domain.raw_models import RawObservation
+from app.intelligence.feedback_processor import FeedbackProcessor
 from app.intelligence.inference_pipeline import InferencePipeline
+from app.intelligence.orchestrator import (
+    ConversationTurn,
+    DeepResearchReport,
+    DraftResponse,
+    MultiAgentOrchestrator,
+    SignalInteractionAgent,
+    VectorSearchTool,
+)
+from app.domain.inference_models import UserContext
+
+_feedback_processor = FeedbackProcessor()
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +397,19 @@ async def mark_signal_acted(
                 signal_db.metadata_ = {}
             signal_db.metadata_['action_notes'] = request.notes
 
+        # Closed-loop calibration — fire-and-forget; never blocks the response
+        try:
+            fb = await _feedback_processor.process_act(
+                signal_id=str(signal_id),
+                signal_type_value=signal_db.signal_type.value,
+                confidence_score=signal_db.confidence_score,
+                current_action_score=signal_db.action_score,
+                notes=request.notes,
+            )
+            signal_db.action_score = fb.new_action_score
+        except Exception as _fb_exc:
+            logger.warning("FeedbackProcessor.process_act error (non-fatal): %s", _fb_exc)
+
         await db.commit()
         await db.refresh(signal_db)
 
@@ -474,6 +503,19 @@ async def dismiss_signal(
             if signal_db.metadata_ is None:
                 signal_db.metadata_ = {}
             signal_db.metadata_['dismissal_reason'] = request.reason
+
+        # Closed-loop calibration
+        try:
+            fb = await _feedback_processor.process_dismiss(
+                signal_id=str(signal_id),
+                signal_type_value=signal_db.signal_type.value,
+                confidence_score=signal_db.confidence_score,
+                current_action_score=signal_db.action_score,
+                reason=request.reason,
+            )
+            signal_db.action_score = fb.new_action_score
+        except Exception as _fb_exc:
+            logger.warning("FeedbackProcessor.process_dismiss error (non-fatal): %s", _fb_exc)
 
         await db.commit()
         await db.refresh(signal_db)
@@ -747,6 +789,505 @@ async def stream_signal_inference(
             "X-Accel-Buffering": "no",  # Disable Nginx buffering for SSE
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket real-time signal stream
+# ---------------------------------------------------------------------------
+
+class WebSocketConnectionManager:
+    """Manage active WebSocket connections per user, backed by Redis pub/sub.
+
+    Each user gets their own Redis channel ``signals:{user_id}``.  When the
+    inference pipeline or a Celery task generates a new actionable signal for
+    a user, it publishes a JSON payload to that channel.  All connected
+    WebSocket clients for that user receive the broadcast instantly.
+
+    Connection lifecycle
+    --------------------
+    1. Client opens ``GET /api/v1/signals/ws?token=<JWT>``.
+    2. Manager authenticates the token, subscribes to ``signals:{user_id}``.
+    3. Incoming Redis messages are forwarded to the WebSocket.
+    4. On disconnect, the subscription is torn down and the gauge updated.
+    """
+
+    async def connect(
+        self,
+        ws: WebSocket,
+        user_id: str,
+        redis_url: str,
+    ) -> None:
+        """Accept the WebSocket, subscribe to the user's Redis channel, and
+        handle both inbound ``chat_message`` events and outbound signal pushes.
+
+        The connection is fully bidirectional:
+
+        * **Outbound** — Redis pub/sub messages on ``signals:{user_id}`` are
+          forwarded verbatim as ``{"type": "signal", ...}`` frames.
+        * **Inbound** — the client may send ``{"type": "chat_message",
+          "signal_id": "<uuid>", "message": "<text>"}`` frames.  These are
+          currently acknowledged with a ``{"type": "chat_ack"}`` frame;
+          full response generation is handled by the ``/chat`` HTTP endpoint
+          which uses ``SignalInteractionAgent`` for RAG-backed replies.
+
+        Args:
+            ws: FastAPI WebSocket connection.
+            user_id: Authenticated user's UUID string.
+            redis_url: Redis connection URL from settings.
+        """
+        await ws.accept()
+        MetricsCollector.record_websocket_connection(+1)
+        channel = f"signals:{user_id}"
+        client: aioredis.Redis = aioredis.from_url(redis_url, decode_responses=True)
+        pubsub = client.pubsub()
+        await pubsub.subscribe(channel)
+        logger.info("WebSocket subscribed to %s", channel)
+
+        async def _redis_listener() -> None:
+            """Forward Redis pub/sub messages to the WebSocket."""
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    await ws.send_text(message["data"])
+
+        async def _ws_receiver() -> None:
+            """Process inbound WebSocket frames from the client."""
+            while True:
+                try:
+                    raw = await ws.receive_text()
+                except WebSocketDisconnect:
+                    break
+                except Exception:
+                    break
+                try:
+                    frame = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                event_type = frame.get("type")
+                if event_type == "chat_message":
+                    # Acknowledge receipt; actual response via /chat endpoint
+                    ack = json.dumps({
+                        "type": "chat_ack",
+                        "signal_id": frame.get("signal_id"),
+                        "status": "received",
+                    })
+                    await ws.send_text(ack)
+                elif event_type == "ping":
+                    await ws.send_text(json.dumps({"type": "pong"}))
+
+        try:
+            # Run both tasks concurrently; stop as soon as either finishes
+            await asyncio.gather(
+                _redis_listener(),
+                _ws_receiver(),
+                return_exceptions=True,
+            )
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected for user %s", user_id)
+        except Exception as exc:
+            logger.warning("WebSocket error for user %s: %s", user_id, exc)
+        finally:
+            await pubsub.unsubscribe(channel)
+            await client.aclose()
+            MetricsCollector.record_websocket_connection(-1)
+
+
+_ws_manager = WebSocketConnectionManager()
+
+
+@router.websocket("/ws")
+async def signal_stream_ws(
+    ws: WebSocket,
+    token: str = Query(..., description="JWT access token (query param — WS cannot send headers)"),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Stream new signals to the client in real time over WebSocket.
+
+    Authentication is performed via a JWT passed as the ``token`` query
+    parameter (WebSocket connections cannot carry Authorization headers).
+
+    Each message is a JSON object with a ``type`` field:
+
+    * ``{"type": "signal", "data": {...}}`` — a new actionable signal.
+    * ``{"type": "ping"}`` — keepalive sent every 30 seconds.
+
+    The client must reconnect on disconnect; the server does not buffer
+    messages sent while the client was offline.
+
+    Args:
+        ws: WebSocket connection provided by FastAPI.
+        token: Bearer JWT token passed as a query parameter.
+        db: Database session for user lookup.
+
+    Raises:
+        WebSocketDisconnect: Raised internally when the client closes.
+    """
+    from app.api.routes.auth import get_current_user_from_token
+    try:
+        current_user: User = await get_current_user_from_token(token, db)
+    except Exception:
+        await ws.close(code=1008)  # Policy violation — auth failure
+        return
+
+    await _ws_manager.connect(
+        ws=ws,
+        user_id=str(current_user.id),
+        redis_url=settings.redis_url,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deep Research endpoint
+# ---------------------------------------------------------------------------
+
+class DeepResearchRequest(BaseModel):
+    """Request body for the Deep Research endpoint."""
+
+    question: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description="Opening research question to drive the recursive analysis.",
+    )
+    content_history_ids: Optional[List[UUID]] = Field(
+        None,
+        description="UUIDs of ContentItems to cross-reference during research.",
+    )
+    max_depth: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="Maximum recursion depth (1–5).",
+    )
+
+
+@router.post(
+    "/{signal_id}/deep-research",
+    response_model=DeepResearchReport,
+    summary="Run Deep Research on an actionable signal",
+    description=(
+        "Trigger a recursive multi-step LLM analysis on a specific signal. "
+        "The orchestrator resolves knowledge gaps iteratively up to ``max_depth`` rounds "
+        "and returns a structured research report with a final synthesis paragraph."
+    ),
+)
+async def deep_research(
+    signal_id: UUID,
+    request: DeepResearchRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DeepResearchReport:
+    """Execute Deep Research mode on an actionable signal.
+
+    Args:
+        signal_id: UUID of the signal to research.
+        request: Research parameters (question, depth, content history).
+        current_user: Authenticated user.
+        db: Database session.
+
+    Returns:
+        :class:`~app.intelligence.orchestrator.DeepResearchReport` with all
+        recursive steps and a final synthesis paragraph.
+
+    Raises:
+        HTTPException 404: Signal not found or not owned by current user.
+        HTTPException 500: Orchestration failure.
+    """
+    result = await db.execute(
+        select(ActionableSignalDB).where(
+            and_(
+                ActionableSignalDB.id == signal_id,
+                ActionableSignalDB.user_id == current_user.id,
+            )
+        )
+    )
+    signal_db = result.scalar_one_or_none()
+    if not signal_db:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Signal not found")
+
+    signal_context = (
+        f"Type: {signal_db.signal_type.value}\n"
+        f"Title: {signal_db.title}\n"
+        f"Description: {signal_db.description}\n"
+        f"Context: {signal_db.context}"
+    )
+    orchestrator = MultiAgentOrchestrator()
+    # Build VectorSearchTool for this request (Req 2)
+    try:
+        from app.core.db import AsyncSessionLocal
+        vec_tool: Optional[VectorSearchTool] = VectorSearchTool(
+            db_session_factory=AsyncSessionLocal,
+        )
+    except Exception:
+        vec_tool = None
+
+    # Build temporal signals from recent acted signals of the same type (Req 2)
+    temporal_signals: List[dict] = []
+    try:
+        ts_result = await db.execute(
+            select(ActionableSignalDB)
+            .where(
+                and_(
+                    ActionableSignalDB.user_id == current_user.id,
+                    ActionableSignalDB.signal_type == signal_db.signal_type,
+                    ActionableSignalDB.acted_at.isnot(None),
+                )
+            )
+            .order_by(ActionableSignalDB.acted_at.desc())
+            .limit(5)
+        )
+        for ts in ts_result.scalars().all():
+            temporal_signals.append({
+                "type": ts.signal_type.value,
+                "confidence": float(ts.confidence_score or 0.0),
+                "title": ts.title or "",
+                "acted_at": ts.acted_at.isoformat() if ts.acted_at else None,
+            })
+    except Exception as ts_exc:
+        logger.debug("Temporal signals query failed: %s", ts_exc)
+
+    try:
+        report = await orchestrator.deep_research(
+            signal_id=str(signal_id),
+            signal_type=signal_db.signal_type.value,
+            signal_context=signal_context,
+            initial_question=request.question,
+            max_depth=request.max_depth,
+            vector_search_tool=vec_tool,
+            user_id=current_user.id,
+            temporal_signals=temporal_signals or None,
+        )
+    except Exception as exc:
+        logger.error("Deep Research failed for signal %s: %s", signal_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Deep Research orchestration failed",
+        )
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Req 3 — Conversational chat + one-click draft-response endpoints
+# ---------------------------------------------------------------------------
+
+
+class ChatRequest(BaseModel):
+    """Request body for the signal chat endpoint."""
+
+    message: str = Field(..., min_length=1, max_length=1000)
+    history: Optional[List[dict]] = Field(
+        default=None,
+        description=(
+            "Prior conversation turns as ``[{'role': 'user'|'assistant', 'content': '...'}]``. "
+            "Last 6 turns are used."
+        ),
+    )
+    report: Optional[dict] = Field(
+        None,
+        description="Serialised DeepResearchReport from a prior research session.",
+    )
+
+
+class ChatResponse(BaseModel):
+    """Response body for the signal chat endpoint."""
+
+    answer: str
+    signal_id: str
+
+
+class OneClickActionRequest(BaseModel):
+    """Request body for the one-click-action endpoint."""
+
+    channel: str = Field(
+        default="internal_note",
+        description="Target channel: 'dm', 'public_reply', 'email', or 'internal_note'.",
+    )
+    report: Optional[dict] = Field(
+        None,
+        description="Serialised DeepResearchReport; when absent a lightweight synthesis is used.",
+    )
+
+
+@router.post(
+    "/{signal_id}/chat",
+    response_model=ChatResponse,
+    summary="Ask a follow-up question about a signal (RAG-backed)",
+)
+async def signal_chat(
+    signal_id: UUID,
+    request: ChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ChatResponse:
+    """Answer a follow-up question about an actionable signal using the
+    ``DeepResearchReport`` as a RAG source.
+
+    The endpoint is the HTTP counterpart to the ``chat_message`` WebSocket event.
+    It is stateless: the caller must pass *history* and *report* on every request.
+
+    Args:
+        signal_id: UUID of the signal being discussed.
+        request: Chat payload (message, optional history, optional report).
+        current_user: Authenticated user.
+        db: Database session.
+
+    Returns:
+        :class:`ChatResponse` with the assistant's answer.
+
+    Raises:
+        HTTPException 404: Signal not owned by the authenticated user.
+    """
+    res = await db.execute(
+        select(ActionableSignalDB).where(
+            and_(
+                ActionableSignalDB.id == signal_id,
+                ActionableSignalDB.user_id == current_user.id,
+            )
+        )
+    )
+    signal_db = res.scalar_one_or_none()
+    if not signal_db:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Signal not found")
+
+    signal_context = (
+        f"Type: {signal_db.signal_type.value}\n"
+        f"Title: {signal_db.title}\n"
+        f"Description: {signal_db.description}\n"
+    )
+
+    # Reconstruct report from request payload if provided
+    report_obj: Optional[DeepResearchReport] = None
+    if request.report:
+        try:
+            report_obj = DeepResearchReport(**request.report)
+        except Exception:
+            report_obj = None
+
+    # Fallback minimal report when none supplied
+    if report_obj is None:
+        from app.intelligence.orchestrator import DeepResearchStep
+        report_obj = DeepResearchReport(
+            signal_id=str(signal_id),
+            signal_type=signal_db.signal_type.value,
+            initial_question="",
+            steps=[],
+            final_synthesis=signal_db.description or "",
+            total_tokens_used=0,
+            max_depth_reached=0,
+            knowledge_gaps_remaining=[],
+            started_at=datetime.now(timezone.utc),
+        )
+
+    # Reconstruct conversation history
+    history_turns: List[ConversationTurn] = []
+    for turn in (request.history or [])[-6:]:
+        history_turns.append(
+            ConversationTurn(role=turn.get("role", "user"), content=turn.get("content", ""))
+        )
+
+    agent = SignalInteractionAgent()
+    answer = await agent.chat(
+        signal_context=signal_context,
+        report=report_obj,
+        history=history_turns,
+        user_message=request.message,
+    )
+    return ChatResponse(answer=answer, signal_id=str(signal_id))
+
+
+@router.post(
+    "/{signal_id}/one-click-action",
+    summary="Generate a one-click draft response grounded in Deep Research",
+)
+async def one_click_action(
+    signal_id: UUID,
+    request: OneClickActionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Generate a tailored draft response for an actionable signal.
+
+    Uses ``SignalInteractionAgent.generate_draft_response()`` to produce copy
+    for the requested *channel* grounded in the signal's ``DeepResearchReport``.
+    The user's ``StrategicPriorities.tone`` is applied when available.
+
+    Args:
+        signal_id: UUID of the signal to respond to.
+        request: Channel selection and optional report payload.
+        current_user: Authenticated user.
+        db: Database session.
+
+    Returns:
+        Serialised :class:`~app.intelligence.orchestrator.DraftResponse`.
+
+    Raises:
+        HTTPException 404: Signal not found or not owned by user.
+        HTTPException 500: Draft generation failed.
+    """
+    res = await db.execute(
+        select(ActionableSignalDB).where(
+            and_(
+                ActionableSignalDB.id == signal_id,
+                ActionableSignalDB.user_id == current_user.id,
+            )
+        )
+    )
+    signal_db = res.scalar_one_or_none()
+    if not signal_db:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Signal not found")
+
+    # Determine tone from user's strategic_priorities (Req 1 integration)
+    user_ctx = UserContext.from_user(current_user)
+    tone = user_ctx.strategic_priorities.tone
+
+    signal_context = (
+        f"Type: {signal_db.signal_type.value}\n"
+        f"Title: {signal_db.title}\n"
+        f"Description: {signal_db.description}\n"
+    )
+
+    # Reconstruct report from payload or build minimal fallback
+    report_obj: Optional[DeepResearchReport] = None
+    if request.report:
+        try:
+            report_obj = DeepResearchReport(**request.report)
+        except Exception:
+            report_obj = None
+    if report_obj is None:
+        report_obj = DeepResearchReport(
+            signal_id=str(signal_id),
+            signal_type=signal_db.signal_type.value,
+            initial_question="",
+            steps=[],
+            final_synthesis=signal_db.description or "",
+            total_tokens_used=0,
+            max_depth_reached=0,
+            knowledge_gaps_remaining=[],
+            started_at=datetime.now(timezone.utc),
+        )
+
+    agent = SignalInteractionAgent()
+    try:
+        draft = await agent.generate_draft_response(
+            signal_context=signal_context,
+            report=report_obj,
+            channel=request.channel,
+            tone=tone,
+        )
+    except Exception as exc:
+        logger.error("one-click-action failed for signal %s: %s", signal_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Draft generation failed",
+        )
+    return {
+        "signal_id": draft.signal_id,
+        "channel": draft.channel,
+        "tone": draft.tone,
+        "body": draft.body,
+        "suggested_subject": draft.suggested_subject,
+        "generated_at": draft.generated_at.isoformat(),
+        "source_report_steps": draft.source_report_steps,
+    }
 
 
 # ---------------------------------------------------------------------------

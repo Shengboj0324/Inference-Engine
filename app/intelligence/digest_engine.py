@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db_models import ContentItemDB, User
 from app.core.models import Cluster, ContentItem, DigestRequest, DigestResponse, SourcePlatform
+from app.core.monitoring import MetricsCollector
 from app.core.ranking import ContentClusterer, RelevanceScorer
 from app.llm.openai_client import OpenAILLMClient
 from app.intelligence.cluster_summarizer import ClusterSummarizer
@@ -201,6 +202,12 @@ class DigestEngine:
         )
 
         clusters = clusterer.cluster_items(items, user_id)
+
+        # Emit per-cluster density metrics so Prometheus can track whether
+        # HDBSCAN is producing appropriately dense or degenerate clusters.
+        for cluster in clusters:
+            MetricsCollector.record_clustering_density(len(cluster.items))
+
         return clusters
 
     async def _summarize_clusters(self, clusters: List[Cluster]) -> List[Cluster]:

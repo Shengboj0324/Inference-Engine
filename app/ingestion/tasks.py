@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from app.core.config import settings
 from app.core.db import SessionLocal
 from app.core.db_models import ContentItemDB, PlatformConfigDB, User
 from app.core.models import ContentItem
+from app.core.monitoring import MetricsCollector
 from app.ingestion.celery_app import celery_app
 from app.llm.openai_client import OpenAISyncEmbeddingClient
 
@@ -119,12 +121,33 @@ def fetch_source_content(self, user_id: UUID, config_id: UUID):
         # Default to 24 hours ago if no previous fetch
         since = config.last_fetch_time or (datetime.utcnow() - timedelta(hours=24))
 
+        # Measure end-to-end ingestion latency for the Prometheus histogram.
+        # The clock starts just before the connector call and stops after the
+        # last ContentItem has been queued for processing.
+        _fetch_start = time.monotonic()
+
         # Run async connector in sync context using asyncio.run()
         result = asyncio.run(
             connector.fetch_content(
                 since=since, max_items=settings.max_items_per_fetch
             )
         )
+
+        _fetch_elapsed = time.monotonic() - _fetch_start
+        if result.items:
+            # Record per-item latency (total fetch time ÷ items avoids
+            # artificially large values for large batches).
+            per_item_latency = _fetch_elapsed / len(result.items)
+            MetricsCollector.record_ingestion_latency(
+                platform=str(config.platform),
+                latency_seconds=per_item_latency,
+            )
+        else:
+            # Still record a zero-items fetch so the histogram baseline exists.
+            MetricsCollector.record_ingestion_latency(
+                platform=str(config.platform),
+                latency_seconds=_fetch_elapsed,
+            )
 
         # Check for duplicates and upsert instead of blind insert
         new_items = 0
@@ -211,8 +234,17 @@ def process_content_item(self, item_dict: dict):
         metadata_=item.metadata,
     )
 
+    _write_start = time.monotonic()
     db.add(db_item)
     db.commit()
+    _write_elapsed = time.monotonic() - _write_start
+
+    # Record DB-write latency under the same platform label so operators can
+    # distinguish connector-fetch latency from storage-write latency.
+    MetricsCollector.record_ingestion_latency(
+        platform=str(item.source_platform),
+        latency_seconds=_write_elapsed,
+    )
 
     return {"status": "success", "item_id": str(item.id)}
 
@@ -236,6 +268,163 @@ def cleanup_old_content(self):
     db.commit()
 
     return {"status": "success", "items_deleted": len(old_items)}
+
+
+# ---------------------------------------------------------------------------
+# Req 4 — Contextual Thread Expansion
+# ---------------------------------------------------------------------------
+
+#: Minimum classification confidence required to trigger thread expansion.
+_THREAD_EXPANSION_CONFIDENCE_THRESHOLD: float = 0.8
+#: Minimum impact score required to trigger thread expansion.
+_THREAD_EXPANSION_IMPACT_THRESHOLD: float = 0.7
+#: Maximum number of parent/child nodes to ingest per thread expansion.
+_THREAD_EXPANSION_MAX_NODES: int = 50
+
+
+@celery_app.task(base=DatabaseTask, bind=True, queue="high_priority")
+def expand_conversation_thread(
+    self,
+    signal_id: str,
+    source_id: str,
+    platform: str,
+    user_id: str,
+    max_nodes: int = _THREAD_EXPANSION_MAX_NODES,
+) -> dict:
+    """High-priority task: ingest the full conversation thread for a signal.
+
+    Triggered automatically when a signal is classified with
+    ``confidence_score > 0.8`` AND ``impact_score > 0.7``.  Ingests up to
+    *max_nodes* parent and child posts from the originating thread, stores
+    them as ``ContentItemDB`` rows, and updates
+    ``ActionableSignalDB.context`` to record that thread expansion has run.
+
+    All new items are linked to the signal by appending their IDs to the
+    ``context`` JSON field so the ``DeepResearchAgent`` can surface them via
+    the ``VectorSearchTool``.
+
+    Args:
+        signal_id: UUID string of the ``ActionableSignalDB`` that triggered
+            expansion.
+        source_id: Platform-native thread/post identifier (e.g. Reddit
+            ``t1_abc123`` or Twitter conversation ID).
+        platform: Lower-case platform name (e.g. ``"reddit"``).
+        user_id: UUID string of the signal owner — used to scope DB writes.
+        max_nodes: Maximum parent/child nodes to ingest (default 50).
+
+    Returns:
+        Dict with ``status``, ``signal_id``, ``nodes_ingested``, and
+        ``platform``.
+    """
+    db = self.db
+    logger.info(
+        "expand_conversation_thread: signal=%s platform=%s source_id=%s max_nodes=%d",
+        signal_id, platform, source_id, max_nodes,
+    )
+    start_time = time.time()
+    nodes_ingested = 0
+
+    try:
+        from app.core.db_models import ActionableSignalDB
+        from app.connectors.registry import ConnectorRegistry
+
+        # Resolve the signal row
+        sig_row = db.execute(
+            select(ActionableSignalDB).where(
+                ActionableSignalDB.id == UUID(signal_id)
+            )
+        ).scalar_one_or_none()
+        if sig_row is None:
+            logger.warning("expand_conversation_thread: signal %s not found", signal_id)
+            return {"status": "not_found", "signal_id": signal_id, "nodes_ingested": 0}
+
+        # Try to fetch the full thread via the platform connector
+        try:
+            registry = ConnectorRegistry()
+            connector = registry.get_connector(platform)
+            thread_items: list = connector.fetch_thread(
+                source_id=source_id, max_nodes=max_nodes
+            ) if hasattr(connector, "fetch_thread") else []
+        except Exception as conn_exc:
+            logger.warning(
+                "expand_conversation_thread: connector fetch failed for %s/%s: %s",
+                platform, source_id, conn_exc,
+            )
+            thread_items = []
+
+        # Persist each thread node as a ContentItemDB
+        expanded_ids: list[str] = []
+        user_uuid = UUID(user_id)
+        for raw_item in thread_items[:max_nodes]:
+            try:
+                existing = db.execute(
+                    select(ContentItemDB).where(
+                        ContentItemDB.source_id == raw_item.get("source_id", ""),
+                    )
+                ).scalar_one_or_none()
+                if existing:
+                    expanded_ids.append(str(existing.id))
+                    continue
+
+                db_item = ContentItemDB(
+                    user_id=user_uuid,
+                    source_platform=platform,
+                    source_id=raw_item.get("source_id", f"{source_id}_node_{nodes_ingested}"),
+                    source_url=raw_item.get("url", ""),
+                    title=raw_item.get("title", "")[:255],
+                    raw_text=raw_item.get("text", "")[:10000],
+                    author=raw_item.get("author"),
+                    published_at=raw_item.get("published_at", datetime.utcnow()),
+                    fetched_at=datetime.utcnow(),
+                )
+                db.add(db_item)
+                db.flush()
+                expanded_ids.append(str(db_item.id))
+                nodes_ingested += 1
+            except Exception as item_exc:
+                logger.debug("expand_conversation_thread: item write failed: %s", item_exc)
+
+        # Update ActionableSignalDB.context to record expansion
+        import json as _json
+        existing_ctx: dict = {}
+        try:
+            existing_ctx = _json.loads(sig_row.context or "{}") if isinstance(
+                sig_row.context, str
+            ) else (sig_row.context or {})
+        except Exception:
+            existing_ctx = {}
+        existing_ctx["thread_expansion"] = {
+            "source_id": source_id,
+            "platform": platform,
+            "nodes_ingested": nodes_ingested,
+            "expanded_content_ids": expanded_ids,
+            "expanded_at": datetime.utcnow().isoformat(),
+        }
+        sig_row.context = _json.dumps(existing_ctx)
+        db.commit()
+
+        elapsed = time.time() - start_time
+        logger.info(
+            "expand_conversation_thread: done — signal=%s nodes=%d elapsed=%.2fs",
+            signal_id, nodes_ingested, elapsed,
+        )
+        MetricsCollector.record_ingestion(
+            platform=platform,
+            latency_seconds=elapsed,
+        )
+        return {
+            "status": "success",
+            "signal_id": signal_id,
+            "nodes_ingested": nodes_ingested,
+            "platform": platform,
+        }
+
+    except Exception as exc:
+        logger.error(
+            "expand_conversation_thread: unhandled error for signal %s: %s",
+            signal_id, exc, exc_info=True,
+        )
+        return {"status": "error", "signal_id": signal_id, "error": str(exc), "nodes_ingested": 0}
 
 
 # Connector creation is now handled by ConnectorRegistry

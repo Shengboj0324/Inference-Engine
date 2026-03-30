@@ -61,6 +61,83 @@ class AbstentionReason(str, Enum):
     MALFORMED_OUTPUT = "malformed_output"  # LLM output could not be parsed/validated
 
 
+class StrategicPriorities(BaseModel):
+    """User-defined GTM priorities that bias inference scoring.
+
+    All fields are optional; absent fields receive system defaults.
+    Populated from ``User.strategic_priorities`` JSON at request time.
+
+    Attributes:
+        competitors: Surface forms of competitors to up-weight in scoring.
+            When the observation mentions any of these names the ``urgency_score``
+            multiplier is applied during adjudication.
+        focus_areas: Product or domain keywords (e.g. "permissions", "pricing")
+            that indicate high relevance for this user's business context.
+        tone: Preferred response tone for ``DraftResponse`` generation.
+            One of ``"assertive"``, ``"empathetic"``, or ``"neutral"`` (default).
+        urgency_weight: Multiplier applied to the raw ``urgency_score`` when
+            persisting an ``ActionableSignalDB`` for this user (default 1.0).
+        impact_weight: Multiplier applied to the raw ``impact_score`` (default 1.0).
+    """
+
+    competitors: List[str] = Field(default_factory=list)
+    focus_areas: List[str] = Field(default_factory=list)
+    tone: str = Field(
+        default="neutral",
+        description="One of 'assertive', 'empathetic', 'neutral'",
+    )
+    urgency_weight: float = Field(default=1.0, ge=0.5, le=3.0)
+    impact_weight: float = Field(default=1.0, ge=0.5, le=3.0)
+
+    @classmethod
+    def from_db_json(cls, raw: Optional[Dict[str, Any]]) -> "StrategicPriorities":
+        """Construct from the raw ``User.strategic_priorities`` JSON blob.
+
+        Returns a default ``StrategicPriorities`` when *raw* is ``None`` or
+        otherwise unparseable so callers never need to ``None``-guard.
+        """
+        if not raw:
+            return cls()
+        try:
+            return cls(**{k: v for k, v in raw.items() if k in cls.model_fields})
+        except Exception:
+            return cls()
+
+
+class UserContext(BaseModel):
+    """Typed wrapper around per-user context injected into the inference prompt.
+
+    Constructed once per API request from the authenticated ``User`` record and
+    threaded through ``InferencePipeline.run()`` → ``LLMAdjudicator.adjudicate()``.
+
+    Attributes:
+        user_id: UUID of the authenticated user (for logging).
+        strategic_priorities: Parsed GTM priorities for prompt injection.
+    """
+
+    user_id: UUID
+    strategic_priorities: StrategicPriorities = Field(
+        default_factory=StrategicPriorities
+    )
+
+    @classmethod
+    def from_user(cls, user: Any) -> "UserContext":
+        """Build a ``UserContext`` from a ``User`` DB model instance.
+
+        Args:
+            user: ``app.core.db_models.User`` instance.
+
+        Returns:
+            Fully populated ``UserContext``; never raises.
+        """
+        return cls(
+            user_id=user.id,
+            strategic_priorities=StrategicPriorities.from_db_json(
+                getattr(user, "strategic_priorities", None)
+            ),
+        )
+
+
 class EvidenceSpan(BaseModel):
     """Evidence span in text supporting a prediction."""
     

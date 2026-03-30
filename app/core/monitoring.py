@@ -132,6 +132,63 @@ clusters_generated_total = _counter("clusters_generated_total", "Total clusters 
 # Error metrics
 errors_total = _counter("errors_total", "Total errors", ("error_code", "severity"))
 
+# ---------------------------------------------------------------------------
+# Industrial-grade observability metrics (Phase 2)
+# ---------------------------------------------------------------------------
+
+# Ingestion latency per source platform — measures end-to-end time from
+# connector fetch to ContentItem stored in Postgres, segmented by platform.
+ingestion_latency_seconds = _histogram(
+    "ingestion_latency_seconds",
+    "End-to-end content ingestion latency per source platform (seconds)",
+    ("platform",),
+)
+
+# Token-to-signal efficiency — how many LLM tokens are consumed per actionable
+# signal produced.  High ratios flag costly classification paths.
+token_signal_ratio = _histogram(
+    "token_signal_ratio",
+    "LLM tokens consumed per actionable signal generated",
+    ("signal_type",),
+)
+
+# HDBSCAN clustering density — distribution of items per cluster.
+# Sparse clusters (size 2–3) may indicate over-sensitive similarity thresholds.
+clustering_density = _histogram(
+    "clustering_density_items",
+    "Number of content items per HDBSCAN cluster",
+    (),
+)
+
+# WebSocket signal-stream connections — tracks concurrent real-time subscribers.
+websocket_connections_active = _gauge(
+    "websocket_connections_active",
+    "Number of active WebSocket signal-stream connections",
+)
+
+# Deep Research steps — counts recursive LLM adjudication rounds.
+deep_research_steps_total = _counter(
+    "deep_research_steps_total",
+    "Total recursive LLM steps executed in Deep Research mode",
+    ("signal_type",),
+)
+
+# PII scrubbing — counts entity instances removed during normalization,
+# segmented by platform and PII category (email, phone, name, …).
+pii_entities_scrubbed_total = _counter(
+    "pii_entities_scrubbed_total",
+    "PII entity instances scrubbed from content during normalization",
+    ("platform", "entity_type"),
+)
+
+# Sentiment drift detections — counts observations where measured sentiment
+# diverges materially from the author/channel rolling baseline.
+sentiment_drift_detected_total = _counter(
+    "sentiment_drift_detected_total",
+    "Observations where sentiment drifted beyond threshold vs baseline",
+    ("platform", "direction"),  # direction: positive | negative
+)
+
 
 class MetricsCollector:
     """Collect and export application metrics."""
@@ -216,6 +273,78 @@ class MetricsCollector:
     def increment_clusters_generated():
         """Increment clusters generated counter."""
         clusters_generated_total.inc()
+
+    # ------------------------------------------------------------------
+    # Industrial-grade observability (Phase 2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def record_ingestion_latency(platform: str, latency_seconds: float) -> None:
+        """Record end-to-end ingestion latency for a single content item.
+
+        Args:
+            platform: Source platform name (e.g. 'reddit', 'rss').
+            latency_seconds: Elapsed seconds from fetch to DB write.
+        """
+        ingestion_latency_seconds.labels(platform=platform).observe(latency_seconds)
+
+    @staticmethod
+    def record_token_signal_ratio(signal_type: str, tokens: int) -> None:
+        """Record LLM token cost per actionable signal produced.
+
+        Args:
+            signal_type: Signal type value string.
+            tokens: Total tokens (prompt + completion) used to produce the signal.
+        """
+        token_signal_ratio.labels(signal_type=signal_type).observe(tokens)
+
+    @staticmethod
+    def record_clustering_density(items_per_cluster: int) -> None:
+        """Record the size (item count) of a single HDBSCAN cluster.
+
+        Args:
+            items_per_cluster: Number of content items grouped into the cluster.
+        """
+        clustering_density.observe(items_per_cluster)
+
+    @staticmethod
+    def record_websocket_connection(delta: int) -> None:
+        """Adjust the active WebSocket connection gauge.
+
+        Args:
+            delta: +1 when a client connects, -1 when it disconnects.
+        """
+        websocket_connections_active.inc(delta)
+
+    @staticmethod
+    def record_deep_research_step(signal_type: str) -> None:
+        """Increment the Deep Research step counter for a signal type.
+
+        Args:
+            signal_type: Signal type value string for the research session.
+        """
+        deep_research_steps_total.labels(signal_type=signal_type).inc()
+
+    @staticmethod
+    def record_pii_scrub(platform: str, entity_type: str, count: int = 1) -> None:
+        """Record PII entity instances scrubbed during normalization.
+
+        Args:
+            platform: Source platform of the content being scrubbed.
+            entity_type: PII category (e.g. 'email', 'phone', 'name').
+            count: Number of entity instances removed (default 1).
+        """
+        pii_entities_scrubbed_total.labels(platform=platform, entity_type=entity_type).inc(count)
+
+    @staticmethod
+    def record_sentiment_drift(platform: str, direction: str) -> None:
+        """Record a sentiment drift detection event.
+
+        Args:
+            platform: Source platform of the drifting observation.
+            direction: 'positive' or 'negative' relative to baseline.
+        """
+        sentiment_drift_detected_total.labels(platform=platform, direction=direction).inc()
 
 
 @contextmanager
