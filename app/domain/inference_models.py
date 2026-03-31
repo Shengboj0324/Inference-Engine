@@ -89,6 +89,37 @@ class StrategicPriorities(BaseModel):
     urgency_weight: float = Field(default=1.0, ge=0.5, le=3.0)
     impact_weight: float = Field(default=1.0, ge=0.5, le=3.0)
 
+    # ── Acquisition-level filters (evaluated BEFORE normalization) ────────────
+    content_types: List[str] = Field(
+        default_factory=list,
+        description="Allowed content types e.g. ['posts', 'videos', 'news', 'comments']."
+        " Empty list means all types are accepted.",
+    )
+    platforms_enabled: List[str] = Field(
+        default_factory=list,
+        description="Subset of the 13 supported platform values to monitor."
+        " Empty list means all connected platforms.",
+    )
+    keywords_allowlist: List[str] = Field(
+        default_factory=list,
+        description="Only ingest content containing at least one of these terms"
+        " (case-insensitive substring match). Empty list = no restriction.",
+    )
+    keywords_blocklist: List[str] = Field(
+        default_factory=list,
+        description="Drop content containing any of these terms before normalization."
+        " Takes precedence over allowlist.",
+    )
+    min_engagement_threshold: int = Field(
+        default=0,
+        ge=0,
+        description="Minimum likes/upvotes/shares to qualify for ingestion. 0 = no minimum.",
+    )
+    trending_only: bool = Field(
+        default=False,
+        description="If True, only ingest content flagged as trending by the platform API.",
+    )
+
     @classmethod
     def from_db_json(cls, raw: Optional[Dict[str, Any]]) -> "StrategicPriorities":
         """Construct from the raw ``User.strategic_priorities`` JSON blob.

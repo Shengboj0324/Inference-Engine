@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
-from app.core.models import MediaType, SourcePlatform
+from app.core.models import MediaType, PlatformAuthStatus, SourcePlatform
 from app.core.signal_models import SignalType, ActionType, SignalStatus, ResponseTone
 
 
@@ -75,6 +75,9 @@ class User(Base):
         back_populates="user",
         foreign_keys="ActionableSignalDB.user_id",
         cascade="all, delete-orphan",
+    )
+    platform_credentials: Mapped[List["PlatformCredential"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -642,3 +645,55 @@ class SignalFeedbackDB(Base):
         default=lambda: datetime.now(timezone.utc),
         index=True,
     )
+
+
+class PlatformCredential(Base):
+    """Stores per-user OAuth tokens for each connected platform.
+
+    One row per (user, platform) pair; the encrypted blobs are stored
+    separately in ``CredentialVault`` / ``encrypted_credentials`` and
+    referenced here by ``credential_vault_id``.
+
+    The ``auth_status`` column is the single source of truth surfaced to
+    the WebSocket push layer so the frontend can prompt re-auth when a
+    token has expired or been revoked.
+    """
+
+    __tablename__ = "platform_credentials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "platform", name="uq_platform_credential_user_platform"),
+    )
+
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    platform: Mapped[SourcePlatform] = mapped_column(Enum(SourcePlatform), nullable=False)
+    auth_status: Mapped[PlatformAuthStatus] = mapped_column(
+        Enum(PlatformAuthStatus), nullable=False, default=PlatformAuthStatus.NOT_CONNECTED
+    )
+    # Reference into CredentialVault (encrypted_credentials table)
+    credential_vault_id: Mapped[Optional[UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    # Scope granted by the user (space-separated, stored as-is from the OAuth server)
+    granted_scope: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    # When the access token expires (UTC); None = non-expiring or unknown
+    token_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    last_refreshed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship(back_populates="platform_credentials")
+

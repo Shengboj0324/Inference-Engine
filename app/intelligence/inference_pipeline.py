@@ -23,6 +23,7 @@ import redis.asyncio as aioredis
 from app.domain.raw_models import RawObservation
 from app.domain.normalized_models import NormalizedObservation
 from app.domain.inference_models import SignalInference, UserContext
+from app.core.models import PlatformAuthStatus
 from app.intelligence.normalization import NormalizationEngine
 from app.intelligence.candidate_retrieval import CandidateRetriever
 from app.intelligence.llm_adjudicator import LLMAdjudicator
@@ -301,6 +302,7 @@ class InferencePipeline:
         self,
         user_id: UUID,
         inference: SignalInference,
+        platform_auth_status: Optional[PlatformAuthStatus] = None,
     ) -> None:
         """Publish a non-abstained inference result to the user's Redis channel.
 
@@ -345,6 +347,13 @@ class InferencePipeline:
                 "confidence": round(top.probability, 4),
                 "rationale": (inference.rationale or "")[:300],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                # OAuth status of the source platform — frontend uses this to
+                # prompt re-authentication when a token has expired mid-session.
+                "platform_auth_status": (
+                    platform_auth_status.value
+                    if platform_auth_status is not None
+                    else PlatformAuthStatus.CONNECTED.value
+                ),
             },
         })
         try:

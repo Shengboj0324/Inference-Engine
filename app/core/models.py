@@ -17,6 +17,26 @@ class MediaType(str, Enum):
     MIXED = "mixed"
 
 
+class PlatformAuthStatus(str, Enum):
+    """OAuth connection status for a user-platform credential.
+
+    Surfaced in the WebSocket push payload so the frontend can prompt
+    the user to re-authenticate when a token expires mid-session.
+
+    Values
+    ------
+    CONNECTED      — Valid access token; ingestion can proceed.
+    EXPIRED        — Token TTL has elapsed; refresh is needed.
+    REVOKED        — User revoked app access on the platform side.
+    NOT_CONNECTED  — No OAuth flow has been completed for this platform.
+    """
+
+    CONNECTED = "connected"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+    NOT_CONNECTED = "not_connected"
+
+
 class ContentType(str, Enum):
     """Semantic content type used by platform connectors.
 

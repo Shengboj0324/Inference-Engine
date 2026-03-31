@@ -11,9 +11,10 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.auth import get_current_user
+from app.connectors.registry import OAUTH_SCOPES, PUBLIC_ACCESS_PLATFORMS
 from app.core.credential_vault import CredentialVault
 from app.core.db import get_db
-from app.core.models import SourcePlatform, UserProfile
+from app.core.models import PlatformAuthStatus, SourcePlatform, UserProfile
 from app.oauth.oauth_proxy import OAuthProxyService
 
 
@@ -22,7 +23,7 @@ router = APIRouter(prefix="/platforms", tags=["platforms"])
 
 class PlatformInfo(BaseModel):
     """Platform information."""
-    
+
     platform: SourcePlatform
     name: str
     description: str
@@ -34,7 +35,7 @@ class PlatformInfo(BaseModel):
 
 class ConnectPlatformResponse(BaseModel):
     """Response for platform connection initiation."""
-    
+
     platform: SourcePlatform
     authorization_url: str
     message: str
@@ -42,12 +43,32 @@ class ConnectPlatformResponse(BaseModel):
 
 class PlatformConnectionStatus(BaseModel):
     """Platform connection status."""
-    
+
     platform: SourcePlatform
     is_connected: bool
     credential_id: Optional[str] = None
     connected_at: Optional[str] = None
     last_accessed: Optional[str] = None
+
+
+class ConnectedPlatformDetail(BaseModel):
+    """Detailed per-platform OAuth status returned by /me/connected-platforms.
+
+    Designed to be surfaced in WebSocket push events so the frontend can
+    prompt the user to re-authenticate when ``auth_status`` is EXPIRED
+    or REVOKED.
+    """
+
+    platform: SourcePlatform
+    auth_status: PlatformAuthStatus
+    oauth_required: bool
+    """True for OAuth platforms (Reddit, YouTube, etc.). False for public access."""
+    required_scopes: List[str]
+    """Minimum scopes needed for read access; empty for public-access platforms."""
+    credential_id: Optional[str] = None
+    token_expires_at: Optional[str] = None
+    last_refreshed_at: Optional[str] = None
+    connected_at: Optional[str] = None
 
 
 # Platform metadata
@@ -118,6 +139,20 @@ PLATFORM_INFO = {
         "requires_oauth": False,
         "requires_api_key": False,
     },
+    # The two platforms that were previously absent from this dict.
+    # Both use public RSS feeds and therefore require no OAuth or API key.
+    SourcePlatform.RSS: {
+        "name": "RSS / Atom",
+        "description": "Monitor any RSS or Atom feed (no authentication required)",
+        "requires_oauth": False,
+        "requires_api_key": False,
+    },
+    SourcePlatform.ABC_NEWS_AU: {
+        "name": "ABC News (Australia)",
+        "description": "Monitor ABC Australia RSS feeds (no authentication required)",
+        "requires_oauth": False,
+        "requires_api_key": False,
+    },
 }
 
 
@@ -127,15 +162,15 @@ async def list_platforms(
     db: AsyncSession = Depends(get_db)
 ):
     """List all available platforms and their connection status.
-    
+
     This endpoint shows users which platforms they can connect to.
     """
     vault = CredentialVault(db)
-    
+
     # Get user's connected platforms
     credentials = await vault.list_credentials(current_user.id)
     connected_platforms = {cred["platform"] for cred in credentials}
-    
+
     platforms = []
     for platform, info in PLATFORM_INFO.items():
         platforms.append(PlatformInfo(
@@ -146,7 +181,7 @@ async def list_platforms(
             requires_api_key=info["requires_api_key"],
             is_connected=platform.value in connected_platforms,
         ))
-    
+
     return platforms
 
 
@@ -157,13 +192,13 @@ async def connect_platform(
     current_user: UserProfile = Depends(get_current_user),
 ):
     """Initiate platform connection (Step 1 of OAuth flow).
-    
+
     This is the "Connect [Platform]" button endpoint!
     Users just call this and get a URL to visit.
-    
+
     Args:
         platform: Platform to connect
-        
+
     Returns:
         Authorization URL for user to visit
     """
@@ -192,13 +227,13 @@ async def connect_platform(
         app_credentials=app_credentials,
         base_redirect_uri=f"{settings.api_base_url}/api/v1/platforms/callback"
     )
-    
+
     try:
         auth_url = oauth_service.get_authorization_url(
             user_id=current_user.id,
             platform=platform
         )
-        
+
         return ConnectPlatformResponse(
             platform=platform,
             authorization_url=auth_url,
@@ -217,15 +252,15 @@ async def oauth_callback(
     db: AsyncSession = Depends(get_db)
 ):
     """Handle OAuth callback (Step 2 of OAuth flow).
-    
+
     This endpoint is called automatically by the platform after user authorizes.
     Users don't need to interact with this directly!
-    
+
     Args:
         platform: Platform
         code: Authorization code
         state: State parameter
-        
+
     Returns:
         Success message and redirect to app
     """
@@ -275,7 +310,7 @@ async def oauth_callback(
         app_credentials=app_credentials,
         base_redirect_uri=f"{settings.api_base_url}/api/v1/platforms/callback"
     )
-    
+
     try:
         result = await oauth_service.handle_callback(
             platform=platform,
@@ -283,7 +318,7 @@ async def oauth_callback(
             state=state,
             user_password=user_password
         )
-        
+
         # Redirect to success page
         return {
             "success": True,
@@ -301,17 +336,17 @@ async def get_connection_status(
     db: AsyncSession = Depends(get_db)
 ):
     """Get connection status for all platforms.
-    
+
     Shows which platforms are connected and when they were last used.
     """
     vault = CredentialVault(db)
     credentials = await vault.list_credentials(current_user.id)
-    
+
     # Create status for all platforms
     statuses = []
     for platform in PLATFORM_INFO.keys():
         cred = next((c for c in credentials if c["platform"] == platform.value), None)
-        
+
         statuses.append(PlatformConnectionStatus(
             platform=platform,
             is_connected=cred is not None,
@@ -319,7 +354,7 @@ async def get_connection_status(
             connected_at=cred["created_at"] if cred else None,
             last_accessed=cred["last_accessed"] if cred else None,
         ))
-    
+
     return statuses
 
 
@@ -330,21 +365,100 @@ async def disconnect_platform(
     db: AsyncSession = Depends(get_db)
 ):
     """Disconnect a platform.
-    
+
     Removes stored credentials for the platform.
     """
     vault = CredentialVault(db)
     credentials = await vault.list_credentials(current_user.id, platform=platform.value)
-    
+
     if not credentials:
         raise HTTPException(status_code=404, detail="Platform not connected")
-    
+
     # Delete all credentials for this platform
     for cred in credentials:
         await vault.delete_credential(UUID(cred["id"]))
-    
+
     return {
         "success": True,
         "message": f"{PLATFORM_INFO[platform]['name']} disconnected successfully"
     }
 
+
+
+@router.get("/me/connected-platforms", response_model=List[ConnectedPlatformDetail])
+async def get_connected_platforms(
+    current_user: UserProfile = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the OAuth connection status for every supported platform.
+
+    For each of the 13 platforms this endpoint reports:
+
+    * ``auth_status`` — one of ``CONNECTED``, ``EXPIRED``, ``REVOKED``,
+      ``NOT_CONNECTED`` (the :class:`~app.core.models.PlatformAuthStatus` enum).
+    * ``oauth_required`` — whether the platform uses OAuth or public/API-key access.
+    * ``required_scopes`` — the minimum read-only OAuth scopes required.
+    * Token timestamps and the credential vault ID when connected.
+
+    This payload is also surfaced in WebSocket push events so the frontend
+    can display re-authentication prompts when tokens expire mid-session.
+
+    Implementation note
+    -------------------
+    Auth status and token expiry are sourced from the ``platform_credentials``
+    table (``PlatformCredential`` ORM model), **not** from
+    ``CredentialVault.list_credentials`` which only holds encrypted blobs in
+    ``encrypted_credentials`` and does not expose token TTL information.
+    ``PlatformCredential`` is the canonical, single source of truth for
+    per-user platform auth state.
+    """
+    from sqlalchemy import select
+    from app.core.db_models import PlatformCredential
+
+    # Query the canonical auth-status table for this user
+    stmt = select(PlatformCredential).where(
+        PlatformCredential.user_id == current_user.id
+    )
+    rows = await db.execute(stmt)
+    pc_by_platform: dict[SourcePlatform, PlatformCredential] = {
+        row.platform: row for row in rows.scalars().all()
+    }
+
+    result: List[ConnectedPlatformDetail] = []
+
+    for platform, info in PLATFORM_INFO.items():
+        oauth_required: bool = info["requires_oauth"]
+        required_scopes: List[str] = list(OAUTH_SCOPES.get(platform, []))
+        pc: Optional[PlatformCredential] = pc_by_platform.get(platform)
+
+        if not oauth_required:
+            # Public/RSS/API-key platforms are always reachable without user tokens
+            auth_status = PlatformAuthStatus.CONNECTED
+        elif pc is None:
+            auth_status = PlatformAuthStatus.NOT_CONNECTED
+        else:
+            # PlatformCredential.auth_status is the authoritative field —
+            # it is updated by the token-refresh worker whenever a token is
+            # refreshed, expires, or is revoked.
+            auth_status = pc.auth_status
+
+        result.append(ConnectedPlatformDetail(
+            platform=platform,
+            auth_status=auth_status,
+            oauth_required=oauth_required,
+            required_scopes=required_scopes,
+            credential_id=(
+                str(pc.credential_vault_id) if pc and pc.credential_vault_id else None
+            ),
+            token_expires_at=(
+                pc.token_expires_at.isoformat() if pc and pc.token_expires_at else None
+            ),
+            last_refreshed_at=(
+                pc.last_refreshed_at.isoformat() if pc and pc.last_refreshed_at else None
+            ),
+            connected_at=(
+                pc.created_at.isoformat() if pc else None
+            ),
+        ))
+
+    return result
