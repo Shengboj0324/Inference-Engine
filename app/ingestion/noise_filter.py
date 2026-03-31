@@ -148,6 +148,35 @@ _ENGAGEMENT_KEY_MAP: Dict[str, List[str]] = {
 }
 
 
+def _coerce_to_int(val: Any) -> Optional[int]:
+    """Safely coerce *val* to a non-negative ``int``, or return ``None`` on failure.
+
+    Handles the full range of values connectors may produce:
+
+    * Native ``int`` / ``float`` / ``bool`` — cast directly.
+    * Numeric strings with locale-style commas (e.g. ``"1,234"``).
+    * Numeric strings with surrounding whitespace (e.g. ``" 500 "``).
+
+    Returns ``None`` (instead of raising) for non-numeric strings (``"n/a"``)
+    and for any other value that cannot be meaningfully interpreted as an
+    integer engagement count.  Negative values are clamped to ``0``.
+    """
+    if val is None:
+        return None
+    # bool is a subclass of int in Python — handle explicitly to avoid
+    # treating True/False as meaningful engagement signals.
+    if isinstance(val, bool):
+        return int(val)  # True→1, False→0; still valid (rare but correct)
+    if isinstance(val, (int, float)):
+        return max(0, int(val))
+    # String path — strip whitespace and locale commas before converting.
+    try:
+        cleaned = str(val).replace(",", "").strip()
+        return max(0, int(float(cleaned)))
+    except (ValueError, TypeError):
+        return None
+
+
 def normalize_engagement(
     platform_metadata: Dict[str, Any],
     source_platform: "Any",  # SourcePlatform; avoid circular import
@@ -156,8 +185,8 @@ def normalize_engagement(
 
     The function reads platform-specific engagement metric keys (in priority
     order per :data:`_ENGAGEMENT_KEY_MAP`) and returns the first non-``None``
-    value found, cast to ``int``.  Returns ``0`` when no engagement data is
-    available (e.g. news RSS connectors without an engagement API).
+    value found, coerced to a non-negative ``int`` via :func:`_coerce_to_int`.
+    Returns ``0`` when no valid engagement data is available.
 
     **Side effect:** the result is written back under the ``"engagement_score"``
     key so that the Stage 4 engagement-threshold check and downstream analytics
@@ -169,19 +198,37 @@ def normalize_engagement(
         The ``RawObservation.platform_metadata`` dict (mutated in place).
     source_platform:
         A :class:`~app.core.models.SourcePlatform` enum instance.
+
+    Notes
+    -----
+    Idempotent: if ``"engagement_score"`` is already present and is a valid
+    numeric value, it is returned immediately without re-scanning the key map.
+    If the cached value is itself non-numeric (a misconfigured connector wrote
+    a string like ``"n/a"``), the cache is cleared and the key map is re-scanned
+    so Stage 4 always receives a reliable integer.
     """
-    # Short-circuit: already normalised (e.g. called twice in the same request)
+    # Short-circuit: already normalised (e.g. called twice in the same request).
+    # Guard against a cached non-numeric value left by a misconfigured connector.
     if "engagement_score" in platform_metadata:
-        return int(platform_metadata["engagement_score"])
+        cached = _coerce_to_int(platform_metadata["engagement_score"])
+        if cached is not None:
+            return cached
+        # Cached value is non-numeric; evict it and fall through to re-scan.
+        del platform_metadata["engagement_score"]
 
     platform_value = getattr(source_platform, "value", str(source_platform))
     keys = _ENGAGEMENT_KEY_MAP.get(platform_value, [])
     for key in keys:
         val = platform_metadata.get(key)
-        if val is not None:
-            score = max(0, int(val))
-            platform_metadata["engagement_score"] = score
-            return score
+        if val is None:
+            continue
+        score = _coerce_to_int(val)
+        if score is None:
+            # This key exists but holds a non-numeric value; skip to the next
+            # key in priority order rather than treating it as 0.
+            continue
+        platform_metadata["engagement_score"] = score
+        return score
 
     platform_metadata["engagement_score"] = 0
     return 0
