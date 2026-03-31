@@ -12,6 +12,7 @@ from uuid import UUID
 
 import aiohttp
 
+from app.connectors.auth import ConnectorAuthError, is_token_expired, safe_error_str
 from app.connectors.base import BaseConnector, ConnectorConfig, FetchResult, RateLimitInfo
 from app.core.errors import ConnectorError
 from app.core.models import ContentItem, ContentType, SourcePlatform
@@ -61,7 +62,7 @@ class FacebookConnector(BaseConnector):
                 ) as response:
                     return response.status == 200
         except Exception as e:
-            logger.error(f"Facebook credential validation failed: {e}")
+            logger.error("Facebook credential validation failed: %s", safe_error_str(e))
             return False
 
     async def fetch_content(
@@ -71,9 +72,19 @@ class FacebookConnector(BaseConnector):
         max_items: int = 100,
     ) -> FetchResult:
         """Fetch Facebook posts from user feed and pages."""
+        # ── Pre-call token expiry check ──────────────────────────────────────
+        if is_token_expired(self.config.credentials):
+            raise ConnectorAuthError(
+                "Facebook access token is expired or expires within the safety buffer",
+                platform=SourcePlatform.FACEBOOK.value,
+                user_id=str(self.user_id),
+                http_status=None,
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         items: List[ContentItem] = []
         errors: List[str] = []
-        
+
         try:
             # Fetch from multiple sources
             sources = self.config.settings.get("sources", ["feed"])
@@ -90,9 +101,11 @@ class FacebookConnector(BaseConnector):
             
             return FetchResult(items=items, errors=errors)
         
+        except ConnectorAuthError:
+            raise
         except Exception as e:
-            logger.error(f"Error fetching Facebook content: {e}")
-            errors.append(str(e))
+            logger.error("Error fetching Facebook content: %s", safe_error_str(e))
+            errors.append(safe_error_str(e))
             return FetchResult(items=items, errors=errors)
 
     async def _fetch_user_feed(
@@ -122,9 +135,18 @@ class FacebookConnector(BaseConnector):
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as response:
+                if response.status == 401:
+                    raise ConnectorAuthError(
+                        "Facebook API returned HTTP 401 — access token expired or revoked",
+                        platform=SourcePlatform.FACEBOOK.value,
+                        user_id=str(self.user_id),
+                        http_status=401,
+                    )
                 if response.status != 200:
                     error_text = await response.text()
-                    raise ConnectorError(f"Facebook API error: {response.status} - {error_text}")
+                    raise ConnectorError(
+                        f"Facebook API error: {response.status} - {error_text}"
+                    )
                 
                 data = await response.json()
                 
@@ -161,9 +183,19 @@ class FacebookConnector(BaseConnector):
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as response:
+                if response.status == 401:
+                    raise ConnectorAuthError(
+                        f"Facebook API returned HTTP 401 fetching page {page_id} "
+                        "— access token expired or revoked",
+                        platform=SourcePlatform.FACEBOOK.value,
+                        user_id=str(self.user_id),
+                        http_status=401,
+                    )
                 if response.status != 200:
                     error_text = await response.text()
-                    logger.warning(f"Failed to fetch page {page_id}: {error_text}")
+                    logger.warning("Failed to fetch page %s: %s", page_id, safe_error_str(
+                        Exception(error_text)
+                    ))
                     return items
                 
                 data = await response.json()

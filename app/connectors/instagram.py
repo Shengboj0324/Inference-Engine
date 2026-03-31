@@ -12,6 +12,7 @@ from uuid import UUID
 
 import aiohttp
 
+from app.connectors.auth import ConnectorAuthError, is_token_expired, safe_error_str
 from app.connectors.base import BaseConnector, ConnectorConfig, FetchResult, RateLimitInfo
 from app.core.errors import ConnectorError
 from app.core.models import ContentItem, ContentType, SourcePlatform
@@ -71,7 +72,7 @@ class InstagramConnector(BaseConnector):
                 ) as response:
                     return response.status == 200
         except Exception as e:
-            logger.error(f"Instagram credential validation failed: {e}")
+            logger.error("Instagram credential validation failed: %s", safe_error_str(e))
             return False
 
     async def fetch_content(
@@ -81,9 +82,19 @@ class InstagramConnector(BaseConnector):
         max_items: int = 100,
     ) -> FetchResult:
         """Fetch Instagram media."""
+        # ── Pre-call token expiry check ──────────────────────────────────────
+        if is_token_expired(self.config.credentials):
+            raise ConnectorAuthError(
+                "Instagram access token is expired or expires within the safety buffer",
+                platform=SourcePlatform.INSTAGRAM.value,
+                user_id=str(self.user_id),
+                http_status=None,
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         items: List[ContentItem] = []
         errors: List[str] = []
-        
+
         try:
             # Fetch user media
             media_items = await self._fetch_user_media(since, cursor, max_items)
@@ -98,9 +109,11 @@ class InstagramConnector(BaseConnector):
             
             return FetchResult(items=items, errors=errors)
         
+        except ConnectorAuthError:
+            raise
         except Exception as e:
-            logger.error(f"Error fetching Instagram content: {e}")
-            errors.append(str(e))
+            logger.error("Error fetching Instagram content: %s", safe_error_str(e))
+            errors.append(safe_error_str(e))
             return FetchResult(items=items, errors=errors)
 
     async def _fetch_user_media(
@@ -130,9 +143,18 @@ class InstagramConnector(BaseConnector):
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as response:
+                if response.status == 401:
+                    raise ConnectorAuthError(
+                        "Instagram API returned HTTP 401 — access token expired or revoked",
+                        platform=SourcePlatform.INSTAGRAM.value,
+                        user_id=str(self.user_id),
+                        http_status=401,
+                    )
                 if response.status != 200:
                     error_text = await response.text()
-                    raise ConnectorError(f"Instagram API error: {response.status} - {error_text}")
+                    raise ConnectorError(
+                        f"Instagram API error: {response.status} - {error_text}"
+                    )
                 
                 data = await response.json()
                 

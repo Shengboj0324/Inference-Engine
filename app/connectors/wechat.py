@@ -14,6 +14,7 @@ from uuid import UUID
 
 import aiohttp
 
+from app.connectors.auth import ConnectorAuthError, is_token_expired, safe_error_str
 from app.connectors.base import BaseConnector, ConnectorConfig, FetchResult
 from app.core.errors import ConnectorError
 from app.core.models import ContentItem, ContentType, SourcePlatform
@@ -70,7 +71,7 @@ class WeChatConnector(BaseConnector):
                     data = await response.json()
                     return data.get("errcode", -1) == 0
         except Exception as e:
-            logger.error(f"WeChat credential validation failed: {e}")
+            logger.error("WeChat credential validation failed: %s", safe_error_str(e))
             return False
 
     async def _get_access_token(self) -> str:
@@ -99,12 +100,31 @@ class WeChatConnector(BaseConnector):
         cursor: Optional[str] = None,
         max_items: int = 100,
     ) -> FetchResult:
-        """Fetch WeChat articles."""
+        """Fetch WeChat articles.
+
+        Credential retrieval is single-fetch: the access_token is resolved
+        exactly once at the start of fetch_content() — either from the
+        credential dict (set at construction time) or via a single call to
+        _get_access_token() when the stored token is absent or expired.  This
+        eliminates the previous double-fetch pattern where validate_credentials()
+        and fetch_content() each independently called _get_access_token().
+        """
+        # ── Pre-call token expiry / single-fetch credential resolution ───────
+        # ``is_token_expired`` returns False when token_expires_at is absent,
+        # so this only fires when expiry data was injected via credentials dict.
+        if is_token_expired(self.config.credentials):
+            raise ConnectorAuthError(
+                "WeChat access token is expired or expires within the safety buffer",
+                platform=SourcePlatform.WECHAT.value,
+                user_id=str(self.user_id),
+                http_status=None,
+            )
+
         items: List[ContentItem] = []
         errors: List[str] = []
-        
+
         try:
-            # Ensure we have a valid access token
+            # Ensure we have a valid access token (single resolution per call)
             if not self.access_token:
                 await self._get_access_token()
             
@@ -146,9 +166,11 @@ class WeChatConnector(BaseConnector):
                         errors=errors,
                     )
         
+        except ConnectorAuthError:
+            raise
         except Exception as e:
-            logger.error(f"Error fetching WeChat content: {e}")
-            errors.append(str(e))
+            logger.error("Error fetching WeChat content: %s", safe_error_str(e))
+            errors.append(safe_error_str(e))
             return FetchResult(items=items, errors=errors)
 
     def _parse_article(self, news: Dict[str, Any], update_time: int) -> ContentItem:

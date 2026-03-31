@@ -119,6 +119,18 @@ class StrategicPriorities(BaseModel):
         default=False,
         description="If True, only ingest content flagged as trending by the platform API.",
     )
+    max_downstream_chars: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Per-batch downstream character budget (sum of raw_text lengths) passed "
+            "to NormalizationEngine / LLM.  When set, AcquisitionNoiseFilter.filter_batch() "
+            "and ConnectorRegistry.apply_acquisition_filter() truncate the accepted list "
+            "once the cumulative character count exceeds this value, emitting a WARNING. "
+            "None (default) = use the system-level default of 500 000 characters. "
+            "Set explicitly to 0 to disable budget enforcement entirely."
+        ),
+    )
 
     @classmethod
     def from_db_json(cls, raw: Optional[Dict[str, Any]]) -> "StrategicPriorities":

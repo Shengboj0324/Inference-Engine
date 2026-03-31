@@ -409,16 +409,83 @@ class AcquisitionNoiseFilter:
         self,
         observations: List[RawObservation],
         priorities: Optional[StrategicPriorities] = None,
+        max_downstream_chars: int = 500_000,
     ) -> Tuple[List[RawObservation], int]:
-        """Filter a batch; returns ``(accepted, noise_filtered_count)``."""
+        """Filter a batch; returns ``(accepted, noise_filtered_count)``.
+
+        Parameters
+        ----------
+        observations:
+            Raw observations to evaluate through all 8 stages.
+        priorities:
+            User's ``StrategicPriorities``.  ``None`` applies system defaults.
+        max_downstream_chars:
+            Hard ceiling on the total number of characters (sum of
+            ``raw_text`` lengths) in the accepted list that will be forwarded
+            to ``NormalizationEngine`` / the LLM.  Observations are accepted
+            in order until the cumulative character count would exceed this
+            limit; subsequent observations are silently dropped from the
+            accepted list and a WARNING is emitted.
+
+            When ``priorities.max_downstream_chars`` is set it takes
+            precedence over this parameter, allowing per-user overrides.
+            Pass ``0`` to disable budget enforcement entirely.
+
+        Returns
+        -------
+        Tuple[List[RawObservation], int]
+            ``(accepted_observations, noise_filter_drop_count)``
+            The drop count includes *only* observations rejected by the 8
+            filter stages — not observations removed by the character budget
+            (those are reported via WARNING log).
+        """
+        sp = priorities or StrategicPriorities()
+
+        # Per-user budget takes precedence; fall back to the call-site param.
+        effective_budget: int = (
+            sp.max_downstream_chars
+            if sp.max_downstream_chars is not None
+            else max_downstream_chars
+        )
+
         accepted: List[RawObservation] = []
         dropped = 0
         for obs in observations:
-            ok, _ = self.filter(obs, priorities)
+            ok, _ = self.filter(obs, sp)
             if ok:
                 accepted.append(obs)
             else:
                 dropped += 1
+
+        # ── Downstream character-budget enforcement ───────────────────────────
+        # Applied *after* noise filtering so the 8-stage audit trail is
+        # complete and all dedup state is registered for every accepted obs.
+        if effective_budget > 0 and accepted:
+            budget_accepted: List[RawObservation] = []
+            total_chars = 0
+            truncated = 0
+            for obs in accepted:
+                obs_chars = len(obs.raw_text or obs.title or "")
+                if total_chars + obs_chars > effective_budget:
+                    truncated += 1
+                else:
+                    total_chars += obs_chars
+                    budget_accepted.append(obs)
+            if truncated:
+                logger.warning(
+                    "filter_batch: downstream char budget (%d) reached — "
+                    "truncated %d of %d accepted observations "
+                    "(total chars in window: %d).  "
+                    "Raise StrategicPriorities.max_downstream_chars or "
+                    "increase the max_downstream_chars parameter to ingest more.",
+                    effective_budget,
+                    truncated,
+                    len(accepted),
+                    total_chars,
+                )
+            accepted = budget_accepted
+        # ─────────────────────────────────────────────────────────────────────
+
         return accepted, dropped
 
 

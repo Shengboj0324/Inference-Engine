@@ -213,6 +213,7 @@ class ConnectorRegistry:
         priorities: Optional[StrategicPriorities],
         user_id: UUID,
         noise_filter: Optional[AcquisitionNoiseFilter] = None,
+        max_downstream_chars: int = 500_000,
     ) -> "FetchResult":
         """Run ``AcquisitionNoiseFilter`` against every item in *fetch_result*.
 
@@ -220,15 +221,23 @@ class ConnectorRegistry:
         before the items enter ``NormalizationEngine``.  A log line is emitted
         for each batch summarising how many items were accepted vs. dropped.
 
+        After the 8-stage noise filter the accepted list is further trimmed by
+        the downstream character budget so that the cumulative ``raw_text``
+        length of all accepted items never exceeds *max_downstream_chars*.
+        When ``priorities.max_downstream_chars`` is set it overrides the
+        call-site default.  Pass ``max_downstream_chars=0`` to disable budget
+        enforcement.
+
         Args:
             fetch_result: Raw fetch result from a connector.
             priorities: User's ``StrategicPriorities``; ``None`` = no filtering.
             user_id: Used for per-user dedup state.
             noise_filter: Optional pre-built filter instance; defaults to a new
                           ``AcquisitionNoiseFilter()`` with default settings.
+            max_downstream_chars: System-level character budget ceiling.
 
         Returns:
-            A mutated ``FetchResult`` with only accepted items.
+            A mutated ``FetchResult`` with only accepted, budget-fitting items.
         """
         from app.domain.raw_models import RawObservation
         from app.core.models import MediaType
@@ -279,6 +288,41 @@ class ConnectorRegistry:
                 accepted_items.append(item)
             else:
                 dropped += 1
+
+        # ── Downstream character-budget enforcement ───────────────────────────
+        # Mirrors the identical logic in AcquisitionNoiseFilter.filter_batch().
+        # Evaluated here because apply_acquisition_filter operates on
+        # ContentItem objects (the connector's native output) whereas
+        # filter_batch works on RawObservation shells.  Both use the same
+        # effective_budget resolution: per-user SP value → call-site default.
+        sp = priorities or StrategicPriorities()
+        effective_budget: int = (
+            sp.max_downstream_chars
+            if sp.max_downstream_chars is not None
+            else max_downstream_chars
+        )
+        if effective_budget > 0 and accepted_items:
+            budget_items = []
+            total_chars = 0
+            truncated = 0
+            for item in accepted_items:
+                item_chars = len(item.raw_text or item.title or "")
+                if total_chars + item_chars > effective_budget:
+                    truncated += 1
+                else:
+                    total_chars += item_chars
+                    budget_items.append(item)
+            if truncated:
+                logger.warning(
+                    "AcquisitionFilter: downstream char budget (%d) reached — "
+                    "truncated %d of %d accepted items (chars used: %d).",
+                    effective_budget,
+                    truncated,
+                    len(accepted_items),
+                    total_chars,
+                )
+            accepted_items = budget_items
+        # ─────────────────────────────────────────────────────────────────────
 
         logger.info(
             "AcquisitionFilter: %d/%d items passed (dropped %d)",

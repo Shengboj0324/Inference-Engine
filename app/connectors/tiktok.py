@@ -12,6 +12,7 @@ from uuid import UUID
 
 import aiohttp
 
+from app.connectors.auth import ConnectorAuthError, is_token_expired, safe_error_str
 from app.connectors.base import BaseConnector, ConnectorConfig, FetchResult, RateLimitInfo
 from app.core.errors import ConnectorError
 from app.core.models import ContentItem, ContentType, SourcePlatform
@@ -77,7 +78,7 @@ class TikTokConnector(BaseConnector):
                 ) as response:
                     return response.status == 200
         except Exception as e:
-            logger.error(f"TikTok credential validation failed: {e}")
+            logger.error("TikTok credential validation failed: %s", safe_error_str(e))
             return False
 
     async def fetch_content(
@@ -87,9 +88,19 @@ class TikTokConnector(BaseConnector):
         max_items: int = 100,
     ) -> FetchResult:
         """Fetch TikTok videos based on configured search criteria."""
+        # ── Pre-call token expiry check ──────────────────────────────────────
+        if is_token_expired(self.config.credentials):
+            raise ConnectorAuthError(
+                "TikTok access token is expired or expires within the safety buffer",
+                platform=SourcePlatform.TIKTOK.value,
+                user_id=str(self.user_id),
+                http_status=None,
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         items: List[ContentItem] = []
         errors: List[str] = []
-        
+
         try:
             # Get search queries from settings
             search_queries = self.config.settings.get("search_queries", [])
@@ -145,9 +156,18 @@ class TikTokConnector(BaseConnector):
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as response:
+                    if response.status == 401:
+                        raise ConnectorAuthError(
+                            "TikTok API returned HTTP 401 — access token expired or revoked",
+                            platform=SourcePlatform.TIKTOK.value,
+                            user_id=str(self.user_id),
+                            http_status=401,
+                        )
                     if response.status != 200:
                         error_text = await response.text()
-                        raise ConnectorError(f"TikTok API error: {response.status} - {error_text}")
+                        raise ConnectorError(
+                            f"TikTok API error: {response.status} - {error_text}"
+                        )
                     
                     data = await response.json()
                     
@@ -165,9 +185,11 @@ class TikTokConnector(BaseConnector):
                         errors=errors,
                     )
         
+        except ConnectorAuthError:
+            raise  # Propagate structured auth errors without modification
         except Exception as e:
-            logger.error(f"Error fetching TikTok content: {e}")
-            errors.append(str(e))
+            logger.error("Error fetching TikTok content: %s", safe_error_str(e))
+            errors.append(safe_error_str(e))
             return FetchResult(items=items, errors=errors)
 
     def _parse_video(self, video: Dict[str, Any]) -> ContentItem:
