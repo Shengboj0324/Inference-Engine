@@ -369,6 +369,16 @@ class ConfidenceCalibrator:
     probability.  ``update()`` performs a single gradient-descent step on the
     binary cross-entropy loss to adjust ``T`` given one labelled example.
 
+    **Learning-rate decay.** The effective step size decays as
+    ``lr_eff = lr / (1 + lr_decay * step_count)`` so the scalars converge
+    smoothly over time rather than oscillating around the optimum.  Set
+    ``lr_decay=0.0`` (default) to disable decay and restore constant-lr
+    behaviour.
+
+    **Atomic saves.** ``_save()`` writes to a sibling ``.tmp`` file and
+    then renames it over the target path, preventing partial-write corruption
+    on crash.
+
     Scalars are persisted to ``state_path`` (a JSON file) after every
     ``update()`` call so they survive restarts.
 
@@ -376,8 +386,11 @@ class ConfidenceCalibrator:
         state_path: Path to the JSON file that stores per-``SignalType``
             temperature scalars.  Defaults to
             ``training/calibration_state.json``.
-        learning_rate: Step size for the gradient update.  Defaults to
+        learning_rate: Base step size for the gradient update.  Defaults to
             ``0.01``.
+        lr_decay: Inverse-time decay coefficient.  The effective LR at step
+            ``n`` is ``lr / (1 + lr_decay * n)``.  Defaults to ``0.0``
+            (no decay).
     """
 
     #: Maximum α weight for the per-user calibration curve in the federated blend.
@@ -389,22 +402,30 @@ class ConfidenceCalibrator:
         self,
         state_path: Optional[Path] = None,
         learning_rate: float = _LR,
+        lr_decay: float = 0.0,
     ) -> None:
         """Initialise and load persisted scalars.
 
         Args:
             state_path: Path to ``calibration_state.json``.
-            learning_rate: Gradient-descent step size for ``update()``
-                and ``update_user()``.
+            learning_rate: Base gradient-descent step size.
+            lr_decay: Inverse-time decay coefficient (≥ 0.0).
         """
+        if lr_decay < 0.0:
+            raise ValueError(f"lr_decay must be ≥ 0.0; got {lr_decay!r}")
         self._state_path: Path = state_path or _DEFAULT_STATE_PATH
         self._lr: float = learning_rate
+        self._lr_decay: float = lr_decay
         # Global per-SignalType temperature scalars (shared across all users).
         self._scalars: Dict[str, float] = {}
         # Per-user temperature scalars: user_id → {signal_type.value → T}
         self._user_scalars: Dict[str, Dict[str, float]] = {}
         # Confirmed outcome counts per user (used to compute α blend weight).
         self._user_outcome_counts: Dict[str, int] = {}
+        # Step counts for LR decay: {signal_type.value → n_global_steps}
+        self._global_step_counts: Dict[str, int] = {}
+        # Per-user step counts: user_id → {signal_type.value → n_steps}
+        self._user_step_counts: Dict[str, Dict[str, int]] = {}
         self._load()
 
     # ------------------------------------------------------------------
@@ -496,22 +517,29 @@ class ConfidenceCalibrator:
                 raise ValueError(
                     f"lr must be positive; got {lr!r}"
                 )
-        effective_lr: float = lr if lr is not None else self._lr
+        base_lr: float = lr if lr is not None else self._lr
+        stv = signal_type.value
+        # Apply inverse-time decay to the effective learning rate
+        step_n = self._global_step_counts.get(stv, 0)
+        effective_lr = base_lr / (1.0 + self._lr_decay * step_n)
+        # Numerically stable logit: clamp p away from 0/1 before log()
         p: float = max(_PROB_EPS, min(1.0 - _PROB_EPS, predicted_prob))
         logit: float = math.log(p / (1.0 - p))
-        t: float = max(_T_MIN, min(_T_MAX, self._scalars.get(signal_type.value, 1.0)))
-        p_cal: float = 1.0 / (1.0 + math.exp(-logit / t))
+        t: float = max(_T_MIN, min(_T_MAX, self._scalars.get(stv, 1.0)))
+        try:
+            p_cal: float = 1.0 / (1.0 + math.exp(-logit / t))
+        except OverflowError:
+            p_cal = 0.0
         y: float = 1.0 if true_label else 0.0
         gradient: float = (p_cal - y) * (-logit / (t * t))
         new_t: float = max(_T_MIN, min(_T_MAX, t - effective_lr * gradient))
-        self._scalars[signal_type.value] = new_t
+        self._scalars[stv] = new_t
+        self._global_step_counts[stv] = step_n + 1
         self._save()
         logger.debug(
-            "ConfidenceCalibrator.update: signal_type=%s T: %.4f → %.4f (lr=%.5f)",
-            signal_type.value,
-            t,
-            new_t,
-            effective_lr,
+            "ConfidenceCalibrator.update: signal_type=%s T: %.4f → %.4f "
+            "(lr=%.5f step=%d)",
+            stv, t, new_t, effective_lr, step_n + 1,
         )
 
     # ------------------------------------------------------------------
@@ -569,19 +597,29 @@ class ConfidenceCalibrator:
             raise ValueError(
                 f"predicted_prob must be in [0.0, 1.0]; got {predicted_prob!r}"
             )
-        effective_lr: float = lr if (lr is not None and lr > 0.0) else self._lr
+        base_lr: float = lr if (lr is not None and lr > 0.0) else self._lr
+        stv = signal_type.value
+        # Apply inverse-time LR decay per (user, signal_type) independently
+        user_steps = self._user_step_counts.setdefault(user_id, {})
+        step_n = user_steps.get(stv, 0)
+        effective_lr = base_lr / (1.0 + self._lr_decay * step_n)
+        # Numerically stable logit
         p: float = max(_PROB_EPS, min(1.0 - _PROB_EPS, predicted_prob))
         logit: float = math.log(p / (1.0 - p))
 
         # Retrieve or initialise the per-user scalar for this signal type
         user_temps = self._user_scalars.setdefault(user_id, {})
-        t_u: float = max(_T_MIN, min(_T_MAX, user_temps.get(signal_type.value, 1.0)))
+        t_u: float = max(_T_MIN, min(_T_MAX, user_temps.get(stv, 1.0)))
 
-        p_cal: float = 1.0 / (1.0 + math.exp(-logit / t_u))
+        try:
+            p_cal: float = 1.0 / (1.0 + math.exp(-logit / t_u))
+        except OverflowError:
+            p_cal = 0.0
         y: float = 1.0 if true_label else 0.0
         gradient: float = (p_cal - y) * (-logit / (t_u * t_u))
         new_t_u: float = max(_T_MIN, min(_T_MAX, t_u - effective_lr * gradient))
-        user_temps[signal_type.value] = new_t_u
+        user_temps[stv] = new_t_u
+        user_steps[stv] = step_n + 1
 
         # Track confirmed outcomes (any label) for α convergence
         self._user_outcome_counts[user_id] = (
@@ -589,8 +627,9 @@ class ConfidenceCalibrator:
         )
         self._save()
         logger.debug(
-            "ConfidenceCalibrator.update_user: user=%s signal_type=%s T_u: %.4f → %.4f",
-            user_id, signal_type.value, t_u, new_t_u,
+            "ConfidenceCalibrator.update_user: user=%s signal_type=%s "
+            "T_u: %.4f → %.4f (lr=%.5f step=%d)",
+            user_id, stv, t_u, new_t_u, effective_lr, step_n + 1,
         )
 
     def calibrate_federated(
@@ -648,6 +687,65 @@ class ConfidenceCalibrator:
         p_final = alpha * p_user + (1.0 - alpha) * p_global
         return float(np.clip(p_final, 0.0, 1.0))
 
+    def recalibrate_global(
+        self,
+        signal_type: SignalType,
+        outcomes: List[Tuple[float, bool]],
+        n_passes: int = 10,
+    ) -> None:
+        """Re-fit the global temperature scalar from a batch of labelled outcomes.
+
+        Runs ``n_passes`` full sweeps through ``outcomes``, applying a gradient
+        step with the current (potentially decayed) effective LR on each example.
+        This can be called periodically (e.g. nightly) to incorporate a batch
+        of recently accumulated outcomes without waiting for online updates.
+
+        Uses numerically stable logit computation and OverflowError guards
+        identical to ``update()``.
+
+        Args:
+            signal_type: Signal type whose global temperature to re-fit.
+            outcomes: List of ``(predicted_prob, true_label)`` pairs.
+                Each ``predicted_prob`` must be a finite float in ``[0, 1]``.
+            n_passes: Number of full passes through ``outcomes``.  Defaults
+                to ``10``.
+
+        Raises:
+            ValueError: If any ``predicted_prob`` is not finite or out of range.
+        """
+        stv = signal_type.value
+        for _pass in range(n_passes):
+            for predicted_prob, true_label in outcomes:
+                if not math.isfinite(predicted_prob):
+                    raise ValueError(
+                        f"recalibrate_global: non-finite predicted_prob={predicted_prob!r}"
+                    )
+                if not (0.0 <= predicted_prob <= 1.0):
+                    raise ValueError(
+                        f"recalibrate_global: predicted_prob={predicted_prob!r} not in [0, 1]"
+                    )
+                step_n = self._global_step_counts.get(stv, 0)
+                effective_lr = self._lr / (1.0 + self._lr_decay * step_n)
+                p = max(_PROB_EPS, min(1.0 - _PROB_EPS, predicted_prob))
+                logit = math.log(p / (1.0 - p))
+                t = max(_T_MIN, min(_T_MAX, self._scalars.get(stv, 1.0)))
+                try:
+                    p_cal = 1.0 / (1.0 + math.exp(-logit / t))
+                except OverflowError:
+                    p_cal = 0.0
+                y = 1.0 if true_label else 0.0
+                gradient = (p_cal - y) * (-logit / (t * t))
+                new_t = max(_T_MIN, min(_T_MAX, t - effective_lr * gradient))
+                self._scalars[stv] = new_t
+                self._global_step_counts[stv] = step_n + 1
+
+        self._save()
+        logger.info(
+            "ConfidenceCalibrator.recalibrate_global: signal_type=%s "
+            "passes=%d examples=%d final_T=%.4f",
+            stv, n_passes, len(outcomes), self._scalars.get(stv, 1.0),
+        )
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -674,6 +772,16 @@ class ConfidenceCalibrator:
                 self._user_outcome_counts = {
                     uid: int(n) for uid, n in raw_counts.items()
                 }
+                # Step counts for LR decay (added in v2.1 — absent in older files)
+                self._global_step_counts = {
+                    k: int(v)
+                    for k, v in data.get("global_step_counts", {}).items()
+                }
+                raw_user_steps = data.get("user_step_counts", {})
+                self._user_step_counts = {
+                    uid: {st: int(n) for st, n in steps.items()}
+                    for uid, steps in raw_user_steps.items()
+                }
                 logger.info(
                     "ConfidenceCalibrator: loaded %d global + %d user scalars from %s",
                     len(self._scalars),
@@ -690,20 +798,35 @@ class ConfidenceCalibrator:
             self._scalars = {}
             self._user_scalars = {}
             self._user_outcome_counts = {}
+            self._global_step_counts = {}
+            self._user_step_counts = {}
 
     def _save(self) -> None:
-        """Persist global and per-user scalars to ``state_path``."""
+        """Persist global and per-user scalars to ``state_path``.
+
+        Uses an atomic write-then-rename strategy: the payload is first written
+        to a sibling ``<path>.tmp`` file, then ``os.replace()`` is used to
+        rename it over the target path.  This prevents partial-write corruption
+        if the process is killed mid-write.
+        """
+        import os
+
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             payload: Dict = {
-                "version": "2.0",
+                "version": "2.1",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "scalars": self._scalars,
                 "user_scalars": self._user_scalars,
                 "user_outcome_counts": self._user_outcome_counts,
+                "global_step_counts": self._global_step_counts,
+                "user_step_counts": self._user_step_counts,
             }
-            with self._state_path.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
+            tmp_path = self._state_path.with_suffix(
+                self._state_path.suffix + ".tmp"
+            )
+            tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp_path, self._state_path)
         except OSError as exc:
             logger.error("ConfidenceCalibrator: failed to save state: %s", exc)
 

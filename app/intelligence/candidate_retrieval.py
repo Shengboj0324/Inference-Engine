@@ -9,11 +9,13 @@ This module implements Stage B of the inference pipeline:
 Outputs top-k signal candidates with weak scores to guide LLM adjudication.
 """
 
+import heapq
 import json
 import logging
 import math
 import re
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple
@@ -825,18 +827,20 @@ class ExemplarBank:
 
     Exemplars are sourced from non-abstained inferences with calibrated
     probability ≥ 0.85 across **all** users.  ``CandidateRetriever`` can query
-    the bank as an additional retrieval source alongside the per-user RAG pool,
-    making the system collectively smarter as the user base grows.
+    the bank as an additional retrieval source alongside the per-user RAG pool
+    via :meth:`search_similar`.
 
     Design constraints
     ------------------
-    * Capped at ``_MAX_PER_SIGNAL_TYPE`` exemplars per ``SignalType`` (default
+    * Capped at ``max_per_signal_type`` exemplars per ``SignalType`` (default
       10 000).  When the cap is reached, the exemplar with the **lowest**
-      confidence is evicted to make room.
+      confidence is evicted using a min-heap — **O(log n)** per insert rather
+      than O(n) sort.
     * All public methods are thread-safe via a single ``threading.Lock``.
-    * ``add_nonblocking()`` dispatches the add to
-      ``asyncio.get_event_loop().run_in_executor`` so async callers are not
-      blocked by the eviction sort.
+    * ``add_nonblocking()`` dispatches ``add()`` to
+      ``asyncio.get_running_loop().run_in_executor`` so async callers are not
+      blocked.
+    * State can be serialised / restored via :meth:`persist` / :meth:`load`.
 
     Args:
         max_per_signal_type: Per-``SignalType`` exemplar cap.
@@ -852,8 +856,12 @@ class ExemplarBank:
                 eviction.
         """
         self._max: int = max_per_signal_type
-        # signal_type.value → list of (confidence, ExemplarSignal) pairs
-        self._bank: Dict[str, List[Tuple[float, ExemplarSignal]]] = {}
+        # signal_type.value → min-heap of (confidence, seq_id, ExemplarSignal)
+        # The seq_id breaks ties deterministically (monotonically increasing
+        # counter) so that the heap comparison never falls through to the
+        # non-comparable ExemplarSignal object.
+        self._bank: Dict[str, List[Tuple[float, int, ExemplarSignal]]] = {}
+        self._seq: int = 0  # global monotonic insertion counter
         self._lock: threading.Lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -862,6 +870,8 @@ class ExemplarBank:
 
     def add(self, exemplar: ExemplarSignal, confidence: float) -> None:
         """Add ``exemplar`` to the bank; evict lowest-confidence on overflow.
+
+        Uses a min-heap so the eviction is **O(log n)** rather than O(n).
 
         This method is safe to call from multiple threads concurrently.
 
@@ -875,13 +885,12 @@ class ExemplarBank:
         with self._lock:
             if key not in self._bank:
                 self._bank[key] = []
-            bucket = self._bank[key]
-            bucket.append((confidence, exemplar))
-            if len(bucket) > self._max:
-                # Evict the entry with the lowest confidence in O(n).
-                # Sorting only happens on overflow (amortised cost is low).
-                bucket.sort(key=lambda t: t[0])
-                bucket.pop(0)
+            heap = self._bank[key]
+            seq = self._seq
+            self._seq += 1
+            heapq.heappush(heap, (confidence, seq, exemplar))
+            if len(heap) > self._max:
+                heapq.heappop(heap)  # O(log n) — removes minimum-confidence entry
 
     async def add_nonblocking(
         self, exemplar: ExemplarSignal, confidence: float
@@ -889,11 +898,7 @@ class ExemplarBank:
         """Async wrapper around ``add()`` — does not block the event loop.
 
         Dispatches ``add()`` to the default thread-pool executor so the await
-        returns quickly even if eviction sorting is required.
-
-        Uses ``asyncio.get_running_loop()`` (Python 3.7+) rather than the
-        deprecated ``asyncio.get_event_loop()`` to guarantee we operate on the
-        loop that is actually running this coroutine.
+        returns quickly.  Uses ``asyncio.get_running_loop()`` (Python 3.7+).
 
         Args:
             exemplar: Exemplar signal to store.
@@ -919,9 +924,76 @@ class ExemplarBank:
         """
         key = signal_type.value
         with self._lock:
-            bucket = list(self._bank.get(key, []))
-        bucket.sort(key=lambda t: t[0], reverse=True)
-        return [ex for _, ex in bucket[:top_k]]
+            heap_copy = list(self._bank.get(key, []))
+        # Sort copy descending by confidence (index 0 in the tuple)
+        heap_copy.sort(key=lambda t: t[0], reverse=True)
+        return [ex for _, _seq, ex in heap_copy[:top_k]]
+
+    def search_similar(
+        self,
+        query_embedding: List[float],
+        top_k: int = 10,
+        signal_type: Optional[SignalType] = None,
+    ) -> List[Tuple[float, "ExemplarSignal"]]:
+        """Return the ``top_k`` exemplars most similar to ``query_embedding``.
+
+        Uses cosine similarity over the stored ``ExemplarSignal.embedding``
+        vectors.  If ``signal_type`` is specified, only exemplars of that type
+        are searched.
+
+        This allows ``CandidateRetriever`` to use the bank as an additional
+        retrieval source alongside the per-user RAG pool.
+
+        Args:
+            query_embedding: Query vector to compare against stored embeddings.
+                Must be non-empty and have at least one non-zero component.
+            top_k: Maximum number of exemplars to return.
+            signal_type: Optional filter; when provided only exemplars of this
+                type are searched.
+
+        Returns:
+            List of ``(cosine_similarity, ExemplarSignal)`` pairs, sorted by
+            similarity descending.  Empty list if the bank is empty or all
+            embeddings have zero norm.
+        """
+        _t0 = time.perf_counter()
+        q = np.array(query_embedding, dtype=np.float32)
+        q_norm = float(np.linalg.norm(q))
+        if q_norm < 1e-9:
+            return []
+
+        with self._lock:
+            # Gather all relevant (confidence, seq, exemplar) triples
+            if signal_type is not None:
+                items: List[Tuple[float, int, ExemplarSignal]] = list(
+                    self._bank.get(signal_type.value, [])
+                )
+            else:
+                items = [
+                    entry
+                    for bucket in self._bank.values()
+                    for entry in bucket
+                ]
+
+        scored: List[Tuple[float, ExemplarSignal]] = []
+        for _conf, _seq, exemplar in items:
+            emb = exemplar.embedding
+            if emb is None or len(emb) == 0:
+                continue
+            v = np.array(emb, dtype=np.float32)
+            v_norm = float(np.linalg.norm(v))
+            if v_norm < 1e-9:
+                continue
+            sim = float(np.dot(q, v) / (q_norm * v_norm))
+            scored.append((sim, exemplar))
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        results = scored[:top_k]
+        logger.debug(
+            "ExemplarBank.search_similar: top_k=%d results=%d latency_ms=%.1f",
+            top_k, len(results), (time.perf_counter() - _t0) * 1000,
+        )
+        return results
 
     def total_size(self) -> int:
         """Return the total number of exemplars across all signal types."""
@@ -937,11 +1009,114 @@ class ExemplarBank:
         """Remove all exemplars from the bank (primarily used in tests)."""
         with self._lock:
             self._bank.clear()
+            self._seq = 0
 
     def get_signal_types_represented(self) -> Set[str]:
         """Return the set of ``SignalType.value`` strings present in the bank."""
         with self._lock:
             return set(self._bank.keys())
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def persist(self, path: Path) -> None:
+        """Serialise the bank to ``path`` as a JSON file (atomic write).
+
+        Each exemplar is stored with its confidence, signal type, and embedding
+        so the bank can be fully restored via :meth:`load`.
+
+        The write is atomic: payload is written to a sibling ``.tmp`` file and
+        then renamed over ``path``.
+
+        Args:
+            path: Destination file path (created / overwritten).
+        """
+        path = Path(path)
+        _t0 = time.perf_counter()
+        with self._lock:
+            serialised: Dict[str, List[Dict]] = {}
+            for key, heap in self._bank.items():
+                serialised[key] = [
+                    {
+                        "confidence": conf,
+                        "exemplar": {
+                            "signal_type": ex.signal_type.value,
+                            "text": ex.text,
+                            "embedding": ex.embedding or [],
+                            "entities": ex.entities or [],
+                            "platform": ex.platform or "",
+                        },
+                    }
+                    for conf, _seq, ex in heap
+                ]
+            payload = {"version": "1.0", "max_per_signal_type": self._max, "bank": serialised}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+        logger.info(
+            "ExemplarBank.persist: wrote %d exemplars to %s in %.1f ms",
+            sum(len(v) for v in serialised.values()),
+            path, (time.perf_counter() - _t0) * 1000,
+        )
+
+    def load(self, path: Path) -> None:
+        """Restore bank state from a file written by :meth:`persist`.
+
+        Existing bank contents are **replaced** (not merged) with the loaded
+        data.  The min-heap invariant is re-established via ``heapq.heapify``.
+
+        Args:
+            path: Source file path.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            ValueError: If the file is not valid JSON or has an unsupported
+                version.
+        """
+        from app.domain.inference_models import SignalType as _ST
+
+        path = Path(path)
+        _t0 = time.perf_counter()
+        raw = path.read_text(encoding="utf-8")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"ExemplarBank.load: invalid JSON in {path}: {exc}") from exc
+
+        new_bank: Dict[str, List[Tuple[float, int, ExemplarSignal]]] = {}
+        seq = 0
+        for key, entries in payload.get("bank", {}).items():
+            heap: List[Tuple[float, int, ExemplarSignal]] = []
+            for item in entries:
+                conf = float(item["confidence"])
+                ed = item["exemplar"]
+                try:
+                    st = _ST(ed["signal_type"])
+                except ValueError:
+                    continue  # skip unknown signal types gracefully
+                ex = ExemplarSignal(
+                    signal_type=st,
+                    text=ed.get("text", ""),
+                    embedding=ed.get("embedding") or [],
+                    entities=ed.get("entities") or [],
+                    platform=ed.get("platform", ""),
+                )
+                heap.append((conf, seq, ex))
+                seq += 1
+            heapq.heapify(heap)
+            new_bank[key] = heap
+
+        with self._lock:
+            self._bank = new_bank
+            self._seq = seq
+
+        total = sum(len(v) for v in new_bank.values())
+        logger.info(
+            "ExemplarBank.load: loaded %d exemplars from %s in %.1f ms",
+            total, path, (time.perf_counter() - _t0) * 1000,
+        )
 
 
 #: Module-level singleton — shared across all users and all pipeline instances.

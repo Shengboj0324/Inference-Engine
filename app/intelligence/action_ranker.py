@@ -15,7 +15,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Deque, List, Dict, Optional, Set
+from typing import Deque, List, Dict, Optional, Set, Tuple
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
@@ -48,21 +48,42 @@ _TREND_BASELINE_WINDOW_S: float = 7 * 86_400.0
 class TrendTracker:
     """Thread-safe monitor that detects when a ``SignalType`` is trending.
 
-    Records a monotonic timestamp each time a signal type is classified by any
-    user.  Declares a type **TRENDING** when its count in the last 24 hours is
-    ≥ ``_TREND_MULTIPLIER`` × its 7-day rolling daily average.
+    Records a **wall-clock** ``time.time()`` timestamp each time a signal type
+    is classified by any user.  Using wall-clock time (rather than monotonic
+    time) means trend windows are meaningful across process restarts and survive
+    sleep/hibernate cycles.
+
+    Declares a type **TRENDING** when its count in the last 24 hours is ≥
+    ``_TREND_MULTIPLIER`` × its 7-day rolling daily average **and** the total
+    count in the 7-day window is ≥ ``min_baseline_count`` (cold-start guard).
+
+    Provides :meth:`get_trending_scores` returning a graded ratio so downstream
+    components can apply continuous boosting rather than a binary flag.
 
     All public methods are thread-safe via a single ``threading.Lock``.
+
+    Args:
+        min_baseline_count: Minimum number of occurrences in the 7-day window
+            before a signal type can be declared trending.  Prevents
+            false-positives on cold-start data (e.g. a single burst right
+            after deployment).  Defaults to ``5``.
     """
 
-    def __init__(self) -> None:
-        """Initialise an empty tracker."""
-        # signal_type.value → deque of float timestamps (monotonic seconds)
+    def __init__(self, min_baseline_count: int = 5) -> None:
+        """Initialise an empty tracker.
+
+        Args:
+            min_baseline_count: Minimum 7-day count before trending is allowed.
+        """
+        if min_baseline_count < 0:
+            raise ValueError(f"min_baseline_count must be ≥ 0; got {min_baseline_count!r}")
+        # signal_type.value → deque of float timestamps (wall-clock seconds)
         self._timestamps: Dict[str, Deque[float]] = {}
         self._lock: threading.Lock = threading.Lock()
+        self._min_baseline_count: int = min_baseline_count
 
     def record(self, signal_type: SignalType) -> None:
-        """Record a new occurrence of ``signal_type`` at the current time.
+        """Record a new occurrence of ``signal_type`` at the current wall-clock time.
 
         Thread-safe.  Old timestamps (> 7 days) are pruned on each record call
         to keep memory bounded.
@@ -71,7 +92,7 @@ class TrendTracker:
             signal_type: Signal type that was just classified.
         """
         key = signal_type.value
-        now = time.monotonic()
+        now = time.time()  # wall-clock — survives restarts / sleep
         cutoff = now - _TREND_BASELINE_WINDOW_S
         with self._lock:
             if key not in self._timestamps:
@@ -82,6 +103,35 @@ class TrendTracker:
             while ts and ts[0] < cutoff:
                 ts.popleft()
 
+    def _trending_score(
+        self,
+        key: str,
+        now: float,
+        multiplier: float,
+    ) -> float:
+        """Return the raw trending ratio for ``key`` (internal helper).
+
+        The ratio is ``count_24h / (multiplier * avg_per_day_7d)``.  A ratio
+        ≥ 1.0 means the type is trending; below 1.0 it is not.  Returns ``0.0``
+        when there are no 7-day records or the cold-start guard fails.
+
+        Must be called with ``self._lock`` already held if ``now`` is used for
+        consistent snapshot semantics; the caller is responsible for lock
+        management when iterating over keys.
+        """
+        ts = self._timestamps.get(key, deque())
+        cutoff_24h = now - _TREND_CURRENT_WINDOW_S
+        cutoff_7d = now - _TREND_BASELINE_WINDOW_S
+        count_24h = sum(1 for t in ts if t >= cutoff_24h)
+        count_7d = sum(1 for t in ts if t >= cutoff_7d)
+        if count_7d < max(1, self._min_baseline_count):
+            return 0.0
+        avg_per_day_7d = count_7d / 7.0
+        denominator = multiplier * avg_per_day_7d
+        if denominator < 1e-9:
+            return 0.0
+        return count_24h / denominator
+
     def is_trending(
         self,
         signal_type: SignalType,
@@ -89,8 +139,10 @@ class TrendTracker:
     ) -> bool:
         """Return ``True`` if ``signal_type`` is currently trending.
 
-        A type is trending when its count in the last 24 hours is ≥
-        ``multiplier`` × its 7-day rolling daily average count.
+        A type is trending when:
+
+        1. Its count in the last 24 h is ≥ ``multiplier × 7d_daily_average``.
+        2. Its total 7-day count is ≥ ``min_baseline_count`` (cold-start guard).
 
         Args:
             signal_type: Signal type to test.
@@ -99,18 +151,9 @@ class TrendTracker:
         Returns:
             ``True`` if trending, ``False`` otherwise.
         """
-        key = signal_type.value
-        now = time.monotonic()
-        cutoff_24h = now - _TREND_CURRENT_WINDOW_S
-        cutoff_7d = now - _TREND_BASELINE_WINDOW_S
+        now = time.time()
         with self._lock:
-            ts = self._timestamps.get(key, deque())
-            count_24h = sum(1 for t in ts if t >= cutoff_24h)
-            count_7d = sum(1 for t in ts if t >= cutoff_7d)
-        if count_7d == 0:
-            return False
-        avg_per_day_7d = count_7d / 7.0
-        return count_24h >= multiplier * avg_per_day_7d
+            return self._trending_score(signal_type.value, now, multiplier) >= 1.0
 
     def get_trending_types(
         self, multiplier: float = _TREND_MULTIPLIER
@@ -123,12 +166,45 @@ class TrendTracker:
         Returns:
             Set of signal type value strings.
         """
+        now = time.time()
         with self._lock:
             keys = list(self._timestamps.keys())
-        return {
-            k for k in keys
-            if self.is_trending(SignalType(k), multiplier)
-        }
+            return {
+                k for k in keys
+                if self._trending_score(k, now, multiplier) >= 1.0
+            }
+
+    def get_trending_scores(
+        self, multiplier: float = _TREND_MULTIPLIER
+    ) -> Dict[str, float]:
+        """Return a graded trending ratio for every tracked signal type.
+
+        The ratio is ``count_24h / (multiplier × 7d_daily_average)``, clamped
+        to ``[0.0, ∞)``.  A ratio ≥ 1.0 means the type is trending.  Downstream
+        components can use this ratio for proportional boosting rather than the
+        binary flag from :meth:`is_trending`.
+
+        Signal types that fail the ``min_baseline_count`` cold-start guard have
+        a ratio of ``0.0``.
+
+        Args:
+            multiplier: Trending multiplier threshold (denominator scale).
+
+        Returns:
+            Dict mapping ``SignalType.value`` → trending ratio (float ≥ 0.0).
+        """
+        now = time.time()
+        with self._lock:
+            keys = list(self._timestamps.keys())
+            scores: Dict[str, float] = {
+                k: self._trending_score(k, now, multiplier) for k in keys
+            }
+        logger.debug(
+            "TrendTracker.get_trending_scores: tracked=%d trending=%d",
+            len(scores),
+            sum(1 for v in scores.values() if v >= 1.0),
+        )
+        return scores
 
     def clear(self) -> None:
         """Remove all recorded timestamps (used in tests)."""

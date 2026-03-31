@@ -14,9 +14,11 @@ import asyncio
 import json
 import logging
 import math
+import os
+from collections.abc import Coroutine
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import UUID
 
 import numpy as np
@@ -40,13 +42,38 @@ from app.intelligence.orchestrator import MultiAgentOrchestrator
 from app.intelligence.context_memory import ContextMemoryStore
 from app.intelligence.deliberation import DeliberationEngine
 from app.intelligence.reranker import Reranker
-from app.intelligence.action_ranker import _GLOBAL_TREND_TRACKER
+from app.intelligence.action_ranker import (
+    ActionRanker,
+    _GLOBAL_TREND_TRACKER,
+)
 
 #: Minimum probability for an inference to be written to the ExemplarBank.
 _EXEMPLAR_MIN_PROB: float = 0.85
+
 #: Cosine distance threshold above which a re-ingested source is treated as a
 #: new signal (Step 4c signal drift detection).
-_DRIFT_THRESHOLD: float = 0.3
+#:
+#: Configurable at runtime via the ``SMR_DRIFT_THRESHOLD`` environment variable
+#: (e.g. ``SMR_DRIFT_THRESHOLD=0.25 uvicorn ...``).  Falls back to ``0.3``
+#: when the variable is absent or cannot be parsed as a float.
+def _load_drift_threshold() -> float:
+    raw = os.environ.get("SMR_DRIFT_THRESHOLD", "0.3")
+    try:
+        val = float(raw)
+        if not (0.0 < val <= 1.0):
+            raise ValueError(f"out of range: {val}")
+        return val
+    except ValueError:
+        logger_init = logging.getLogger(__name__)
+        logger_init.warning(
+            "SMR_DRIFT_THRESHOLD=%r is not a valid float in (0, 1]; "
+            "using default 0.3",
+            raw,
+        )
+        return 0.3
+
+
+_DRIFT_THRESHOLD: float = _load_drift_threshold()
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +87,37 @@ class InferencePipeline:
     - LLM adjudication (with optional E1–E6 enhancements)
     - ECE calibration (aggregate-level, Stage D)
     - Abstention
+    - Optional action ranking (propagates ``signal_type_weights`` end-to-end)
 
     The five enhancement components (E1–E3, E5–E6) are injected into
     ``LLMAdjudicator`` and default to ``None``, preserving full backward
     compatibility.  When ``None``, adjudication falls back to the original
     single-call path.
+
+    Background tasks (ExemplarBank write, Redis publish) are tracked in
+    ``_bg_tasks`` — a class-level :class:`set` — so they are not garbage-
+    collected before completion.  Each task removes itself from the set via a
+    ``done_callback`` once it finishes.
     """
+
+    #: Class-level set of strongly-referenced background tasks to prevent GC.
+    _bg_tasks: Set["asyncio.Task[None]"] = set()
+
+    @classmethod
+    def _fire_background(cls, coro: Coroutine[Any, Any, None]) -> None:
+        """Create a tracked background task and register a cleanup callback.
+
+        This is cancel-safe: if the event loop is shut down, tasks are
+        cancelled by the runtime; the ``done_callback`` removes them from
+        ``_bg_tasks`` in all cases (success, exception, cancellation) so the
+        set never leaks.
+
+        Args:
+            coro: Coroutine to run in the background.
+        """
+        task: asyncio.Task[None] = asyncio.create_task(coro)
+        cls._bg_tasks.add(task)
+        task.add_done_callback(cls._bg_tasks.discard)
 
     def __init__(
         self,
@@ -173,6 +225,11 @@ class InferencePipeline:
         # passed to LLMAdjudicator) so run() can read preference vectors and
         # store source embeddings for drift detection.
         self._context_memory_store: Optional[ContextMemoryStore] = context_memory
+
+        # Optional ActionRanker — when provided, rank_action() is called at
+        # the end of run() and the priority score is emitted into
+        # inference.inference_metadata["action_priority_score"].
+        self._action_ranker: Optional[ActionRanker] = None
 
         logger.info("InferencePipeline initialized with all components")
     
@@ -342,7 +399,7 @@ class InferencePipeline:
             except Exception as _tr_exc:  # noqa: BLE001
                 logger.debug("TrendTracker.record failed: %s", _tr_exc)
 
-        # ── Write to ExemplarBank (Step 3a, non-blocking) ────────────────────
+        # ── Write to ExemplarBank (Step 3a, cancel-safe background task) ───────
         if (
             not inference.abstained
             and inference.top_prediction is not None
@@ -362,7 +419,10 @@ class InferencePipeline:
                     if hasattr(raw_observation.source_platform, "value")
                     else str(raw_observation.source_platform),
                 )
-                asyncio.ensure_future(
+                # Use create_task + _bg_tasks registry so the task is:
+                #   (a) strongly referenced (won't be GC'd before completion)
+                #   (b) cancellable by the runtime on loop shutdown
+                self._fire_background(
                     _GLOBAL_EXEMPLAR_BANK.add_nonblocking(
                         exemplar, inference.top_prediction.probability
                     )
@@ -402,9 +462,48 @@ class InferencePipeline:
                 _art_exc,
             )
 
-        # Stage 6: Publish to Redis for WebSocket broadcast (non-blocking)
+        # ── Wire signal_type_weights → ActionRanker (end-to-end) ─────────────
+        # When an ActionRanker is attached to this pipeline, call rank_action()
+        # with the per-user weight vector so signal types the user frequently
+        # dismisses are deprioritised in the delivered action score.
+        if getattr(self, "_action_ranker", None) is not None and not inference.abstained:
+            try:
+                _weights: Optional[Dict[str, float]] = (
+                    user_context.signal_type_weights if user_context else None
+                )
+                _trending: Optional[Set[str]] = (
+                    _GLOBAL_TREND_TRACKER.get_trending_types()
+                    if inference.top_prediction is not None
+                    else None
+                )
+                _action = getattr(self, "_action_ranker").rank_action(
+                    inference,
+                    normalized,
+                    signal_type_weights=_weights,
+                    trending_types=_trending,
+                )
+                if _action is not None:
+                    inference.inference_metadata["action_priority_score"] = (
+                        _action.priority_score
+                    )
+                    inference.inference_metadata["action_priority_level"] = (
+                        _action.priority_level.value
+                        if hasattr(_action.priority_level, "value")
+                        else str(_action.priority_level)
+                    )
+                    logger.debug(
+                        "InferencePipeline: action_ranker score=%.3f level=%s "
+                        "weights_applied=%s",
+                        _action.priority_score,
+                        inference.inference_metadata["action_priority_level"],
+                        _weights is not None,
+                    )
+            except Exception as _ar_exc:  # noqa: BLE001
+                logger.debug("ActionRanker.rank_action failed: %s", _ar_exc)
+
+        # Stage 6: Publish to Redis for WebSocket broadcast (cancel-safe)
         if not inference.abstained and raw_observation.user_id:
-            asyncio.ensure_future(
+            self._fire_background(
                 self._publish_to_redis(raw_observation.user_id, inference)
             )
 
