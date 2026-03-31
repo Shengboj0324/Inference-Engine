@@ -1,4 +1,79 @@
-"""Connector registry for platform-specific connector instantiation."""
+"""Connector registry for platform-specific connector instantiation.
+
+Connector Capability Matrix
+===========================
+Documents each of the 13 connectors across four capability dimensions that
+the acquisition pipeline depends on.  Update this table whenever a connector
+is modified.
+
+Legend
+------
+ ✓  : Capability is implemented.
+ ~  : Partially implemented or dependent on API mode.
+ ✗  : Not implemented; downstream stages must not assume this field.
+ N/A: Not applicable (public/RSS connector, no OAuth).
+
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| Platform          | SP fields used   | is_trending  | engagement_score | source_url          | Rate-limit handling | Query strategy   |
+|                   | at query time    | emitted      | (native key)     | populated           |                     |                  |
++===================+==================+==============+==================+=====================+=====================+==================+
+| reddit            | ✗ (uses subscr.) | ✗ (default)  | ✓ (score)        | ✓ permalink         | PlatformError       | Broad fetch,     |
+|                   |                  |              |                  |                     | raised on exc.      | post-fetch filter|
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| youtube           | ~ (config query) | ✗ (default)  | ✗ (no view_count)| ✓ watch URL         | PlatformError       | Channel search;  |
+|                   |                  |              | view_count absent| built in connector  | on HttpError        | relevanceLang ✗  |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| tiktok            | ~ (config kw/ht) | ✗ (default)  | ~ (play_count    | ✓ user/video URL    | ConnectorError      | Keyword & hashtag|
+|                   |                  |              | via view_count)  | built in _parse     | raised; partial FR  | query at API     |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| facebook          | ✗ (config pages) | ✗ (default)  | ✓ reactions_count| ✓ post link         | ConnectorError      | Feed/page IDs;   |
+|                   |                  |              |                  | or FB permalink     | raised on 4xx       | no keyword query |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| instagram         | ~ (config tags)  | ✗ (default)  | ✓ like_count     | ✓ permalink         | ConnectorError      | Hashtag & account|
+|                   |                  |              |                  |                     | raised on non-200   | query at API     |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| wechat            | ✗ (account-wide) | ✗ (default)  | ✗ (no engagement | ✓ article URL       | ConnectorError      | Account material |
+|                   |                  |              | data in API)     |                     | raised on errcode   | batch; no query  |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| rss               | ✗ (feed URLs)    | ✗ (default)  | ✗ (no engagement)| ✓ entry link        | PlatformError       | Fixed URLs;      |
+|                   |                  |              |                  |                     | raised on HTTPError | no keyword query |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| nytimes           | ~ (config query) | ~ (most_pop) | ~ views (most_pop| ✓ web_url field     | ConnectorError      | Article search   |
+|                   |                  | mode only)   | mode only)       |                     | on 429; raised      | w/ config query  |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| wsj               | ✗ (config feeds) | ✗ (default)  | ✗ (no engagement)| ✓ entry link        | Silent warning;     | Named feed URLs; |
+|                   |                  |              |                  |                     | returns partial FR  | no keyword query |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| abc_news          | ✗ (config feeds) | ✗ (default)  | ✗ (no engagement)| ✓ entry link        | Silent warning;     | Named feed URLs; |
+| abc_news_au       |                  |              |                  |                     | returns partial FR  | no keyword query |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| google_news       | ~ (config kw/top)| ✗ (default)  | ✗ (no engagement)| ✓ entry link        | Silent warning;     | Keyword & topic  |
+|                   |                  |              |                  |                     | returns partial FR  | search at API    |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+| apple_news        | ✗ (scraping)     | ✗ (default)  | ✗ (no engagement)| ✓ scraped URL       | Silent warning;     | Newsroom scrape; |
+|                   |                  |              |                  |                     | returns partial FR  | no keyword query |
++-------------------+------------------+--------------+------------------+---------------------+---------------------+------------------+
+
+Key observations from the audit
+--------------------------------
+1. Reddit uses ``score`` (not ``upvotes``) — the old Stage 4 engagement check
+   always read 0 for Reddit.  Fixed via ``normalize_engagement()``.
+2. YouTube's ``_fetch_from_channel`` does not include ``view_count`` in
+   ``metadata``; only ``channel_id``, ``video_id``, and ``thumbnails`` are
+   present.  ``normalize_engagement`` falls back to 0 for YouTube until the
+   connector is updated to request statistics.
+3. WeChat and all RSS/news connectors do not expose engagement data; they
+   safely score 0 for ``min_engagement_threshold`` when the threshold is
+   non-zero.  Users should set ``min_engagement_threshold=0`` when monitoring
+   news-only sources.
+4. No connector populates ``is_trending``; ``apply_acquisition_filter``
+   therefore injects ``is_trending=False`` before running the filter.  Users
+   enabling ``trending_only=True`` must also configure a connector that
+   actively queries platform trending APIs (e.g. TikTok ``trending`` endpoint).
+5. The deduplication fingerprint is now URL-based when ``source_url`` is
+   present, enabling cross-platform dedup (same article from NYTimes RSS +
+   Google News shares one fingerprint).
+"""
 
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -20,7 +95,7 @@ from app.connectors.youtube import YouTubeConnector
 from app.core.errors import ConnectorError
 from app.core.models import SourcePlatform
 from app.domain.inference_models import StrategicPriorities
-from app.ingestion.noise_filter import AcquisitionNoiseFilter
+from app.ingestion.noise_filter import AcquisitionNoiseFilter, normalize_engagement
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +260,19 @@ class ConnectorRegistry:
                 logger.debug("AcquisitionFilter: failed to wrap item %s: %s", item.id, exc)
                 accepted_items.append(item)
                 continue
+
+            # ── Pre-filter enrichment ────────────────────────────────────────
+            # 1. Guarantee ``is_trending`` is present (Stage 8 contract).
+            #    No current connector populates this field; injecting the
+            #    default here means Stage 8 is always safe to run.
+            raw.platform_metadata.setdefault("is_trending", False)
+
+            # 2. Normalise engagement to ``engagement_score`` before Stage 4.
+            #    This maps platform-specific keys (Reddit ``score``,
+            #    TikTok ``play_count``, etc.) to a single canonical field so
+            #    the filter never reads a stale or missing key.
+            normalize_engagement(raw.platform_metadata, raw.source_platform)
+            # ────────────────────────────────────────────────────────────────
 
             ok, _ = nf.filter(raw, priorities)
             if ok:

@@ -9,23 +9,39 @@ Filter stages (applied in order):
   2. Keyword blocklist              — ``StrategicPriorities.keywords_blocklist``
   3. Keyword allowlist              — ``StrategicPriorities.keywords_allowlist``
   4. Engagement threshold           — ``StrategicPriorities.min_engagement_threshold``
-  5. Near-duplicate fingerprint     — 24 h sliding window per user
+                                      Uses ``normalize_engagement()`` which maps each
+                                      platform's native metric to a canonical
+                                      ``engagement_score`` field.
+  5. Near-duplicate fingerprint     — 24 h sliding window per user.  When a
+                                      canonical ``source_url`` is present the
+                                      fingerprint is URL-based (UTM params stripped)
+                                      enabling *cross-platform* deduplication.
   6. Bot / spam heuristics          — caps-ratio, URL density, post-frequency
   7. Minimum text length            — configurable floor (default 20 chars)
-  8. Language filter                — ``StrategicPriorities`` (reserved hook)
+  8. Trending gate                  — ``StrategicPriorities.trending_only``
+                                      Drops observations whose
+                                      ``platform_metadata["is_trending"]`` is falsy.
+                                      Connectors that do not expose trending signals
+                                      must emit ``is_trending=False`` by default;
+                                      ``ConnectorRegistry.apply_acquisition_filter``
+                                      guarantees this invariant.
 
 Every drop appends a ``noise_filter_decision`` entry to
 ``RawObservation.platform_metadata`` for full auditability.
+Every passing observation receives a ``relevance_score`` (0.0–1.0) written
+by ``RelevanceScorer`` based on ``StrategicPriorities`` keyword density.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from app.domain.raw_models import RawObservation
 from app.domain.inference_models import StrategicPriorities
@@ -41,17 +57,134 @@ logger = logging.getLogger(__name__)
 _seen_fingerprints: Dict[str, Dict[str, float]] = defaultdict(dict)
 _DEDUP_WINDOW_SECONDS: int = 86_400  # 24 h
 
+# URL query parameters that carry zero content-identity information.
+_TRACKING_PARAMS: frozenset = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_source_platform", "fbclid", "gclid", "msclkid",
+    "ref", "source", "s", "via", "_hsenc", "_hsmi", "mc_eid",
+})
+
+
+def _normalize_url(url: str) -> str:
+    """Return a canonical form of *url* for cross-platform deduplication.
+
+    Transformations applied (all safe / invertible):
+    - Scheme and netloc lowercased.
+    - ``www.`` prefix stripped from netloc.
+    - Trailing slashes removed from path.
+    - Tracking / UTM query parameters removed.
+    - URL fragment discarded (fragments are client-only, never server-canonical).
+
+    Falls back to the original URL if parsing fails (e.g. relative URL).
+    """
+    try:
+        p = urlparse(url.strip())
+        netloc = p.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        qs_pairs = [
+            (k, v) for k, v in parse_qsl(p.query)
+            if k.lower() not in _TRACKING_PARAMS
+        ]
+        return urlunparse((
+            p.scheme.lower(),
+            netloc,
+            p.path.rstrip("/"),
+            p.params,
+            urlencode(qs_pairs),
+            "",  # discard fragment
+        ))
+    except Exception:
+        return url.strip()
+
 
 def _make_fingerprint(obs: RawObservation) -> str:
     """Return a short fingerprint for near-duplicate detection.
 
-    Uses the first 64 characters of raw_text (or title if no text),
-    the author, and the platform.  Collisions are extremely rare for
-    distinct posts and acceptably frequent for true near-duplicates.
+    Strategy
+    --------
+    When *obs* has a non-empty ``source_url`` we derive the fingerprint
+    exclusively from its *normalised* form (UTM params stripped, ``www.``
+    removed, trailing slash removed).  This means the **same article URL
+    ingested from multiple connectors** (e.g. NYTimes RSS + Google News +
+    Apple News) produces the **same fingerprint**, enabling cross-platform
+    deduplication.
+
+    When no URL is available we fall back to the original platform-scoped
+    strategy (platform + author + first 64 chars of body text), which is
+    appropriate for social-media posts that lack canonical URLs.
     """
-    body = (obs.raw_text or obs.title or "")[:64]
-    raw = f"{obs.source_platform.value}|{obs.author or ''}|{body}"
+    if obs.source_url:
+        raw = _normalize_url(obs.source_url)
+    else:
+        body = (obs.raw_text or obs.title or "")[:64]
+        raw = f"{obs.source_platform.value}|{obs.author or ''}|{body}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Engagement normalisation
+# ---------------------------------------------------------------------------
+
+# Maps SourcePlatform.value → ordered list of metadata keys to try.
+# The first key found with a non-None value is used as the canonical score.
+_ENGAGEMENT_KEY_MAP: Dict[str, List[str]] = {
+    # Social media — primary engagement metrics
+    "reddit":      ["score", "upvotes"],            # PRAW exposes .score
+    "youtube":     ["view_count", "like_count"],
+    "tiktok":      ["play_count", "digg_count", "like_count"],
+    "facebook":    ["reactions_count", "shares_count", "like_count"],
+    "instagram":   ["like_count", "play_count"],
+    "wechat":      ["read_count", "like_count"],
+    # News / RSS — engagement signals are sparse; views from NYTimes
+    # most_popular mode is the only real signal
+    "rss":         ["like_count", "share_count", "views"],
+    "nytimes":     ["views", "share_count"],
+    "wsj":         ["views", "share_count", "like_count"],
+    "abc_news":    ["views", "share_count"],
+    "abc_news_au": ["views", "share_count"],
+    "google_news": ["like_count", "share_count"],
+    "apple_news":  ["like_count", "share_count"],
+}
+
+
+def normalize_engagement(
+    platform_metadata: Dict[str, Any],
+    source_platform: "Any",  # SourcePlatform; avoid circular import
+) -> int:
+    """Return a canonical ``engagement_score`` (int ≥ 0) from *platform_metadata*.
+
+    The function reads platform-specific engagement metric keys (in priority
+    order per :data:`_ENGAGEMENT_KEY_MAP`) and returns the first non-``None``
+    value found, cast to ``int``.  Returns ``0`` when no engagement data is
+    available (e.g. news RSS connectors without an engagement API).
+
+    **Side effect:** the result is written back under the ``"engagement_score"``
+    key so that the Stage 4 engagement-threshold check and downstream analytics
+    can rely on a single, platform-agnostic field regardless of connector.
+
+    Parameters
+    ----------
+    platform_metadata:
+        The ``RawObservation.platform_metadata`` dict (mutated in place).
+    source_platform:
+        A :class:`~app.core.models.SourcePlatform` enum instance.
+    """
+    # Short-circuit: already normalised (e.g. called twice in the same request)
+    if "engagement_score" in platform_metadata:
+        return int(platform_metadata["engagement_score"])
+
+    platform_value = getattr(source_platform, "value", str(source_platform))
+    keys = _ENGAGEMENT_KEY_MAP.get(platform_value, [])
+    for key in keys:
+        val = platform_metadata.get(key)
+        if val is not None:
+            score = max(0, int(val))
+            platform_metadata["engagement_score"] = score
+            return score
+
+    platform_metadata["engagement_score"] = 0
+    return 0
 
 
 def _purge_expired(user_key: str) -> None:
@@ -172,16 +305,19 @@ class AcquisitionNoiseFilter:
         _pass("keyword_allowlist")
 
         # Stage 4 — Engagement threshold
+        # ``normalize_engagement`` maps every platform's native key(s) to the
+        # canonical ``engagement_score`` field and returns the value.  This
+        # replaces the previous hard-coded ``upvotes / likes / shares`` lookup
+        # which never matched Reddit (``score``) or TikTok (``play_count``).
         if sp.min_engagement_threshold > 0:
-            engagement = (
-                obs.platform_metadata.get("upvotes")
-                or obs.platform_metadata.get("likes")
-                or obs.platform_metadata.get("shares")
-                or 0
+            engagement = normalize_engagement(
+                obs.platform_metadata, obs.source_platform
             )
             if engagement < sp.min_engagement_threshold:
-                return _drop("engagement_threshold",
-                             f"engagement {engagement} < {sp.min_engagement_threshold}")
+                return _drop(
+                    "engagement_threshold",
+                    f"engagement {engagement} < {sp.min_engagement_threshold}",
+                )
         _pass("engagement_threshold")
 
         # Stage 5 — Near-duplicate deduplication
@@ -205,6 +341,20 @@ class AcquisitionNoiseFilter:
                          f"text length {len(raw)} < {self._min_text_length}")
         _pass("min_text_length")
 
+        # Stage 8 — Trending gate (enforces StrategicPriorities.trending_only)
+        # ``is_trending`` must be injected by the connector or defaulted to False
+        # by ``ConnectorRegistry.apply_acquisition_filter`` before this filter
+        # runs.  Connectors that do not expose platform trending signals emit
+        # ``is_trending=False``; enabling ``trending_only`` for those platforms
+        # effectively mutes them (which is the correct, explicit behaviour).
+        if sp.trending_only:
+            if not obs.platform_metadata.get("is_trending"):
+                return _drop(
+                    "trending_gate",
+                    "trending_only=True but is_trending is absent or False",
+                )
+        _pass("trending_gate")
+
         obs.platform_metadata["noise_filter_decision"] = [d.as_dict() for d in decisions]
         return True, decisions
 
@@ -223,3 +373,105 @@ class AcquisitionNoiseFilter:
             else:
                 dropped += 1
         return accepted, dropped
+
+
+
+# ---------------------------------------------------------------------------
+# Relevance Scorer
+# ---------------------------------------------------------------------------
+
+class RelevanceScorer:
+    """Score a *passing* observation by keyword relevance to StrategicPriorities.
+
+    This replaces the binary pass/fail allowlist with a ranked signal.  Every
+    observation that clears the 8-stage filter receives a ``relevance_score``
+    written to ``obs.platform_metadata["relevance_score"]``.
+
+    Scoring formula
+    ---------------
+    Each unique keyword match in the observation text contributes a weight
+    according to its category:
+
+    * ``keywords_allowlist`` → weight **1.0** per match
+    * ``focus_areas``        → weight **1.5** per match (domain-specific)
+    * ``competitors``        → weight **2.0** per match (highest GTM value)
+
+    The raw sum is normalised through ``tanh(raw / scale)`` to produce a
+    monotonically increasing score in **[0.0, 1.0]**:
+
+    * 0 matching terms → **0.0**
+    * 1 allowlist hit  → ≈ **0.48**
+    * 1 focus-area hit → ≈ **0.64**
+    * 1 competitor hit → ≈ **0.76**
+    * 3 mixed hits     → ≈ **0.95**
+
+    The ``scale`` parameter (default **2.1**) controls the knee of the curve.
+    It can be tuned per-deployment without changing the interface.
+
+    Parameters
+    ----------
+    scale:
+        Denominator for the tanh argument.  Larger values flatten the curve
+        (more hits required to reach 1.0); smaller values steepen it.
+    """
+
+    _WEIGHTS: Dict[str, float] = {
+        "keywords_allowlist": 1.0,
+        "focus_areas": 1.5,
+        "competitors": 2.0,
+    }
+
+    def __init__(self, scale: float = 2.1) -> None:
+        self._scale = scale
+
+    def score(
+        self,
+        obs: RawObservation,
+        priorities: StrategicPriorities,
+    ) -> float:
+        """Compute a relevance score and stamp it into ``obs.platform_metadata``.
+
+        Parameters
+        ----------
+        obs:
+            The observation to score (mutated in place via ``platform_metadata``).
+        priorities:
+            The user's ``StrategicPriorities`` supplying the keyword sets.
+
+        Returns
+        -------
+        float
+            The computed relevance score in **[0.0, 1.0]**.
+        """
+        text = (obs.raw_text or obs.title or "").lower()
+        raw_score = 0.0
+
+        for kw in priorities.keywords_allowlist:
+            if kw.lower() in text:
+                raw_score += self._WEIGHTS["keywords_allowlist"]
+
+        for kw in priorities.focus_areas:
+            if kw.lower() in text:
+                raw_score += self._WEIGHTS["focus_areas"]
+
+        for kw in priorities.competitors:
+            if kw.lower() in text:
+                raw_score += self._WEIGHTS["competitors"]
+
+        relevance = round(
+            math.tanh(raw_score / self._scale) if raw_score > 0 else 0.0,
+            4,
+        )
+        obs.platform_metadata["relevance_score"] = relevance
+        return relevance
+
+    def score_batch(
+        self,
+        observations: List[RawObservation],
+        priorities: StrategicPriorities,
+    ) -> List[float]:
+        """Score a batch of observations in-place.
+
+        Returns the list of scores in the same order as *observations*.
+        """
+        return [self.score(obs, priorities) for obs in observations]
