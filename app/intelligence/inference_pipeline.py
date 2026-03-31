@@ -33,6 +33,7 @@ from app.intelligence.cot_reasoner import ChainOfThoughtReasoner
 from app.intelligence.orchestrator import MultiAgentOrchestrator
 from app.intelligence.context_memory import ContextMemoryStore
 from app.intelligence.deliberation import DeliberationEngine
+from app.intelligence.reranker import Reranker
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,11 @@ class InferencePipeline:
         orchestrator: Optional[MultiAgentOrchestrator] = None,
         context_memory: Optional[ContextMemoryStore] = None,
         deliberation_engine: Optional[DeliberationEngine] = None,
+        # Reranker (Stage 2b) — optional
+        reranker: Optional[Reranker] = None,
+        # RAG document pool — pre-populated NormalizedObservations used as
+        # retrieval context by the reranker.  Empty list disables reranking.
+        rag_document_pool: Optional[List[NormalizedObservation]] = None,
         # Redis signal publisher
         redis_url: Optional[str] = None,
     ):
@@ -146,6 +152,10 @@ class InferencePipeline:
 
         self.abstention_decider = abstention_decider or AbstentionDecider()
 
+        # Reranker (Stage 2b) — None means reranking is skipped
+        self.reranker: Optional[Reranker] = reranker
+        self.rag_document_pool: List[NormalizedObservation] = rag_document_pool or []
+
         logger.info("InferencePipeline initialized with all components")
     
     async def run(
@@ -182,7 +192,32 @@ class InferencePipeline:
         logger.debug("Stage 2: Candidate Retrieval")
         candidates = self.candidate_retriever.retrieve_candidates(normalized)
         logger.debug(f"Retrieved {len(candidates)} candidates")
-        
+
+        # Stage 2b: Reranker — only when enabled in StrategicPriorities and
+        # a non-empty RAG document pool is available.
+        sp = user_context.strategic_priorities if user_context else None
+        reranker_enabled = sp.reranker_enabled if sp is not None else True
+        reranker_top_k = sp.reranker_top_k if sp is not None else 10
+
+        rag_pool = getattr(self, "rag_document_pool", []) or []
+        reranked_pool: List[NormalizedObservation] = []
+        if getattr(self, "reranker", None) is not None and reranker_enabled and rag_pool:
+            logger.debug("Stage 2b: Reranker — pool=%d docs", len(rag_pool))
+            query_text = normalized.normalized_text or normalized.title or ""
+            rag_top_k = sp.rag_top_k if sp is not None else 20
+            effective_top_k = min(reranker_top_k, rag_top_k)
+            _active_reranker = getattr(self, "reranker", None)
+            reranked_pool = _active_reranker.rerank(
+                query=query_text,
+                candidates=rag_pool,
+                top_k=effective_top_k,
+            )
+            logger.debug(
+                "Stage 2b: Reranker returned %d docs (requested %d)",
+                len(reranked_pool),
+                effective_top_k,
+            )
+
         # Stage 3: LLM Adjudication (user_context injects strategic priorities)
         logger.debug("Stage 3: LLM Adjudication")
         inference = await self.llm_adjudicator.adjudicate(
@@ -214,6 +249,11 @@ class InferencePipeline:
             f"confidence={inference.top_prediction.probability if inference.top_prediction else 0.0:.2f}, "
             f"abstained={inference.abstained}"
         )
+
+        # Stage 5b: Populate ResponseArtifacts
+        # Attach source citations for RAG pool docs, image/video URLs from
+        # platform_metadata, and document links for news-connector sources.
+        self._populate_artifacts(raw_observation, normalized, reranked_pool, inference)
 
         # Stage 6: Publish to Redis for WebSocket broadcast (non-blocking)
         if not inference.abstained and raw_observation.user_id:
@@ -298,6 +338,109 @@ class InferencePipeline:
                 raw_observation.id, exc,
             )
 
+    # ── NEWS_CONNECTOR_PLATFORMS ──────────────────────────────────────────────
+    # Used by _populate_artifacts to decide whether to emit a document_link.
+    _NEWS_PLATFORMS = frozenset({"abc_news", "reuters", "nytimes", "wsj", "bbc"})
+
+    @staticmethod
+    def _populate_artifacts(
+        raw: "RawObservation",
+        normalized: "NormalizedObservation",
+        reranked_pool: List["NormalizedObservation"],
+        inference: "SignalInference",
+    ) -> None:
+        """Populate ``inference.artifacts`` with structured response artifacts.
+
+        Adds (in order):
+        1. ``source_citation`` for every NormalizedObservation in *reranked_pool*.
+        2. ``image_url`` / ``video_url`` from ``raw.platform_metadata``.
+        3. ``document_link`` when the source platform is a news connector.
+        4. A fallback ``source_citation`` from ``normalized.source_url`` when
+           the reranked pool is empty and a URL is available.
+
+        All failures are silently skipped — artifact population is a value-add
+        step and must never raise.
+        """
+        from app.domain.inference_models import ResponseArtifact  # local to avoid circular
+
+        artifacts = []
+
+        # 1. RAG source citations
+        for rag_doc in reranked_pool:
+            url = getattr(rag_doc, "source_url", None) or ""
+            if url:
+                artifacts.append(
+                    ResponseArtifact(
+                        artifact_type="source_citation",
+                        content=url,
+                        label=getattr(rag_doc, "title", None) or url[:80],
+                        source_platform=getattr(rag_doc, "source_platform", None),
+                        confidence=0.8,
+                        published_at=getattr(rag_doc, "published_at", None),
+                    )
+                )
+
+        # 2. Image / video URLs from platform_metadata
+        meta = raw.platform_metadata or {}
+        for img_key in ("image_url", "thumbnail_url"):
+            img_url = meta.get(img_key)
+            if img_url and isinstance(img_url, str):
+                artifacts.append(
+                    ResponseArtifact(
+                        artifact_type="image_url",
+                        content=img_url,
+                        label="Image from " + raw.source_platform.value,
+                        source_platform=raw.source_platform,
+                        confidence=0.9,
+                    )
+                )
+                break
+        vid_url = meta.get("video_url") or meta.get("media_url")
+        if vid_url and isinstance(vid_url, str):
+            artifacts.append(
+                ResponseArtifact(
+                    artifact_type="video_url",
+                    content=vid_url,
+                    label="Video from " + raw.source_platform.value,
+                    source_platform=raw.source_platform,
+                    confidence=0.9,
+                )
+            )
+
+        # 3. Document link for news connector sources
+        platform_val = (
+            raw.source_platform.value
+            if hasattr(raw.source_platform, "value")
+            else str(raw.source_platform)
+        )
+        if platform_val.lower() in InferencePipeline._NEWS_PLATFORMS and raw.source_url:
+            artifacts.append(
+                ResponseArtifact(
+                    artifact_type="document_link",
+                    content=raw.source_url,
+                    label=raw.title or raw.source_url[:80],
+                    source_platform=raw.source_platform,
+                    confidence=0.95,
+                    published_at=raw.published_at,
+                )
+            )
+
+        # 4. Fallback citation from normalized source URL
+        if not reranked_pool and normalized.source_url and not any(
+            a.artifact_type == "source_citation" for a in artifacts
+        ):
+            artifacts.append(
+                ResponseArtifact(
+                    artifact_type="source_citation",
+                    content=normalized.source_url,
+                    label=normalized.title or normalized.source_url[:80],
+                    source_platform=getattr(normalized, "source_platform", None),
+                    confidence=0.7,
+                )
+            )
+
+        inference.artifacts = artifacts
+
     async def _publish_to_redis(
         self,
         user_id: UUID,
@@ -354,6 +497,11 @@ class InferencePipeline:
                     if platform_auth_status is not None
                     else PlatformAuthStatus.CONNECTED.value
                 ),
+                # Structured response artifacts serialised for the frontend
+                # renderer (citation cards, image thumbnails, video previews).
+                "artifacts": [
+                    a.model_dump(mode="json") for a in inference.artifacts
+                ],
             },
         })
         try:

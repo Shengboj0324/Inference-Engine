@@ -10,10 +10,12 @@ Inference models represent ML/LLM interpretation results with:
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.core.models import SourcePlatform
 
 
 class SignalType(str, Enum):
@@ -129,6 +131,46 @@ class StrategicPriorities(BaseModel):
             "once the cumulative character count exceeds this value, emitting a WARNING. "
             "None (default) = use the system-level default of 500 000 characters. "
             "Set explicitly to 0 to disable budget enforcement entirely."
+        ),
+    )
+
+    # ── RAG / Retrieval settings ──────────────────────────────────────────────
+    rag_top_k: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description=(
+            "Number of candidate documents the RAG retriever returns before reranking. "
+            "Higher values improve recall at the cost of reranker latency."
+        ),
+    )
+
+    # ── Reranker settings ─────────────────────────────────────────────────────
+    reranker_enabled: bool = Field(
+        default=True,
+        description=(
+            "When True, run the cross-encoder Reranker on RAG candidates after retrieval "
+            "and before LLM generation.  Set to False to skip reranking for lower-latency "
+            "use-cases or when the retriever ordering is already trusted."
+        ),
+    )
+    reranker_top_k: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Final candidate count after reranking.  Should be ≤ rag_top_k; "
+            "the pipeline clamps it to rag_top_k automatically if needed."
+        ),
+    )
+
+    # ── Multimodal settings ───────────────────────────────────────────────────
+    multimodal_enabled: bool = Field(
+        default=True,
+        description=(
+            "When True, MultimodalAnalyzer.visual_to_text() is called for any "
+            "RawObservation that contains image_url, video_url, or similar visual "
+            "metadata keys.  The extracted paragraph is appended to raw_text before "
+            "the 8-stage noise filter runs."
         ),
     )
 
@@ -252,6 +294,45 @@ class CalibrationMetrics(BaseModel):
     )
 
 
+class ResponseArtifact(BaseModel):
+    """Structured response artifact attached to a SignalInference result.
+
+    Artifacts allow the frontend to render non-text outputs (citation links,
+    image thumbnails, video previews, document references) alongside the
+    plain-text rationale.  They are also published to Redis so WebSocket
+    clients receive rich media payloads.
+
+    Attributes:
+        artifact_type: Discriminator for the rendering layer.
+            - ``text``            : Plain-text body (for LLM-generated summaries).
+            - ``image_url``       : Renderable image link.
+            - ``video_url``       : Playable video link.
+            - ``document_link``   : News article or long-form document URL.
+            - ``source_citation`` : Attribution string for a RAG source.
+            - ``hyperlink``       : Generic clickable hyperlink.
+        content: URL, citation string, or short text body (≤ 2 000 chars).
+        label: Human-readable label shown to the user in the UI.
+        source_platform: Platform this artifact came from, used to render
+            the platform logo in the frontend (optional).
+        confidence: Model confidence that this artifact is relevant [0.0, 1.0].
+        published_at: Publication timestamp of the source content (optional).
+    """
+
+    artifact_type: Literal[
+        "text",
+        "image_url",
+        "video_url",
+        "document_link",
+        "source_citation",
+        "hyperlink",
+    ]
+    content: str
+    label: Optional[str] = None
+    source_platform: Optional[SourcePlatform] = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    published_at: Optional[datetime] = None
+
+
 class SignalInference(BaseModel):
     """Signal inference result - Layer 3 output.
     
@@ -313,7 +394,18 @@ class SignalInference(BaseModel):
         default_factory=dict,
         description="Model-specific metadata: token count, latency, temperature, etc."
     )
-    
+
+    # Structured response artifacts — populated after adjudication, serialised
+    # to Redis so the frontend can render citations, images, and video previews.
+    artifacts: List[ResponseArtifact] = Field(
+        default_factory=list,
+        description=(
+            "Structured output artifacts: source citations for every RAG-retrieved "
+            "NormalizedObservation, any image/video URLs from multimodal analysis, "
+            "and document links for news-connector sources."
+        ),
+    )
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {

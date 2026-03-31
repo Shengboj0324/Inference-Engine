@@ -11,7 +11,9 @@ Outputs top-k signal candidates with weak scores to guide LLM adjudication.
 
 import json
 import logging
+import math
 import re
+from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -25,6 +27,89 @@ from app.domain.inference_models import SignalType
 from app.intelligence.hnsw_search import HNSWIndex, HNSWConfig, SearchResult
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Hybrid retrieval utilities — Reciprocal Rank Fusion + Query Expansion
+# ---------------------------------------------------------------------------
+
+
+def _rrf_merge(
+    ranked_lists: List[List[int]],
+    k: int = 60,
+) -> List[Tuple[int, float]]:
+    """Reciprocal Rank Fusion over multiple ranked document lists.
+
+    Merges any number of ranked lists (e.g. dense HNSW + sparse TF-IDF) into
+    a single unified ranking.  The RRF constant ``k=60`` is the value
+    recommended in Cormack et al. (2009) and empirically validated on a wide
+    range of retrieval benchmarks.
+
+    Formula::
+
+        score(d) = Σ_lists  1 / (rank(d, list) + k)
+
+    where ``rank`` is 1-indexed.  Documents appearing in more lists receive
+    additive boosts; documents appearing in only one list are never excluded.
+
+    Args:
+        ranked_lists: Each inner list contains document indices in rank order
+                      (most relevant first).  Lists may have different lengths.
+        k: RRF constant.  Higher values reduce the influence of top-ranked
+           documents; lower values amplify rank-1 boosts.
+
+    Returns:
+        List of ``(document_index, rrf_score)`` tuples sorted by score
+        descending.  Only documents that appear in at least one list are
+        included.
+    """
+    scores: Dict[int, float] = {}
+    for ranked in ranked_lists:
+        for rank, idx in enumerate(ranked, start=1):
+            scores[idx] = scores.get(idx, 0.0) + 1.0 / (rank + k)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def _expand_query_with_kb(
+    text: str,
+    entity_kb: Dict[str, Tuple[str, str]],
+    max_terms: int = 3,
+) -> str:
+    """Expand a query text with canonical names from the entity knowledge base.
+
+    Finds entity KB entries whose surface forms appear in *text* and appends
+    up to *max_terms* canonical names.  The expansion improves sparse-retrieval
+    recall for abbreviated or alias-form entity mentions (e.g. "MSFT" → expands
+    to include "Microsoft").
+
+    Privacy note: this function logs only at ``DEBUG`` level — never at
+    ``INFO`` or above — to avoid leaking PII contained in the query text.
+
+    Args:
+        text: The query text to expand (merged_text of a NormalizedObservation).
+        entity_kb: Mapping from lower-cased surface form to
+                   ``(canonical_id, canonical_name)`` pair.
+        max_terms: Maximum number of expansion terms to append.
+
+    Returns:
+        Original *text* with up to *max_terms* canonical names appended,
+        space-separated.  Returns *text* unchanged when no KB match is found.
+    """
+    lower_text = text.lower()
+    expansion: List[str] = []
+    for surface, (_, canonical_name) in entity_kb.items():
+        if surface in lower_text and canonical_name not in expansion:
+            expansion.append(canonical_name)
+            if len(expansion) >= max_terms:
+                break
+
+    if expansion:
+        logger.debug(
+            "RAG query expansion: appended %d KB term(s): %s",
+            len(expansion),
+            expansion,
+        )
+        return text + " " + " ".join(expansion)
+    return text
 
 # ---------------------------------------------------------------------------
 # Module-level compiled regex patterns for entity-based candidate detection.
@@ -159,29 +244,123 @@ class CandidateRetriever:
         )
     
     def _build_index(self) -> None:
-        """Build HNSW index from exemplar embeddings."""
+        """Build HNSW (dense) and TF-IDF (sparse) indices from exemplar data."""
         if not self.exemplar_bank:
             return
 
-        # Extract embeddings
+        # ── Dense: HNSW ──────────────────────────────────────────────────────
         embeddings = np.array([ex.embedding for ex in self.exemplar_bank])
-
-        # Build HNSW index with proper config
         config = HNSWConfig(
             dimension=len(embeddings[0]),
             max_elements=len(embeddings),
         )
         self.hnsw_index = HNSWIndex(config=config)
-
-        # Add exemplars to index
         for i, exemplar in enumerate(self.exemplar_bank):
-            # Use add_vector with string ID
-            self.hnsw_index.add_vector(
-                id=str(i),
-                vector=embeddings[i].tolist(),
-            )
+            self.hnsw_index.add_vector(id=str(i), vector=embeddings[i].tolist())
 
-        logger.info(f"Built HNSW index with {len(self.exemplar_bank)} exemplars")
+        # ── Sparse: TF-IDF ────────────────────────────────────────────────────
+        self._build_sparse_index()
+
+        logger.info(
+            "Built HNSW + TF-IDF hybrid index with %d exemplars",
+            len(self.exemplar_bank),
+        )
+
+    def _build_sparse_index(self) -> None:
+        """Build an in-memory TF-IDF index over exemplar texts for hybrid retrieval.
+
+        Stores:
+            self._sparse_vocab  — term → column index mapping.
+            self._sparse_matrix — list of per-document {col: tfidf} dicts.
+            self._doc_freq      — term → document frequency across all exemplars.
+        """
+        all_tokens: List[List[str]] = []
+        for ex in self.exemplar_bank:
+            toks = re.findall(r"[a-z0-9]+", ex.text.lower())
+            all_tokens.append(toks)
+
+        # Vocabulary
+        vocab: set = set()
+        for toks in all_tokens:
+            vocab.update(toks)
+        self._sparse_vocab: Dict[str, int] = {
+            term: idx for idx, term in enumerate(sorted(vocab))
+        }
+
+        # Document frequencies
+        self._doc_freq: Dict[str, int] = Counter()
+        for toks in all_tokens:
+            self._doc_freq.update(set(toks))
+
+        # TF-IDF per document (stored as sparse dict)
+        n_docs = len(all_tokens)
+        self._sparse_matrix: List[Dict[int, float]] = []
+        for toks in all_tokens:
+            tf = Counter(toks)
+            doc_len = len(toks)
+            row: Dict[int, float] = {}
+            for term, col in self._sparse_vocab.items():
+                if term in tf:
+                    term_tf = tf[term] / doc_len if doc_len else 0.0
+                    idf = math.log((1 + n_docs) / (1 + self._doc_freq[term]))
+                    val = term_tf * idf
+                    if val > 0:
+                        row[col] = val
+            self._sparse_matrix.append(row)
+
+        logger.debug(
+            "TF-IDF sparse index: %d terms, %d documents",
+            len(self._sparse_vocab),
+            n_docs,
+        )
+
+    def _sparse_search(self, query_text: str, k: int) -> List[int]:
+        """Return the top-k exemplar indices by TF-IDF cosine similarity.
+
+        Args:
+            query_text: Expanded query text (output of _expand_query_with_kb).
+            k: Maximum number of indices to return.
+
+        Returns:
+            List of exemplar indices sorted by descending cosine similarity.
+            Returns [] when the sparse index is not built or query is empty.
+        """
+        if not getattr(self, "_sparse_matrix", None):
+            return []
+
+        q_tokens = re.findall(r"[a-z0-9]+", query_text.lower())
+        if not q_tokens:
+            return []
+
+        n_docs = len(self._sparse_matrix)
+        q_tf = Counter(q_tokens)
+        q_len = len(q_tokens)
+
+        # Build query TF-IDF vector (sparse dict)
+        q_vec: Dict[int, float] = {}
+        for term, cnt in q_tf.items():
+            if term in self._sparse_vocab:
+                col = self._sparse_vocab[term]
+                idf = math.log(
+                    (1 + n_docs) / (1 + self._doc_freq.get(term, 0))
+                )
+                val = (cnt / q_len) * idf
+                if val > 0:
+                    q_vec[col] = val
+
+        if not q_vec:
+            return []
+
+        q_norm = math.sqrt(sum(v * v for v in q_vec.values()))
+        scores: List[Tuple[int, float]] = []
+        for doc_idx, doc_vec in enumerate(self._sparse_matrix):
+            dot = sum(q_vec.get(col, 0.0) * val for col, val in doc_vec.items())
+            d_norm = math.sqrt(sum(v * v for v in doc_vec.values()))
+            sim = dot / (q_norm * d_norm) if q_norm > 0 and d_norm > 0 else 0.0
+            scores.append((doc_idx, sim))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return [idx for idx, _ in scores[:k]]
     
     # ------------------------------------------------------------------
     # Persistence: exemplar bank
@@ -395,36 +574,88 @@ class CandidateRetriever:
     def _retrieve_by_embedding(
         self, observation: NormalizedObservation
     ) -> List[Tuple[SignalType, float, str]]:
-        """Retrieve candidates by embedding similarity.
+        """Hybrid retrieval: dense HNSW + sparse TF-IDF merged via RRF.
+
+        Combines:
+        1. Dense cosine similarity search via the HNSW index (observation embedding).
+        2. Sparse TF-IDF cosine similarity over exemplar texts, with the query
+           expanded by up to 3 entity KB terms for improved recall.
+        3. Reciprocal Rank Fusion (k=60) to merge both ranked lists into a
+           single ordering that captures complementary signals.
 
         Args:
-            observation: Normalized observation
+            observation: Normalized observation with an embedding vector.
 
         Returns:
-            List of (signal_type, score, reasoning) tuples
+            List of ``(signal_type, score, reasoning)`` tuples, most relevant
+            first, capped at ``self.top_k``.
         """
         if not observation.embedding or not self.hnsw_index:
             return []
 
-        # Search for nearest neighbors - returns List[SearchResult]
-        results = self.hnsw_index.search(
+        # ── 1. Dense HNSW retrieval ───────────────────────────────────────────
+        hnsw_results = self.hnsw_index.search(
             query_vector=observation.embedding,
-            k=self.top_k
+            k=self.top_k,
         )
+        dense_indices: List[int] = []
+        dense_scores: Dict[int, float] = {}
+        for result in hnsw_results:
+            try:
+                idx = int(result.id)
+                if idx < len(self.exemplar_bank):
+                    dense_indices.append(idx)
+                    dense_scores[idx] = max(0.0, min(1.0, 1.0 - result.distance))
+            except (ValueError, IndexError):
+                pass
 
-        # Convert to candidates
+        # ── 2. Sparse TF-IDF retrieval (query-expanded) ───────────────────────
+        query_text = observation.normalized_text or observation.title or ""
+        try:
+            from app.intelligence.normalization import _ENTITY_KB  # lazy import
+            entity_kb = _ENTITY_KB
+        except Exception:
+            from app.intelligence.normalization import _ENTITY_KB_FALLBACK
+            entity_kb = dict(_ENTITY_KB_FALLBACK)
+
+        expanded_text = _expand_query_with_kb(query_text, entity_kb)
+        sparse_indices = self._sparse_search(expanded_text, k=self.top_k)
+
+        # ── 3. RRF merge ──────────────────────────────────────────────────────
+        merged = _rrf_merge([dense_indices, sparse_indices])
+
+        # ── 4. Convert to (SignalType, score, reason) tuples ─────────────────
         candidates = []
-        for result in results:
-            # Parse ID back to index
+        for idx, rrf_score in merged[: self.top_k]:
+            if idx >= len(self.exemplar_bank):
+                continue
+            exemplar = self.exemplar_bank[idx]
+            dense_sim = dense_scores.get(idx, 0.0)
+            in_sparse = idx in sparse_indices
+            reason = (
+                f"Hybrid RRF (dense_sim={dense_sim:.2f}, sparse={'yes' if in_sparse else 'no'}): "
+                f"'{exemplar.text[:50]}...'"
+            )
+            candidates.append((
+                exemplar.signal_type,
+                max(0.0, min(1.0, rrf_score * 10)),  # scale RRF score to [0,1]
+                reason,
+            ))
+        return candidates
+
+        # ── Legacy fallback path (kept for compatibility) ─────────────────────
+        # This block is unreachable but preserved to document the prior API so
+        # that subclasses overriding _retrieve_by_embedding know the contract.
+        candidates = []
+        for result in hnsw_results:
             try:
                 idx = int(result.id)
                 if idx < len(self.exemplar_bank):
                     exemplar = self.exemplar_bank[idx]
-                    # Distance is already in [0, 1] for cosine, convert to similarity
                     similarity = 1.0 - result.distance
                     candidates.append((
                         exemplar.signal_type,
-                        max(0.0, min(1.0, similarity)),  # Clamp to [0, 1]
+                        max(0.0, min(1.0, similarity)),
                         f"Similar to exemplar: '{exemplar.text[:50]}...' (sim={similarity:.2f})"
                     ))
             except (ValueError, IndexError) as e:

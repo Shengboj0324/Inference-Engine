@@ -281,6 +281,25 @@ class ConnectorRegistry:
             #    TikTok ``play_count``, etc.) to a single canonical field so
             #    the filter never reads a stale or missing key.
             normalize_engagement(raw.platform_metadata, raw.source_platform)
+
+            # 3. Multimodal enrichment — when the observation contains image
+            #    or video metadata keys AND multimodal_enabled=True in the
+            #    user's StrategicPriorities, append a RAG-ready visual
+            #    description to raw_text before the 8-stage noise filter runs.
+            _sp = priorities or StrategicPriorities()
+            if _sp.multimodal_enabled:
+                try:
+                    from app.intelligence.multimodal import MultimodalAnalyzer
+                    _mm = MultimodalAnalyzer()
+                    if _mm.has_visual_content(raw):
+                        visual_text = _mm.visual_to_text(raw)
+                        if visual_text:
+                            raw.raw_text = (raw.raw_text or "") + " " + visual_text
+                except Exception as _mm_exc:
+                    logger.debug(
+                        "AcquisitionFilter: multimodal enrichment failed: %s",
+                        _mm_exc,
+                    )
             # ────────────────────────────────────────────────────────────────
 
             ok, _ = nf.filter(raw, priorities)
