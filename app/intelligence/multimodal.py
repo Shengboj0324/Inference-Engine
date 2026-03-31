@@ -30,12 +30,269 @@ Design for production
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Dict, List, Optional, TypedDict
 
 from app.domain.raw_models import RawObservation
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _url_stub_slot(url: str, n_slots: int) -> int:
+    """Return a deterministic slot index in ``[0, n_slots)`` for a URL.
+
+    Uses the first 8 hex characters of the SHA-256 digest so the result is
+    identical across Python sessions regardless of ``PYTHONHASHSEED``.
+    SHA-256 is used here purely as a deterministic hash, not for security.
+    """
+    digest = hashlib.sha256(url.encode()).hexdigest()
+    return int(digest[:8], 16) % n_slots
+
+
+# ---------------------------------------------------------------------------
+# Deterministic stub data  (5 image slots · 3 video slots)
+#
+# Each slot is designed around a distinct real-world ingestion scenario so
+# that different fixture URLs resolve to meaningfully different stub outputs,
+# making quality tests more diverse without requiring a live vision API.
+# ---------------------------------------------------------------------------
+
+_IMAGE_STUBS: List[Dict[str, Any]] = [
+    {   # Slot 0 — product review / unboxing
+        "caption": (
+            "A high-quality consumer product photograph showing merchandise "
+            "arranged for a detailed review on a neutral studio background "
+            "with professional lighting and clear brand labeling."
+        ),
+        "caption_confidence": 0.88,
+        "entities": [
+            {"name": "consumer product", "type": "object", "confidence": 0.85},
+            {"name": "brand packaging",  "type": "brand",  "confidence": 0.78},
+        ],
+        "sentiment": "positive",
+        "sentiment_confidence": 0.82,
+        "sentiment_justification": (
+            "clean product presentation, bright studio lighting, and intentional "
+            "brand placement suggesting a promotional or review context"
+        ),
+        "signal_hint": "BRAND_SENTIMENT or FEATURE_REQUEST",
+    },
+    {   # Slot 1 — complaint / error screenshot
+        "caption": (
+            "A mobile device screenshot capturing an application error dialog "
+            "with red warning indicators and a truncated system error message "
+            "displayed in white text on a dark background."
+        ),
+        "caption_confidence": 0.91,
+        "entities": [
+            {"name": "error dialog",       "type": "ui_element", "confidence": 0.92},
+            {"name": "mobile application", "type": "software",   "confidence": 0.80},
+        ],
+        "sentiment": "negative",
+        "sentiment_confidence": 0.88,
+        "sentiment_justification": (
+            "prominent error indicators, warning color palette, and visible "
+            "user-frustration signals in the captured interface state"
+        ),
+        "signal_hint": "COMPLAINT or CHURN_RISK",
+    },
+    {   # Slot 2 — feature announcement / product launch
+        "caption": (
+            "A corporate product announcement slide showcasing new software "
+            "capabilities on a large presentation screen at a well-attended "
+            "industry conference with branding prominently displayed overhead."
+        ),
+        "caption_confidence": 0.87,
+        "entities": [
+            {"name": "product feature",    "type": "software", "confidence": 0.87},
+            {"name": "conference audience","type": "group",    "confidence": 0.72},
+        ],
+        "sentiment": "positive",
+        "sentiment_confidence": 0.90,
+        "sentiment_justification": (
+            "polished presentation design, enthusiastic audience positioning, "
+            "and aspirational brand messaging typical of launch events"
+        ),
+        "signal_hint": "FEATURE_REQUEST or BRAND_SENTIMENT",
+    },
+    {   # Slot 3 — competitor brand / storefront
+        "caption": (
+            "A wide-angle photograph of a competitor company storefront with "
+            "large illuminated signage and brand logo displayed at street level "
+            "in a busy commercial district during daytime business hours."
+        ),
+        "caption_confidence": 0.84,
+        "entities": [
+            {"name": "competitor storefront", "type": "brand",    "confidence": 0.93},
+            {"name": "commercial district",   "type": "location", "confidence": 0.75},
+        ],
+        "sentiment": "neutral",
+        "sentiment_confidence": 0.75,
+        "sentiment_justification": (
+            "neutral corporate visual language with standard brand presentation "
+            "and no explicit positive or negative sentiment markers in the frame"
+        ),
+        "signal_hint": "COMPETITOR_ACTIVITY or BRAND_SENTIMENT",
+    },
+    {   # Slot 4 — news / editorial
+        "caption": (
+            "An editorial news photograph depicting industry professionals "
+            "engaged in discussion at a media event, surrounded by camera "
+            "equipment and branded event signage indicating a press briefing."
+        ),
+        "caption_confidence": 0.83,
+        "entities": [
+            {"name": "industry professionals", "type": "group", "confidence": 0.83},
+            {"name": "press event",            "type": "event", "confidence": 0.77},
+        ],
+        "sentiment": "neutral",
+        "sentiment_confidence": 0.79,
+        "sentiment_justification": (
+            "formal professional context with balanced visual composition "
+            "and informational framing consistent with editorial content"
+        ),
+        "signal_hint": "MARKET_TREND or BRAND_SENTIMENT",
+    },
+]
+
+_VIDEO_STUBS: List[Dict[str, Any]] = [
+    {   # Slot 0 — product demo / unboxing video
+        "scenes": [
+            {
+                "ts": 0,
+                "desc": (
+                    "Opening product unboxing sequence with brand packaging "
+                    "visible and upbeat background music setting an engaging tone."
+                ),
+            },
+            {
+                "ts": 14,
+                "desc": (
+                    "Close-up demonstration of key product features with clear "
+                    "voiceover narration highlighting specifications and user benefits."
+                ),
+            },
+            {
+                "ts": 32,
+                "desc": (
+                    "Satisfied customer testimonial segment showing product "
+                    "interaction in a natural home environment with authentic reactions."
+                ),
+            },
+        ],
+        "transcript": (
+            "Welcome to this product review. Today we are looking at the latest "
+            "release from the brand, which has been receiving significant attention "
+            "online. The build quality is impressive and the feature set aligns well "
+            "with what users have been requesting. The setup process was "
+            "straightforward and daily-use performance has been consistently reliable."
+        ),
+        "entities": [
+            {"name": "product brand",    "type": "brand",  "confidence": 0.88},
+            {"name": "product reviewer", "type": "person", "confidence": 0.82},
+        ],
+        "sentiment": "positive",
+        "sentiment_confidence": 0.85,
+        "sentiment_justification": (
+            "upbeat audio cues, enthusiastic presenter delivery, and consistently "
+            "positive product framing throughout the demonstration segments"
+        ),
+        "signal_hint": "BRAND_SENTIMENT or FEATURE_REQUEST",
+    },
+    {   # Slot 1 — news broadcast / editorial clip
+        "scenes": [
+            {
+                "ts": 0,
+                "desc": (
+                    "News anchor presenting a breaking industry story with graphics "
+                    "overlay showing relevant market statistics and trend charts."
+                ),
+            },
+            {
+                "ts": 22,
+                "desc": (
+                    "Field reporter conducting a live interview with a company "
+                    "spokesperson outside corporate headquarters about recent developments."
+                ),
+            },
+            {
+                "ts": 48,
+                "desc": (
+                    "Expert panel analysis segment discussing market implications "
+                    "and consumer impact of the breaking news story at hand."
+                ),
+            },
+        ],
+        "transcript": (
+            "In today's business news, a major company has announced significant "
+            "changes to its product lineup following sustained pressure from consumers "
+            "and investors. Our correspondent has been following this story closely. "
+            "Industry analysts suggest this announcement could signal a broader shift "
+            "in the competitive landscape for the coming quarters."
+        ),
+        "entities": [
+            {"name": "news anchor",           "type": "person",   "confidence": 0.90},
+            {"name": "corporate spokesperson","type": "person",   "confidence": 0.78},
+            {"name": "company headquarters",  "type": "location", "confidence": 0.72},
+        ],
+        "sentiment": "neutral",
+        "sentiment_confidence": 0.76,
+        "sentiment_justification": (
+            "objective journalistic tone, balanced expert commentary, and neutral "
+            "visual presentation style consistent with editorial broadcast content"
+        ),
+        "signal_hint": "MARKET_TREND or COMPETITOR_ACTIVITY",
+    },
+    {   # Slot 2 — short-form social / creator content
+        "scenes": [
+            {
+                "ts": 0,
+                "desc": (
+                    "Content creator introduction in front of ring-lit background "
+                    "sharing personal experience with a recently purchased product."
+                ),
+            },
+            {
+                "ts": 9,
+                "desc": (
+                    "Screen recording demonstration segment highlighting a specific "
+                    "product feature or pain point discovered during extended use."
+                ),
+            },
+            {
+                "ts": 21,
+                "desc": (
+                    "Call-to-action and community engagement prompt with branded "
+                    "text overlay and relevant hashtags clearly visible on screen."
+                ),
+            },
+        ],
+        "transcript": (
+            "Hey everyone, sharing my honest thoughts after two weeks with this "
+            "product. The initial setup had some friction but once configured the "
+            "performance has been genuinely impressive. Battery life exceeded "
+            "expectations and the build feels premium for the price point. Would "
+            "recommend keeping an eye on the software update cadence before buying."
+        ),
+        "entities": [
+            {"name": "content creator", "type": "person", "confidence": 0.85},
+            {"name": "reviewed product","type": "object", "confidence": 0.80},
+            {"name": "consumer audience","type": "group", "confidence": 0.70},
+        ],
+        "sentiment": "positive",
+        "sentiment_confidence": 0.72,
+        "sentiment_justification": (
+            "conversational authentic tone with balanced feedback resolving to "
+            "a positive overall recommendation and genuine user enthusiasm"
+        ),
+        "signal_hint": "BRAND_SENTIMENT or COMPLAINT",
+    },
+]
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +482,7 @@ class MultimodalAnalyzer:
                 parts.append(self._video_to_paragraph(result, observation))
                 break
 
-        return " ".join(p for p in parts if p)
+        return "\n\n".join(p for p in parts if p)
 
     def has_visual_content(self, observation: RawObservation) -> bool:
         """Return ``True`` when the observation has image or video metadata."""
@@ -238,36 +495,44 @@ class MultimodalAnalyzer:
     # ── Private stub factories ────────────────────────────────────────────────
 
     def _stub_image_result(self, url: str) -> ImageAnalysisResult:
+        """Return a URL-hash–selected stub that meets the production quality bar.
+
+        Different URLs deterministically map to different scenario slots so
+        that a suite of real-URL fixtures exercises diverse stub outputs while
+        remaining fully deterministic across test runs.
+        """
+        s = _IMAGE_STUBS[_url_stub_slot(url, len(_IMAGE_STUBS))]
         return ImageAnalysisResult(
             caption=FieldConfidence(
-                value="An image depicting content from a social media post.",
-                confidence=0.75,
+                value=s["caption"],
+                confidence=s["caption_confidence"],
             ),
-            entities=[
-                {"name": "unidentified subject", "type": "object", "confidence": 0.6}
-            ],
-            sentiment=FieldConfidence(value="neutral", confidence=0.8),
+            entities=s["entities"],
+            sentiment=FieldConfidence(
+                value=s["sentiment"],
+                confidence=s["sentiment_confidence"],
+            ),
             source_url=url,
             model=self.model_name,
         )
 
     def _stub_video_result(self, url: str) -> VideoAnalysisResult:
+        """Return a URL-hash–selected video stub with rich transcript and scenes."""
+        s = _VIDEO_STUBS[_url_stub_slot(url, len(_VIDEO_STUBS))]
         return VideoAnalysisResult(
             scenes=[
                 SceneSummary(
-                    timestamp_seconds=0,
-                    description="Opening scene depicting the main subject.",
-                ),
-                SceneSummary(
-                    timestamp_seconds=30,
-                    description="Mid-section showing key content detail.",
-                ),
+                    timestamp_seconds=scene["ts"],
+                    description=scene["desc"],
+                )
+                for scene in s["scenes"]
             ],
-            transcript="[Transcript not available in stub mode]",
-            entities=[
-                {"name": "unidentified speaker", "type": "person", "confidence": 0.5}
-            ],
-            sentiment=FieldConfidence(value="neutral", confidence=0.7),
+            transcript=s["transcript"],
+            entities=s["entities"],
+            sentiment=FieldConfidence(
+                value=s["sentiment"],
+                confidence=s["sentiment_confidence"],
+            ),
             source_url=url,
             model=self.model_name,
         )
@@ -310,29 +575,101 @@ class MultimodalAnalyzer:
         )
 
     # ── Private paragraph formatters ──────────────────────────────────────────
+    #
+    # Output format (Step 5 spec):
+    #   • 3–5 sentences each on its own line
+    #   • 60–200 words total
+    #   • Specificity: named entity present
+    #   • Sentiment attribution with brief justification
+    #   • Signal hint (most likely SignalType)
+    #   • Source attribution (platform + URL)
+    # ──────────────────────────────────────────────────────────────────────────
 
     def _attribution(self, obs: RawObservation) -> str:
         platform = obs.source_platform.value
         return f"{platform} — {obs.source_url}" if obs.source_url else platform
 
+    def _infer_signal_hint(
+        self, entities: List[Dict[str, Any]], sentiment: str
+    ) -> str:
+        """Derive the most likely SignalType hint from entity types and sentiment."""
+        types = {e.get("type", "").lower() for e in entities}
+        if "ui_element" in types or ("software" in types and sentiment == "negative"):
+            return "COMPLAINT or FEATURE_REQUEST"
+        if "brand" in types or "logo" in types:
+            return (
+                "COMPLAINT or COMPETITOR_ACTIVITY"
+                if sentiment == "negative"
+                else "BRAND_SENTIMENT or COMPETITOR_ACTIVITY"
+            )
+        if "event" in types:
+            return "MARKET_TREND or BRAND_SENTIMENT"
+        if "person" in types:
+            return (
+                "COMPLAINT or CHURN_RISK"
+                if sentiment == "negative"
+                else "BRAND_SENTIMENT or MARKET_TREND"
+            )
+        return "COMPLAINT or CHURN_RISK" if sentiment == "negative" else "BRAND_SENTIMENT or MARKET_TREND"
+
+    def _describe_sentiment(self, sentiment: str, entity_names: str) -> str:
+        """Return a one-phrase sentiment justification for the paragraph."""
+        if sentiment == "positive":
+            return (
+                f"warm visual tone, bright composition, and positive engagement "
+                f"signals associated with {entity_names}"
+            )
+        if sentiment == "negative":
+            return (
+                f"concerning visual indicators, distress signals, and negative "
+                f"markers associated with {entity_names}"
+            )
+        return (
+            f"balanced, objective visual presentation with neutral framing "
+            f"around {entity_names}"
+        )
+
     def _image_to_paragraph(
         self, result: ImageAnalysisResult, obs: RawObservation
     ) -> str:
+        """Format an ImageAnalysisResult as a 5-sentence RAG-ready paragraph.
+
+        Line structure:
+          1. [Image content] <caption>
+          2. Detected entities: <names>.
+          3. Visual sentiment: <polarity> — <justification>.
+          4. This image may indicate a <SIGNAL_TYPE> signal.
+          5. Source: <platform> — <url>.
+        """
         caption = result["caption"]["value"]
         sentiment = result["sentiment"]["value"]
         entity_names = ", ".join(
             e.get("name", "") for e in result["entities"] if e.get("name")
         ) or "none detected"
-        return (
-            f"[Image content] {caption} "
-            f"Detected entities: {entity_names}. "
-            f"Visual sentiment: {sentiment}. "
-            f"Source: {self._attribution(obs)}."
-        )
+        signal_hint = self._infer_signal_hint(result["entities"], sentiment)
+        sentiment_just = self._describe_sentiment(sentiment, entity_names)
+        lines = [
+            f"[Image content] {caption}",
+            f"Detected entities: {entity_names}.",
+            f"Visual sentiment: {sentiment} — {sentiment_just}.",
+            f"This image may indicate a {signal_hint} signal.",
+            f"Source: {self._attribution(obs)}.",
+        ]
+        return "\n".join(lines)
 
     def _video_to_paragraph(
         self, result: VideoAnalysisResult, obs: RawObservation
     ) -> str:
+        """Format a VideoAnalysisResult as a 6-sentence RAG-ready paragraph.
+
+        Line structure:
+          1. [Video content] Scenes: @<t>s: <desc>; …
+          2. Transcript excerpt: <first 200 chars>.
+          3. Key entities: <names>.
+          4. Overall sentiment: <polarity> — <justification>.
+          5. This video may indicate a <SIGNAL_TYPE> signal.
+          6. Source: <platform> — <url>.
+        """
         scenes_text = "; ".join(
             f"@{s['timestamp_seconds']}s: {s['description']}"
             for s in result["scenes"]
@@ -341,12 +678,16 @@ class MultimodalAnalyzer:
         entity_names = ", ".join(
             e.get("name", "") for e in result["entities"] if e.get("name")
         ) or "none detected"
-        transcript_snippet = result["transcript"][:200]
-        return (
-            f"[Video content] Scenes: {scenes_text}. "
-            f"Transcript excerpt: {transcript_snippet}. "
-            f"Key entities: {entity_names}. "
-            f"Overall sentiment: {sentiment}. "
-            f"Source: {self._attribution(obs)}."
-        )
+        signal_hint = self._infer_signal_hint(result["entities"], sentiment)
+        sentiment_just = self._describe_sentiment(sentiment, entity_names)
+        transcript_snippet = result["transcript"][:200].rstrip()
+        lines = [
+            f"[Video content] Scenes: {scenes_text}.",
+            f"Transcript excerpt: {transcript_snippet}.",
+            f"Key entities: {entity_names}.",
+            f"Overall sentiment: {sentiment} — {sentiment_just}.",
+            f"This video may indicate a {signal_hint} signal.",
+            f"Source: {self._attribution(obs)}.",
+        ]
+        return "\n".join(lines)
 
