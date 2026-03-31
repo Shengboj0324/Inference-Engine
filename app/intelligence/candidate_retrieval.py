@@ -891,13 +891,17 @@ class ExemplarBank:
         Dispatches ``add()`` to the default thread-pool executor so the await
         returns quickly even if eviction sorting is required.
 
+        Uses ``asyncio.get_running_loop()`` (Python 3.7+) rather than the
+        deprecated ``asyncio.get_event_loop()`` to guarantee we operate on the
+        loop that is actually running this coroutine.
+
         Args:
             exemplar: Exemplar signal to store.
             confidence: Calibrated probability.
         """
         import asyncio
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.add, exemplar, confidence)
 
     def get_for_signal_type(
