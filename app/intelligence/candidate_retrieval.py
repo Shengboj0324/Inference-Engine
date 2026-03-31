@@ -64,6 +64,8 @@ def _rrf_merge(
     """
     scores: Dict[int, float] = {}
     for ranked in ranked_lists:
+        if ranked is None:  # guard: callers must not pass None, but be defensive
+            continue
         for rank, idx in enumerate(ranked, start=1):
             scores[idx] = scores.get(idx, 0.0) + 1.0 / (rank + k)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
@@ -96,7 +98,14 @@ def _expand_query_with_kb(
     """
     lower_text = text.lower()
     expansion: List[str] = []
-    for surface, (_, canonical_name) in entity_kb.items():
+    for surface, value in entity_kb.items():
+        # Guard against malformed KB entries (e.g. loaded from an external JSON
+        # file where a value might be a plain string, None, or a tuple of wrong
+        # arity).  Skip silently so one bad entry never blocks the whole batch.
+        try:
+            _, canonical_name = value
+        except (TypeError, ValueError):
+            continue
         if surface in lower_text and canonical_name not in expansion:
             expansion.append(canonical_name)
             if len(expansion) >= max_terms:
@@ -615,8 +624,10 @@ class CandidateRetriever:
             from app.intelligence.normalization import _ENTITY_KB  # lazy import
             entity_kb = _ENTITY_KB
         except Exception:
-            from app.intelligence.normalization import _ENTITY_KB_FALLBACK
-            entity_kb = dict(_ENTITY_KB_FALLBACK)
+            # Normalization module unavailable (e.g. circular import in tests).
+            # Use an empty KB — query expansion is purely additive, so skipping
+            # it never degrades correctness, only slightly reduces recall.
+            entity_kb = {}
 
         expanded_text = _expand_query_with_kb(query_text, entity_kb)
         sparse_indices = self._sparse_search(expanded_text, k=self.top_k)
@@ -641,27 +652,6 @@ class CandidateRetriever:
                 max(0.0, min(1.0, rrf_score * 10)),  # scale RRF score to [0,1]
                 reason,
             ))
-        return candidates
-
-        # ── Legacy fallback path (kept for compatibility) ─────────────────────
-        # This block is unreachable but preserved to document the prior API so
-        # that subclasses overriding _retrieve_by_embedding know the contract.
-        candidates = []
-        for result in hnsw_results:
-            try:
-                idx = int(result.id)
-                if idx < len(self.exemplar_bank):
-                    exemplar = self.exemplar_bank[idx]
-                    similarity = 1.0 - result.distance
-                    candidates.append((
-                        exemplar.signal_type,
-                        max(0.0, min(1.0, similarity)),
-                        f"Similar to exemplar: '{exemplar.text[:50]}...' (sim={similarity:.2f})"
-                    ))
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Failed to parse search result: {e}")
-                continue
-
         return candidates
 
     def _retrieve_by_entities(

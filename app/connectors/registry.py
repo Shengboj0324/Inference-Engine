@@ -247,6 +247,24 @@ class ConnectorRegistry:
 
         nf = noise_filter or AcquisitionNoiseFilter()
 
+        # ── Hoist per-batch constants outside the per-item loop ──────────────
+        # `priorities` never changes between iterations; computing `_sp` and
+        # constructing `MultimodalAnalyzer` once avoids 500× object allocation
+        # in large batches and makes patching in tests straightforward.
+        _sp = priorities or StrategicPriorities()
+        _mm_analyzer = None
+        if _sp.multimodal_enabled:
+            try:
+                from app.intelligence.multimodal import MultimodalAnalyzer
+                _mm_analyzer = MultimodalAnalyzer()
+            except Exception as _mm_init_exc:
+                logger.debug(
+                    "AcquisitionFilter: MultimodalAnalyzer init failed; "
+                    "multimodal enrichment disabled for this batch: %s",
+                    _mm_init_exc,
+                )
+        # ─────────────────────────────────────────────────────────────────────
+
         # Wrap ContentItems into RawObservation shells for the filter
         accepted_items = []
         dropped = 0
@@ -286,13 +304,11 @@ class ConnectorRegistry:
             #    or video metadata keys AND multimodal_enabled=True in the
             #    user's StrategicPriorities, append a RAG-ready visual
             #    description to raw_text before the 8-stage noise filter runs.
-            _sp = priorities or StrategicPriorities()
-            if _sp.multimodal_enabled:
+            #    (_mm_analyzer is pre-built once per batch above the loop.)
+            if _mm_analyzer is not None:
                 try:
-                    from app.intelligence.multimodal import MultimodalAnalyzer
-                    _mm = MultimodalAnalyzer()
-                    if _mm.has_visual_content(raw):
-                        visual_text = _mm.visual_to_text(raw)
+                    if _mm_analyzer.has_visual_content(raw):
+                        visual_text = _mm_analyzer.visual_to_text(raw)
                         if visual_text:
                             raw.raw_text = (raw.raw_text or "") + " " + visual_text
                 except Exception as _mm_exc:

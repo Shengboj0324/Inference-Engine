@@ -253,7 +253,16 @@ class InferencePipeline:
         # Stage 5b: Populate ResponseArtifacts
         # Attach source citations for RAG pool docs, image/video URLs from
         # platform_metadata, and document links for news-connector sources.
-        self._populate_artifacts(raw_observation, normalized, reranked_pool, inference)
+        # Wrapped in try/except because artifact population is a value-add step
+        # and must never crash the pipeline even on unexpected Pydantic errors.
+        try:
+            self._populate_artifacts(raw_observation, normalized, reranked_pool, inference)
+        except Exception as _art_exc:
+            logger.warning(
+                "InferencePipeline: artifact population failed (obs=%s): %s",
+                raw_observation.id,
+                _art_exc,
+            )
 
         # Stage 6: Publish to Redis for WebSocket broadcast (non-blocking)
         if not inference.abstained and raw_observation.user_id:
