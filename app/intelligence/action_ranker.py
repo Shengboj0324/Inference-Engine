@@ -11,8 +11,11 @@ Combines multiple signals to produce a calibrated priority score.
 
 import json
 import logging
+import threading
+import time
+from collections import deque
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Deque, List, Dict, Optional, Set
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
@@ -26,6 +29,115 @@ logger = logging.getLogger(__name__)
 
 #: Default path for the ``RankerConfig`` JSON file.
 _DEFAULT_RANKER_CONFIG_PATH: Path = Path("training/ranker_config.json")
+
+# ---------------------------------------------------------------------------
+# TrendTracker — cross-user signal-type rate monitor (Step 3c)
+# ---------------------------------------------------------------------------
+
+#: Urgency boost applied to trending signal types (clamped to 1.0 after).
+_TREND_URGENCY_BOOST: float = 0.15
+#: Multiplier threshold: if last-24h rate ≥ multiplier × 7-day daily average,
+#: the signal type is declared TRENDING.
+_TREND_MULTIPLIER: float = 3.0
+#: Observation window for "current rate" (seconds = 24 h).
+_TREND_CURRENT_WINDOW_S: float = 86_400.0
+#: Rolling baseline window (seconds = 7 days).
+_TREND_BASELINE_WINDOW_S: float = 7 * 86_400.0
+
+
+class TrendTracker:
+    """Thread-safe monitor that detects when a ``SignalType`` is trending.
+
+    Records a monotonic timestamp each time a signal type is classified by any
+    user.  Declares a type **TRENDING** when its count in the last 24 hours is
+    ≥ ``_TREND_MULTIPLIER`` × its 7-day rolling daily average.
+
+    All public methods are thread-safe via a single ``threading.Lock``.
+    """
+
+    def __init__(self) -> None:
+        """Initialise an empty tracker."""
+        # signal_type.value → deque of float timestamps (monotonic seconds)
+        self._timestamps: Dict[str, Deque[float]] = {}
+        self._lock: threading.Lock = threading.Lock()
+
+    def record(self, signal_type: SignalType) -> None:
+        """Record a new occurrence of ``signal_type`` at the current time.
+
+        Thread-safe.  Old timestamps (> 7 days) are pruned on each record call
+        to keep memory bounded.
+
+        Args:
+            signal_type: Signal type that was just classified.
+        """
+        key = signal_type.value
+        now = time.monotonic()
+        cutoff = now - _TREND_BASELINE_WINDOW_S
+        with self._lock:
+            if key not in self._timestamps:
+                self._timestamps[key] = deque()
+            ts = self._timestamps[key]
+            ts.append(now)
+            # Prune entries older than the baseline window
+            while ts and ts[0] < cutoff:
+                ts.popleft()
+
+    def is_trending(
+        self,
+        signal_type: SignalType,
+        multiplier: float = _TREND_MULTIPLIER,
+    ) -> bool:
+        """Return ``True`` if ``signal_type`` is currently trending.
+
+        A type is trending when its count in the last 24 hours is ≥
+        ``multiplier`` × its 7-day rolling daily average count.
+
+        Args:
+            signal_type: Signal type to test.
+            multiplier: Trending multiplier threshold (default 3.0).
+
+        Returns:
+            ``True`` if trending, ``False`` otherwise.
+        """
+        key = signal_type.value
+        now = time.monotonic()
+        cutoff_24h = now - _TREND_CURRENT_WINDOW_S
+        cutoff_7d = now - _TREND_BASELINE_WINDOW_S
+        with self._lock:
+            ts = self._timestamps.get(key, deque())
+            count_24h = sum(1 for t in ts if t >= cutoff_24h)
+            count_7d = sum(1 for t in ts if t >= cutoff_7d)
+        if count_7d == 0:
+            return False
+        avg_per_day_7d = count_7d / 7.0
+        return count_24h >= multiplier * avg_per_day_7d
+
+    def get_trending_types(
+        self, multiplier: float = _TREND_MULTIPLIER
+    ) -> Set[str]:
+        """Return the set of ``SignalType.value`` strings that are currently trending.
+
+        Args:
+            multiplier: Trending multiplier threshold.
+
+        Returns:
+            Set of signal type value strings.
+        """
+        with self._lock:
+            keys = list(self._timestamps.keys())
+        return {
+            k for k in keys
+            if self.is_trending(SignalType(k), multiplier)
+        }
+
+    def clear(self) -> None:
+        """Remove all recorded timestamps (used in tests)."""
+        with self._lock:
+            self._timestamps.clear()
+
+
+#: Module-level singleton shared across all pipeline instances.
+_GLOBAL_TREND_TRACKER: TrendTracker = TrendTracker()
 
 
 class RankerConfig(BaseModel):
@@ -300,26 +412,48 @@ class ActionRanker:
         self,
         inference: SignalInference,
         observation: NormalizedObservation,
+        signal_type_weights: Optional[Dict[str, float]] = None,
+        trending_types: Optional[Set[str]] = None,
     ) -> Optional[ActionableSignal]:
-        """Rank a signal inference and create actionable signal if worthy.
-        
+        """Rank a signal inference and create an actionable signal if worthy.
+
+        Extends the base scoring with two personalisation/collective levers:
+
+        * **Per-user signal-type weight vector** — ``signal_type_weights`` maps
+          ``SignalType.value`` → float in ``[0.0, 1.0]``.  The computed
+          ``priority_score`` is multiplied by this weight so that signal types
+          the user has frequently dismissed (weight close to 0) rise less often
+          in their dashboard.
+
+        * **Trending signal amplification** — if the inference's ``signal_type``
+          appears in ``trending_types`` (from ``TrendTracker.get_trending_types()``),
+          the ``urgency_score`` receives a ``+_TREND_URGENCY_BOOST`` boost
+          (clamped to 1.0) before the weighted sum is computed, and
+          ``inference_metadata["trending"]`` is set to ``True``.
+
         Args:
-            inference: Signal inference from Phase 2
-            observation: Normalized observation
-            
+            inference: Calibrated signal inference from Phase 2.
+            observation: Normalised observation.
+            signal_type_weights: Optional per-user weight vector sourced from
+                ``ContextMemoryStore.get_signal_type_weights()``.  ``None``
+                means "no personalisation" (equivalent to all weights = 1.0).
+            trending_types: Set of ``SignalType.value`` strings declared
+                TRENDING by ``TrendTracker.get_trending_types()``.  ``None``
+                skips trending amplification.
+
         Returns:
-            ActionableSignal if worthy of action, None otherwise
+            ``ActionableSignal`` if the signal is worthy of action, else ``None``.
         """
         # Check if inference is abstained
         if inference.abstained:
             logger.debug(f"Skipping abstained inference {inference.id}")
             return None
-        
+
         # Check if confidence meets threshold
         if not inference.top_prediction:
             logger.debug(f"No top prediction for inference {inference.id}")
             return None
-        
+
         if inference.top_prediction.probability < self.config.min_confidence_threshold:
             logger.debug(
                 "Confidence %.2f below threshold %.2f",
@@ -328,10 +462,21 @@ class ActionRanker:
             )
             return None
 
+        st_value = inference.top_prediction.signal_type.value
+
+        # ── Trend amplification (Step 3c) ─────────────────────────────────────
+        is_trending = trending_types is not None and st_value in trending_types
+        if is_trending:
+            inference.inference_metadata["trending"] = True
+
         # Compute scores
         opportunity_score = self._compute_opportunity_score(inference, observation)
         urgency_score = self._compute_urgency_score(inference, observation)
         risk_score = self._compute_risk_score(inference, observation)
+
+        # Apply trending urgency boost BEFORE weighted sum
+        if is_trending:
+            urgency_score = min(1.0, urgency_score + _TREND_URGENCY_BOOST)
 
         # Compute overall priority score
         priority_score = (
@@ -339,13 +484,18 @@ class ActionRanker:
             + self.config.urgency_weight * urgency_score
             + self.config.risk_weight * risk_score
         )
-        
+
+        # ── Per-user signal-type weight (Step 2b) ────────────────────────────
+        if signal_type_weights:
+            user_weight = signal_type_weights.get(st_value, 1.0)
+            priority_score = float(max(0.0, min(1.0, priority_score * user_weight)))
+
         # Determine priority level
         priority = self._determine_priority_level(priority_score)
-        
+
         # Determine recommended channel
         recommended_channel = self._determine_channel(inference, observation)
-        
+
         # Create actionable signal
         action = ActionableSignal(
             signal_inference_id=inference.id,
@@ -361,14 +511,19 @@ class ActionRanker:
             recommended_channel=recommended_channel,
             status=ActionStatus.NEW,
         )
-        
+
         logger.info(
-            f"Created action {action.id}: "
-            f"type={action.signal_type.value}, "
-            f"priority={priority.value}, "
-            f"score={priority_score:.2f}"
+            "Created action %s: type=%s priority=%s score=%.2f"
+            "%s%s",
+            action.id,
+            action.signal_type.value,
+            priority.value,
+            priority_score,
+            " [TRENDING]" if is_trending else "",
+            f" [weight={signal_type_weights.get(st_value, 1.0):.2f}]"
+            if signal_type_weights else "",
         )
-        
+
         return action
     
     def rank_batch(

@@ -13,11 +13,13 @@ This is the main entry point for the Phase 2 inference system.
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 from uuid import UUID
 
+import numpy as np
 import redis.asyncio as aioredis
 
 from app.domain.raw_models import RawObservation
@@ -25,7 +27,11 @@ from app.domain.normalized_models import NormalizedObservation
 from app.domain.inference_models import SignalInference, UserContext
 from app.core.models import PlatformAuthStatus
 from app.intelligence.normalization import NormalizationEngine
-from app.intelligence.candidate_retrieval import CandidateRetriever
+from app.intelligence.candidate_retrieval import (
+    CandidateRetriever,
+    ExemplarSignal,
+    _GLOBAL_EXEMPLAR_BANK,
+)
 from app.intelligence.llm_adjudicator import LLMAdjudicator
 from app.intelligence.calibration import Calibrator, ConfidenceCalibrator
 from app.intelligence.abstention import AbstentionDecider
@@ -34,6 +40,13 @@ from app.intelligence.orchestrator import MultiAgentOrchestrator
 from app.intelligence.context_memory import ContextMemoryStore
 from app.intelligence.deliberation import DeliberationEngine
 from app.intelligence.reranker import Reranker
+from app.intelligence.action_ranker import _GLOBAL_TREND_TRACKER
+
+#: Minimum probability for an inference to be written to the ExemplarBank.
+_EXEMPLAR_MIN_PROB: float = 0.85
+#: Cosine distance threshold above which a re-ingested source is treated as a
+#: new signal (Step 4c signal drift detection).
+_DRIFT_THRESHOLD: float = 0.3
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +169,11 @@ class InferencePipeline:
         self.reranker: Optional[Reranker] = reranker
         self.rag_document_pool: List[NormalizedObservation] = rag_document_pool or []
 
+        # Store context_memory directly on the pipeline (in addition to being
+        # passed to LLMAdjudicator) so run() can read preference vectors and
+        # store source embeddings for drift detection.
+        self._context_memory_store: Optional[ContextMemoryStore] = context_memory
+
         logger.info("InferencePipeline initialized with all components")
     
     async def run(
@@ -188,6 +206,36 @@ class InferencePipeline:
             logger.debug("Stage 1: Normalization")
             normalized = await self.normalization_engine.normalize(raw_observation)
         
+        # ── Step 4c: Signal drift detection ──────────────────────────────────
+        # If this source_id was previously ingested, compute cosine distance
+        # between old and new embedding.  If drift > _DRIFT_THRESHOLD, treat
+        # as a new signal and annotate inference_metadata["drift_summary"].
+        _cm = getattr(self, "_context_memory_store", None)
+        _drift_summary: Optional[str] = None
+        if _cm is not None and raw_observation.source_id and normalized.embedding:
+            prev_emb = _cm.get_source_embedding(raw_observation.source_id)
+            if prev_emb is not None:
+                new_vec = np.array(normalized.embedding, dtype=np.float32)
+                old_vec = np.array(prev_emb, dtype=np.float32)
+                n_new = float(np.linalg.norm(new_vec))
+                n_old = float(np.linalg.norm(old_vec))
+                if n_new > 1e-9 and n_old > 1e-9:
+                    cosine_sim = float(np.dot(new_vec, old_vec) / (n_new * n_old))
+                    drift_score = 1.0 - cosine_sim
+                    if drift_score > _DRIFT_THRESHOLD:
+                        _drift_summary = (
+                            f"Re-ingested source '{raw_observation.source_id}' "
+                            f"shows signal drift (cosine_distance={drift_score:.3f} "
+                            f"> threshold={_DRIFT_THRESHOLD}). Treating as new signal."
+                        )
+                        logger.info(
+                            "InferencePipeline: drift detected for source=%s "
+                            "drift_score=%.3f",
+                            raw_observation.source_id, drift_score,
+                        )
+            # Always update the stored embedding for future drift checks
+            _cm.record_source_embedding(raw_observation.source_id, normalized.embedding)
+
         # Stage 2: Candidate Retrieval (sync operation)
         logger.debug("Stage 2: Candidate Retrieval")
         candidates = self.candidate_retriever.retrieve_candidates(normalized)
@@ -218,6 +266,34 @@ class InferencePipeline:
                 effective_top_k,
             )
 
+        # ── Step 2b: Inject per-user preferences into UserContext ────────────
+        # Read the per-user signal-type weight vector and competitor aliases
+        # from ContextMemoryStore and merge them into a (possibly new) UserContext
+        # before Stage 3 so LLMAdjudicator and downstream ActionRanker can use them.
+        if _cm is not None and user_context is not None:
+            weights = _cm.get_signal_type_weights(user_context.user_id)
+            aliases = _cm.get_competitor_aliases(user_context.user_id)
+            channels = _cm.get_preferred_channels(user_context.user_id)
+            updates: dict = {}
+            if weights:
+                updates["signal_type_weights"] = weights
+            if channels:
+                updates["preferred_channels"] = channels
+            if aliases:
+                existing = list(user_context.strategic_priorities.competitors)
+                merged = existing + [a for a in aliases if a not in existing]
+                sp_updates = user_context.strategic_priorities.model_copy(
+                    update={"competitors": merged}
+                )
+                updates["strategic_priorities"] = sp_updates
+            if updates:
+                user_context = user_context.model_copy(update=updates)
+                logger.debug(
+                    "InferencePipeline: injected %d pref-weights + %d aliases "
+                    "into UserContext for user=%s",
+                    len(weights), len(aliases), user_context.user_id,
+                )
+
         # Stage 3: LLM Adjudication (user_context injects strategic priorities)
         logger.debug("Stage 3: LLM Adjudication")
         inference = await self.llm_adjudicator.adjudicate(
@@ -243,12 +319,74 @@ class InferencePipeline:
             inference.rationale = f"{inference.rationale or ''}\n\nAbstention: {explanation}"
             logger.debug(f"Abstention triggered: {reason.value if reason else 'unknown'}")
 
+        # ── Annotate drift summary if detected (Step 4c) ────────────────────
+        if _drift_summary is not None:
+            inference.inference_metadata["drift_summary"] = _drift_summary
+
         logger.info(
-            f"Pipeline complete for {raw_observation.id}: "
-            f"signal={inference.top_prediction.signal_type.value if inference.top_prediction else 'none'}, "
-            f"confidence={inference.top_prediction.probability if inference.top_prediction else 0.0:.2f}, "
-            f"abstained={inference.abstained}"
+            "Pipeline complete for %s: signal=%s confidence=%.2f abstained=%s%s",
+            raw_observation.id,
+            inference.top_prediction.signal_type.value if inference.top_prediction else "none",
+            inference.top_prediction.probability if inference.top_prediction else 0.0,
+            inference.abstained,
+            " [DRIFT]" if _drift_summary else "",
         )
+
+        # ── Trend tracking (Step 3c) — record classification for TrendTracker ─
+        if inference.top_prediction is not None and not inference.abstained:
+            try:
+                _GLOBAL_TREND_TRACKER.record(inference.top_prediction.signal_type)
+                trending = _GLOBAL_TREND_TRACKER.get_trending_types()
+                if inference.top_prediction.signal_type.value in trending:
+                    inference.inference_metadata["trending"] = True
+            except Exception as _tr_exc:  # noqa: BLE001
+                logger.debug("TrendTracker.record failed: %s", _tr_exc)
+
+        # ── Write to ExemplarBank (Step 3a, non-blocking) ────────────────────
+        if (
+            not inference.abstained
+            and inference.top_prediction is not None
+            and inference.top_prediction.probability >= _EXEMPLAR_MIN_PROB
+            and normalized.embedding
+        ):
+            try:
+                exemplar = ExemplarSignal(
+                    signal_type=inference.top_prediction.signal_type,
+                    text=(normalized.normalized_text or "")[:500],
+                    embedding=list(normalized.embedding),
+                    entities=[
+                        e.text if hasattr(e, "text") else str(e)
+                        for e in (normalized.entities or [])
+                    ],
+                    platform=raw_observation.source_platform.value
+                    if hasattr(raw_observation.source_platform, "value")
+                    else str(raw_observation.source_platform),
+                )
+                asyncio.ensure_future(
+                    _GLOBAL_EXEMPLAR_BANK.add_nonblocking(
+                        exemplar, inference.top_prediction.probability
+                    )
+                )
+            except Exception as _ex_exc:  # noqa: BLE001
+                logger.debug("ExemplarBank write failed: %s", _ex_exc)
+
+        # ── Store rationale in context memory for few-shot reuse (Step 4a) ───
+        if (
+            _cm is not None
+            and not inference.abstained
+            and inference.rationale
+            and inference.top_prediction is not None
+            and normalized.embedding
+        ):
+            try:
+                _cm.store_rationale(
+                    raw_observation.user_id,
+                    inference.rationale,
+                    inference.top_prediction.signal_type,
+                    list(normalized.embedding),
+                )
+            except Exception as _rat_exc:  # noqa: BLE001
+                logger.debug("Rationale store failed: %s", _rat_exc)
 
         # Stage 5b: Populate ResponseArtifacts
         # Attach source citations for RAG pool docs, image/video URLs from

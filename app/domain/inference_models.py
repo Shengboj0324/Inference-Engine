@@ -63,6 +63,28 @@ class AbstentionReason(str, Enum):
     MALFORMED_OUTPUT = "malformed_output"  # LLM output could not be parsed/validated
 
 
+class OutcomeType(str, Enum):
+    """User-provided outcome label for a delivered ``SignalInference``.
+
+    These outcomes are recorded by ``OutcomeFeedbackStore`` and consumed by
+    ``ConfidenceCalibrator.update_user()`` so that repeated ``false_positive``
+    labels raise the per-user temperature scalar (dampening that signal type's
+    calibrated probability on future inferences).
+
+    Values
+    ------
+    acted_on      : User took an action (DM, reply, escalation) on this signal.
+    dismissed     : User explicitly dismissed the signal as not relevant.
+    snoozed       : User deferred the signal for later review.
+    false_positive: User confirmed the signal was incorrectly classified.
+    """
+
+    ACTED_ON = "acted_on"
+    DISMISSED = "dismissed"
+    SNOOZED = "snoozed"
+    FALSE_POSITIVE = "false_positive"
+
+
 class StrategicPriorities(BaseModel):
     """User-defined GTM priorities that bias inference scoring.
 
@@ -198,11 +220,35 @@ class UserContext(BaseModel):
     Attributes:
         user_id: UUID of the authenticated user (for logging).
         strategic_priorities: Parsed GTM priorities for prompt injection.
+        signal_type_weights: Per-signal-type priority multiplier learned from
+            user feedback.  Keys are ``SignalType.value`` strings; values are
+            floats in ``[0.0, 1.0]`` where ``1.0`` means full weight and ``0.0``
+            means the signal type is effectively suppressed.  Populated by
+            ``InferencePipeline.run()`` from ``ContextMemoryStore`` before
+            Stage 3 (LLM adjudication) so that ``ActionRanker`` can apply
+            per-user dampening without modifying the global config.
+        preferred_channels: Mapping of ``SignalType.value`` → ``ResponseChannel``
+            string learned from user behaviour.  Used by ``ActionRanker`` to
+            override the default channel recommendation.
     """
 
     user_id: UUID
     strategic_priorities: StrategicPriorities = Field(
         default_factory=StrategicPriorities
+    )
+    signal_type_weights: Dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Per-signal-type priority weight [0.0, 1.0] learned from user feedback. "
+            "Injected by InferencePipeline.run() before LLM adjudication."
+        ),
+    )
+    preferred_channels: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Mapping of SignalType.value → ResponseChannel string, learned from "
+            "user action history. Used by ActionRanker to personalise channel selection."
+        ),
     )
 
     @classmethod

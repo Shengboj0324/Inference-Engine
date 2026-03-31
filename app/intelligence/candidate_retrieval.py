@@ -13,9 +13,10 @@ import json
 import logging
 import math
 import re
+import threading
 from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, asdict
 from uuid import UUID
 
@@ -812,4 +813,135 @@ class CandidateRetriever:
                 "platform": self.platform_weight,
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# ExemplarBank — global cross-user high-confidence exemplar store (Step 3a)
+# ---------------------------------------------------------------------------
+
+
+class ExemplarBank:
+    """Thread-safe, per-``SignalType``-capped store of high-confidence exemplars.
+
+    Exemplars are sourced from non-abstained inferences with calibrated
+    probability ≥ 0.85 across **all** users.  ``CandidateRetriever`` can query
+    the bank as an additional retrieval source alongside the per-user RAG pool,
+    making the system collectively smarter as the user base grows.
+
+    Design constraints
+    ------------------
+    * Capped at ``_MAX_PER_SIGNAL_TYPE`` exemplars per ``SignalType`` (default
+      10 000).  When the cap is reached, the exemplar with the **lowest**
+      confidence is evicted to make room.
+    * All public methods are thread-safe via a single ``threading.Lock``.
+    * ``add_nonblocking()`` dispatches the add to
+      ``asyncio.get_event_loop().run_in_executor`` so async callers are not
+      blocked by the eviction sort.
+
+    Args:
+        max_per_signal_type: Per-``SignalType`` exemplar cap.
+    """
+
+    _MAX_PER_SIGNAL_TYPE: int = 10_000
+
+    def __init__(self, max_per_signal_type: int = _MAX_PER_SIGNAL_TYPE) -> None:
+        """Initialise an empty exemplar bank.
+
+        Args:
+            max_per_signal_type: Cap per ``SignalType`` before lowest-confidence
+                eviction.
+        """
+        self._max: int = max_per_signal_type
+        # signal_type.value → list of (confidence, ExemplarSignal) pairs
+        self._bank: Dict[str, List[Tuple[float, ExemplarSignal]]] = {}
+        self._lock: threading.Lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def add(self, exemplar: ExemplarSignal, confidence: float) -> None:
+        """Add ``exemplar`` to the bank; evict lowest-confidence on overflow.
+
+        This method is safe to call from multiple threads concurrently.
+
+        Args:
+            exemplar: Exemplar signal to store.
+            confidence: Calibrated probability of the inference that produced
+                this exemplar.  Used for eviction ordering (lowest evicted
+                first when the cap is reached).
+        """
+        key = exemplar.signal_type.value
+        with self._lock:
+            if key not in self._bank:
+                self._bank[key] = []
+            bucket = self._bank[key]
+            bucket.append((confidence, exemplar))
+            if len(bucket) > self._max:
+                # Evict the entry with the lowest confidence in O(n).
+                # Sorting only happens on overflow (amortised cost is low).
+                bucket.sort(key=lambda t: t[0])
+                bucket.pop(0)
+
+    async def add_nonblocking(
+        self, exemplar: ExemplarSignal, confidence: float
+    ) -> None:
+        """Async wrapper around ``add()`` — does not block the event loop.
+
+        Dispatches ``add()`` to the default thread-pool executor so the await
+        returns quickly even if eviction sorting is required.
+
+        Args:
+            exemplar: Exemplar signal to store.
+            confidence: Calibrated probability.
+        """
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.add, exemplar, confidence)
+
+    def get_for_signal_type(
+        self, signal_type: SignalType, top_k: int = 50
+    ) -> List[ExemplarSignal]:
+        """Return the top-``top_k`` highest-confidence exemplars for ``signal_type``.
+
+        Args:
+            signal_type: Signal type to retrieve exemplars for.
+            top_k: Maximum number of exemplars to return.
+
+        Returns:
+            List of ``ExemplarSignal`` objects sorted by confidence descending.
+            Empty list if the signal type has no exemplars.
+        """
+        key = signal_type.value
+        with self._lock:
+            bucket = list(self._bank.get(key, []))
+        bucket.sort(key=lambda t: t[0], reverse=True)
+        return [ex for _, ex in bucket[:top_k]]
+
+    def total_size(self) -> int:
+        """Return the total number of exemplars across all signal types."""
+        with self._lock:
+            return sum(len(v) for v in self._bank.values())
+
+    def size_per_type(self) -> Dict[str, int]:
+        """Return a dict mapping each ``SignalType.value`` to its bucket size."""
+        with self._lock:
+            return {k: len(v) for k, v in self._bank.items()}
+
+    def clear(self) -> None:
+        """Remove all exemplars from the bank (primarily used in tests)."""
+        with self._lock:
+            self._bank.clear()
+
+    def get_signal_types_represented(self) -> Set[str]:
+        """Return the set of ``SignalType.value`` strings present in the bank."""
+        with self._lock:
+            return set(self._bank.keys())
+
+
+#: Module-level singleton — shared across all users and all pipeline instances.
+#: Populated asynchronously after every qualifying inference by
+#: ``InferencePipeline.run()``.
+_GLOBAL_EXEMPLAR_BANK: ExemplarBank = ExemplarBank()
 

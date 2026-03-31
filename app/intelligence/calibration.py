@@ -380,6 +380,11 @@ class ConfidenceCalibrator:
             ``0.01``.
     """
 
+    #: Maximum α weight for the per-user calibration curve in the federated blend.
+    _ALPHA_MAX: float = 0.7
+    #: Number of confirmed outcomes required for α to reach ``_ALPHA_MAX``.
+    _ALPHA_CONVERGENCE_N: int = 500
+
     def __init__(
         self,
         state_path: Optional[Path] = None,
@@ -389,11 +394,17 @@ class ConfidenceCalibrator:
 
         Args:
             state_path: Path to ``calibration_state.json``.
-            learning_rate: Gradient-descent step size for ``update()``.
+            learning_rate: Gradient-descent step size for ``update()``
+                and ``update_user()``.
         """
         self._state_path: Path = state_path or _DEFAULT_STATE_PATH
         self._lr: float = learning_rate
+        # Global per-SignalType temperature scalars (shared across all users).
         self._scalars: Dict[str, float] = {}
+        # Per-user temperature scalars: user_id → {signal_type.value → T}
+        self._user_scalars: Dict[str, Dict[str, float]] = {}
+        # Confirmed outcome counts per user (used to compute α blend weight).
+        self._user_outcome_counts: Dict[str, int] = {}
         self._load()
 
     # ------------------------------------------------------------------
@@ -504,39 +515,192 @@ class ConfidenceCalibrator:
         )
 
     # ------------------------------------------------------------------
+    # Federated (per-user) calibration — Step 3b
+    # ------------------------------------------------------------------
+
+    def _compute_alpha(self, user_id: str) -> float:
+        """Return the blend weight α for ``user_id``'s per-user curve.
+
+        α starts at ``0.0`` for new users (no personal data) and converges
+        linearly toward ``_ALPHA_MAX`` (default ``0.7``) after
+        ``_ALPHA_CONVERGENCE_N`` (default ``500``) confirmed outcomes.
+
+        Args:
+            user_id: String representation of the user UUID.
+
+        Returns:
+            Float in ``[0.0, _ALPHA_MAX]``.
+        """
+        n = self._user_outcome_counts.get(user_id, 0)
+        return min(self._ALPHA_MAX, self._ALPHA_MAX * n / self._ALPHA_CONVERGENCE_N)
+
+    def update_user(
+        self,
+        signal_type: SignalType,
+        user_id: str,
+        predicted_prob: float,
+        true_label: bool,
+        lr: Optional[float] = None,
+    ) -> None:
+        """Perform one gradient step on the *per-user* temperature scalar.
+
+        Identical gradient formula to ``update()`` but applied to the
+        per-user temperature ``T_u`` rather than the global ``T``.  Also
+        increments ``_user_outcome_counts`` so that ``_compute_alpha`` can
+        return a converging blend weight.
+
+        Args:
+            signal_type: Signal type whose per-user temperature to update.
+            user_id: String representation of the user UUID.
+            predicted_prob: Raw predicted probability (before calibration).
+                Must be in ``[0.0, 1.0]``; raises ``ValueError`` otherwise.
+            true_label: ``True`` if the prediction was correct (true-positive);
+                ``False`` for false-positives, dismissed, or snoozed outcomes.
+            lr: Optional per-call learning rate override.
+
+        Raises:
+            ValueError: If ``predicted_prob`` is not finite or not in [0, 1].
+        """
+        if not math.isfinite(predicted_prob):
+            raise ValueError(
+                f"predicted_prob must be finite; got {predicted_prob!r}"
+            )
+        if not (0.0 <= predicted_prob <= 1.0):
+            raise ValueError(
+                f"predicted_prob must be in [0.0, 1.0]; got {predicted_prob!r}"
+            )
+        effective_lr: float = lr if (lr is not None and lr > 0.0) else self._lr
+        p: float = max(_PROB_EPS, min(1.0 - _PROB_EPS, predicted_prob))
+        logit: float = math.log(p / (1.0 - p))
+
+        # Retrieve or initialise the per-user scalar for this signal type
+        user_temps = self._user_scalars.setdefault(user_id, {})
+        t_u: float = max(_T_MIN, min(_T_MAX, user_temps.get(signal_type.value, 1.0)))
+
+        p_cal: float = 1.0 / (1.0 + math.exp(-logit / t_u))
+        y: float = 1.0 if true_label else 0.0
+        gradient: float = (p_cal - y) * (-logit / (t_u * t_u))
+        new_t_u: float = max(_T_MIN, min(_T_MAX, t_u - effective_lr * gradient))
+        user_temps[signal_type.value] = new_t_u
+
+        # Track confirmed outcomes (any label) for α convergence
+        self._user_outcome_counts[user_id] = (
+            self._user_outcome_counts.get(user_id, 0) + 1
+        )
+        self._save()
+        logger.debug(
+            "ConfidenceCalibrator.update_user: user=%s signal_type=%s T_u: %.4f → %.4f",
+            user_id, signal_type.value, t_u, new_t_u,
+        )
+
+    def calibrate_federated(
+        self,
+        raw_logit: float,
+        signal_type: SignalType,
+        user_id: str,
+    ) -> float:
+        """Return a federated calibrated probability blending user + global curves.
+
+        Formula::
+
+            α = _compute_alpha(user_id)   # in [0.0, 0.7]
+            p_user   = sigmoid(raw_logit / T_user)
+            p_global = sigmoid(raw_logit / T_global)
+            p_final  = α * p_user + (1 - α) * p_global
+
+        For new users (``α ≈ 0``) the result is identical to ``calibrate()``.
+        After 500 confirmed outcomes (``α = 0.7``) the personal curve dominates.
+
+        Non-finite ``raw_logit`` is handled identically to ``calibrate()``.
+
+        Args:
+            raw_logit: Log-odds score from the LLM / upstream model.
+            signal_type: Signal type whose temperatures to apply.
+            user_id: String representation of the user UUID.
+
+        Returns:
+            Federated calibrated probability in ``[0.0, 1.0]``.
+        """
+        if not math.isfinite(raw_logit):
+            logger.warning(
+                "ConfidenceCalibrator.calibrate_federated: non-finite raw_logit=%r; "
+                "returning 0.5",
+                raw_logit,
+            )
+            return 0.5
+
+        # Global probability
+        t_global: float = max(_T_MIN, min(_T_MAX, self._scalars.get(signal_type.value, 1.0)))
+        try:
+            p_global = 1.0 / (1.0 + math.exp(-raw_logit / t_global))
+        except OverflowError:
+            p_global = 0.0
+
+        # Per-user probability
+        user_temps = self._user_scalars.get(user_id, {})
+        t_user: float = max(_T_MIN, min(_T_MAX, user_temps.get(signal_type.value, 1.0)))
+        try:
+            p_user = 1.0 / (1.0 + math.exp(-raw_logit / t_user))
+        except OverflowError:
+            p_user = 0.0
+
+        alpha: float = self._compute_alpha(user_id)
+        p_final = alpha * p_user + (1.0 - alpha) * p_global
+        return float(np.clip(p_final, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
-        """Load scalars from ``state_path``.  Falls back to ``T=1.0`` for any
-        missing or unreadable state."""
+        """Load global and per-user scalars from ``state_path``.
+
+        Falls back gracefully for any missing or unreadable state.
+        """
         try:
             if self._state_path.exists():
                 with self._state_path.open("r", encoding="utf-8") as fh:
                     data = json.load(fh)
-                self._scalars = {k: float(v) for k, v in data.get("scalars", {}).items()}
+                self._scalars = {
+                    k: float(v) for k, v in data.get("scalars", {}).items()
+                }
+                # Per-user scalars (added in v2.0 — absent in legacy files)
+                raw_user = data.get("user_scalars", {})
+                self._user_scalars = {
+                    uid: {st: float(t) for st, t in temps.items()}
+                    for uid, temps in raw_user.items()
+                }
+                raw_counts = data.get("user_outcome_counts", {})
+                self._user_outcome_counts = {
+                    uid: int(n) for uid, n in raw_counts.items()
+                }
                 logger.info(
-                    "ConfidenceCalibrator: loaded %d scalars from %s",
+                    "ConfidenceCalibrator: loaded %d global + %d user scalars from %s",
                     len(self._scalars),
+                    len(self._user_scalars),
                     self._state_path,
                 )
             else:
                 logger.info(
-                    "ConfidenceCalibrator: state file not found at %s; using T=1.0 for all types",
+                    "ConfidenceCalibrator: state file not found at %s; using T=1.0",
                     self._state_path,
                 )
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("ConfidenceCalibrator: failed to load state: %s", exc)
             self._scalars = {}
+            self._user_scalars = {}
+            self._user_outcome_counts = {}
 
     def _save(self) -> None:
-        """Persist current scalars to ``state_path``."""
+        """Persist global and per-user scalars to ``state_path``."""
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             payload: Dict = {
-                "version": "1.0",
+                "version": "2.0",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "scalars": self._scalars,
+                "user_scalars": self._user_scalars,
+                "user_outcome_counts": self._user_outcome_counts,
             }
             with self._state_path.open("w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2)
