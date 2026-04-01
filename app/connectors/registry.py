@@ -81,17 +81,28 @@ from uuid import UUID
 
 from app.connectors.abc_news import ABCNewsConnector
 from app.connectors.apple_news import AppleNewsConnector
+from app.connectors.arxiv import ArxivConnector
 from app.connectors.base import BaseConnector, ConnectorConfig, FetchResult
+from app.connectors.changelog import ChangelogConnector
+from app.connectors.docs_monitor import DocsMonitorConnector
 from app.connectors.facebook import FacebookConnector
+from app.connectors.github_discussions import GitHubDiscussionsConnector
+from app.connectors.github_releases import GitHubReleasesConnector
+from app.connectors.github_repo_events import GitHubRepoEventsConnector
 from app.connectors.google_news import GoogleNewsConnector
 from app.connectors.instagram import InstagramConnector
 from app.connectors.nytimes import NYTimesConnector
+from app.connectors.openreview import OpenReviewConnector
+from app.connectors.podcast_rss import PodcastRSSConnector
 from app.connectors.reddit import RedditConnector
 from app.connectors.rss import RSSConnector
+from app.connectors.semantic_scholar import SemanticScholarConnector
 from app.connectors.tiktok import TikTokConnector
+from app.connectors.transcript_feeds import TranscriptFeedConnector
 from app.connectors.wechat import WeChatConnector
 from app.connectors.wsj import WSJConnector
 from app.connectors.youtube import YouTubeConnector
+from app.connectors.youtube_transcript import YouTubeTranscriptConnector
 from app.core.errors import ConnectorError
 from app.core.models import SourcePlatform
 from app.domain.inference_models import StrategicPriorities
@@ -122,6 +133,29 @@ PUBLIC_ACCESS_PLATFORMS: List[SourcePlatform] = [
     SourcePlatform.ABC_NEWS_AU,
     SourcePlatform.GOOGLE_NEWS,
     SourcePlatform.APPLE_NEWS,
+    # Phase 1 — Source Intelligence Layer (no OAuth; optional PAT/key)
+    SourcePlatform.GITHUB_RELEASES,
+    SourcePlatform.GITHUB_REPO_EVENTS,
+    # GitHub Discussions uses a PAT (not user-delegated OAuth) → public/key category
+    SourcePlatform.GITHUB_DISCUSSIONS,
+    SourcePlatform.CHANGELOG,
+    SourcePlatform.DOCS_MONITOR,
+    SourcePlatform.ARXIV,
+    SourcePlatform.OPENREVIEW,
+    SourcePlatform.SEMANTIC_SCHOLAR,
+    SourcePlatform.PODCAST_RSS,
+    SourcePlatform.TRANSCRIPT_FEED,
+    SourcePlatform.YOUTUBE_TRANSCRIPT,
+]
+
+# Phase 1 platforms that accept an optional PAT/API-key for higher rate limits
+# but do NOT require user-delegated OAuth.
+OPTIONAL_AUTH_PLATFORMS: List[SourcePlatform] = [
+    SourcePlatform.GITHUB_RELEASES,
+    SourcePlatform.GITHUB_REPO_EVENTS,
+    SourcePlatform.GITHUB_DISCUSSIONS,  # GraphQL requires a PAT
+    SourcePlatform.SEMANTIC_SCHOLAR,
+    SourcePlatform.YOUTUBE_TRANSCRIPT,
 ]
 
 
@@ -129,14 +163,14 @@ class ConnectorRegistry:
     """Registry for platform-specific connectors."""
 
     _connectors: Dict[SourcePlatform, Type[BaseConnector]] = {
-        # Social Media Platforms
+        # ── Social Media ──────────────────────────────────────────────────────
         SourcePlatform.REDDIT: RedditConnector,
         SourcePlatform.YOUTUBE: YouTubeConnector,
         SourcePlatform.TIKTOK: TikTokConnector,
         SourcePlatform.FACEBOOK: FacebookConnector,
         SourcePlatform.INSTAGRAM: InstagramConnector,
         SourcePlatform.WECHAT: WeChatConnector,
-        # News Sources
+        # ── News / Editorial ──────────────────────────────────────────────────
         SourcePlatform.RSS: RSSConnector,
         SourcePlatform.NYTIMES: NYTimesConnector,
         SourcePlatform.WSJ: WSJConnector,
@@ -144,6 +178,20 @@ class ConnectorRegistry:
         SourcePlatform.ABC_NEWS_AU: ABCNewsConnector,
         SourcePlatform.GOOGLE_NEWS: GoogleNewsConnector,
         SourcePlatform.APPLE_NEWS: AppleNewsConnector,
+        # ── Developer / Release (Phase 1) ─────────────────────────────────────
+        SourcePlatform.GITHUB_RELEASES: GitHubReleasesConnector,
+        SourcePlatform.GITHUB_REPO_EVENTS: GitHubRepoEventsConnector,
+        SourcePlatform.GITHUB_DISCUSSIONS: GitHubDiscussionsConnector,
+        SourcePlatform.CHANGELOG: ChangelogConnector,
+        SourcePlatform.DOCS_MONITOR: DocsMonitorConnector,
+        # ── Research (Phase 1) ────────────────────────────────────────────────
+        SourcePlatform.ARXIV: ArxivConnector,
+        SourcePlatform.OPENREVIEW: OpenReviewConnector,
+        SourcePlatform.SEMANTIC_SCHOLAR: SemanticScholarConnector,
+        # ── Media / Audio (Phase 1) ───────────────────────────────────────────
+        SourcePlatform.PODCAST_RSS: PodcastRSSConnector,
+        SourcePlatform.TRANSCRIPT_FEED: TranscriptFeedConnector,
+        SourcePlatform.YOUTUBE_TRANSCRIPT: YouTubeTranscriptConnector,
     }
 
     @classmethod
@@ -467,7 +515,176 @@ class ConnectorRegistry:
                 "requires_oauth": False,
                 "api_docs": None,
             },
+            # ── Developer / Release (Phase 1) ─────────────────────────────────
+            "github_releases": {
+                "name": "GitHub Releases",
+                "platform": SourcePlatform.GITHUB_RELEASES,
+                "type": "developer",
+                "source_family": "developer_release",
+                "requires_oauth": False,
+                "auth_optional": True,
+                "rate_limit_unauth": "60/hour",
+                "rate_limit_auth": "5000/hour",
+                "content_types": ["release_notes", "changelogs"],
+                "supports_since": True,
+                "api_docs": "https://docs.github.com/en/rest/releases/releases",
+            },
+            "github_repo_events": {
+                "name": "GitHub Repo Events",
+                "platform": SourcePlatform.GITHUB_REPO_EVENTS,
+                "type": "developer",
+                "source_family": "developer_release",
+                "requires_oauth": False,
+                "auth_optional": True,
+                "content_types": ["push_events", "issue_events", "pr_events"],
+                "supports_since": True,
+                "api_docs": "https://docs.github.com/en/rest/activity/events",
+            },
+            "github_discussions": {
+                "name": "GitHub Discussions",
+                "platform": SourcePlatform.GITHUB_DISCUSSIONS,
+                "type": "developer",
+                "source_family": "developer_release",
+                "requires_oauth": True,
+                "auth_type": "github_pat",
+                "content_types": ["rfc", "announcements", "feedback"],
+                "supports_since": True,
+                "api_docs": "https://docs.github.com/en/graphql",
+            },
+            "changelog": {
+                "name": "Changelog Monitor",
+                "platform": SourcePlatform.CHANGELOG,
+                "type": "developer",
+                "source_family": "developer_release",
+                "requires_oauth": False,
+                "content_types": ["version_sections"],
+                "supports_since": True,
+                "api_docs": None,
+            },
+            "docs_monitor": {
+                "name": "Documentation Monitor",
+                "platform": SourcePlatform.DOCS_MONITOR,
+                "type": "developer",
+                "source_family": "developer_release",
+                "requires_oauth": False,
+                "content_types": ["docs_changes"],
+                "supports_since": False,
+                "change_detection": ["etag", "hash"],
+                "api_docs": None,
+            },
+            # ── Research (Phase 1) ────────────────────────────────────────────
+            "arxiv": {
+                "name": "arXiv",
+                "platform": SourcePlatform.ARXIV,
+                "type": "research",
+                "source_family": "research",
+                "requires_oauth": False,
+                "rate_limit": "1 req/3s (courtesy)",
+                "content_types": ["preprints", "abstracts"],
+                "supports_since": True,
+                "api_docs": "https://info.arxiv.org/help/api/user-manual",
+            },
+            "openreview": {
+                "name": "OpenReview",
+                "platform": SourcePlatform.OPENREVIEW,
+                "type": "research",
+                "source_family": "research",
+                "requires_oauth": False,
+                "content_types": ["papers", "reviews", "decisions"],
+                "supports_since": True,
+                "api_docs": "https://docs.openreview.net/reference/api-v2",
+            },
+            "semantic_scholar": {
+                "name": "Semantic Scholar",
+                "platform": SourcePlatform.SEMANTIC_SCHOLAR,
+                "type": "research",
+                "source_family": "research",
+                "requires_oauth": False,
+                "auth_optional": True,
+                "content_types": ["papers", "author_papers"],
+                "supports_since": True,
+                "api_docs": "https://api.semanticscholar.org/api-docs/",
+            },
+            # ── Media / Audio (Phase 1) ───────────────────────────────────────
+            "podcast_rss": {
+                "name": "Podcast RSS",
+                "platform": SourcePlatform.PODCAST_RSS,
+                "type": "media",
+                "source_family": "media_audio",
+                "requires_oauth": False,
+                "content_types": ["episode_metadata", "show_notes"],
+                "media_type": "audio",
+                "transcript_pending": True,
+                "supports_since": True,
+                "api_docs": None,
+            },
+            "transcript_feed": {
+                "name": "Transcript Feed",
+                "platform": SourcePlatform.TRANSCRIPT_FEED,
+                "type": "media",
+                "source_family": "media_audio",
+                "requires_oauth": False,
+                "content_types": ["transcripts"],
+                "media_type": "text",
+                "transcript_pending": False,
+                "supports_since": True,
+                "api_docs": None,
+            },
+            "youtube_transcript": {
+                "name": "YouTube Transcript",
+                "platform": SourcePlatform.YOUTUBE_TRANSCRIPT,
+                "type": "media",
+                "source_family": "media_audio",
+                "requires_oauth": False,
+                "auth_optional": True,
+                "content_types": ["transcripts"],
+                "media_type": "text",
+                "transcript_pending": False,
+                "supports_since": True,
+                "api_docs": "https://developers.google.com/youtube/v3/docs/captions",
+            },
         }
+
+    @classmethod
+    def get_source_family(cls, platform: SourcePlatform) -> str:
+        """Return the source family string for *platform*.
+
+        Source families group platforms for the Source Intelligence Layer:
+        - ``social``           — Reddit, YouTube, TikTok, Facebook, Instagram, WeChat
+        - ``news``             — RSS, NYTimes, WSJ, ABC News, Google News, Apple News
+        - ``developer_release``— GitHub Releases/Events/Discussions, Changelog, DocsMonitor
+        - ``research``         — arXiv, OpenReview, Semantic Scholar
+        - ``media_audio``      — Podcast RSS, Transcript Feeds, YouTube Transcript
+        - ``unknown``          — anything not yet classified
+        """
+        _FAMILY_MAP: Dict[SourcePlatform, str] = {
+            SourcePlatform.REDDIT: "social",
+            SourcePlatform.YOUTUBE: "social",
+            SourcePlatform.TIKTOK: "social",
+            SourcePlatform.FACEBOOK: "social",
+            SourcePlatform.INSTAGRAM: "social",
+            SourcePlatform.WECHAT: "social",
+            SourcePlatform.RSS: "news",
+            SourcePlatform.NEWSAPI: "news",
+            SourcePlatform.NYTIMES: "news",
+            SourcePlatform.WSJ: "news",
+            SourcePlatform.ABC_NEWS: "news",
+            SourcePlatform.ABC_NEWS_AU: "news",
+            SourcePlatform.GOOGLE_NEWS: "news",
+            SourcePlatform.APPLE_NEWS: "news",
+            SourcePlatform.GITHUB_RELEASES: "developer_release",
+            SourcePlatform.GITHUB_REPO_EVENTS: "developer_release",
+            SourcePlatform.GITHUB_DISCUSSIONS: "developer_release",
+            SourcePlatform.CHANGELOG: "developer_release",
+            SourcePlatform.DOCS_MONITOR: "developer_release",
+            SourcePlatform.ARXIV: "research",
+            SourcePlatform.OPENREVIEW: "research",
+            SourcePlatform.SEMANTIC_SCHOLAR: "research",
+            SourcePlatform.PODCAST_RSS: "media_audio",
+            SourcePlatform.TRANSCRIPT_FEED: "media_audio",
+            SourcePlatform.YOUTUBE_TRANSCRIPT: "media_audio",
+        }
+        return _FAMILY_MAP.get(platform, "unknown")
 
 
 # Singleton instance

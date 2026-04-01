@@ -14,6 +14,8 @@ class MediaType(str, Enum):
     TEXT = "text"
     VIDEO = "video"
     IMAGE = "image"
+    AUDIO = "audio"
+    PDF = "pdf"
     MIXED = "mixed"
 
 
@@ -52,7 +54,16 @@ class ContentType(str, Enum):
 
 
 class SourcePlatform(str, Enum):
-    """Supported source platforms."""
+    """Supported source platforms.
+
+    Grouped by source family per the Source Intelligence Layer design:
+      - Social streams  : REDDIT, YOUTUBE, TIKTOK, FACEBOOK, INSTAGRAM, WECHAT
+      - News/editorial  : RSS, NEWSAPI, NYTIMES, WSJ, ABC_NEWS, GOOGLE_NEWS, APPLE_NEWS
+      - Developer/release: GITHUB_RELEASES, GITHUB_REPO_EVENTS, GITHUB_DISCUSSIONS,
+                           CHANGELOG, DOCS_MONITOR
+      - Research        : ARXIV, OPENREVIEW, SEMANTIC_SCHOLAR
+      - Media/audio     : PODCAST_RSS, TRANSCRIPT_FEED, YOUTUBE_TRANSCRIPT
+    """
 
     # Social Media
     REDDIT = "reddit"
@@ -71,6 +82,23 @@ class SourcePlatform(str, Enum):
     ABC_NEWS_AU = "abc_news_au"
     GOOGLE_NEWS = "google_news"
     APPLE_NEWS = "apple_news"
+
+    # Developer / Release streams  (Phase 1 — Source Intelligence Layer)
+    GITHUB_RELEASES = "github_releases"
+    GITHUB_REPO_EVENTS = "github_repo_events"
+    GITHUB_DISCUSSIONS = "github_discussions"
+    CHANGELOG = "changelog"
+    DOCS_MONITOR = "docs_monitor"
+
+    # Research streams  (Phase 1)
+    ARXIV = "arxiv"
+    OPENREVIEW = "openreview"
+    SEMANTIC_SCHOLAR = "semantic_scholar"
+
+    # Media / Audio streams  (Phase 1)
+    PODCAST_RSS = "podcast_rss"
+    TRANSCRIPT_FEED = "transcript_feed"
+    YOUTUBE_TRANSCRIPT = "youtube_transcript"
 
 
 class ContentItem(BaseModel):
