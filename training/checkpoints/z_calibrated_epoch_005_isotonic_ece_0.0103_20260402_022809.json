@@ -1,0 +1,15 @@
+{
+  "epoch": 5,
+  "calibration_method": "isotonic",
+  "ece": 0.01031,
+  "macro_f1": 0.861124,
+  "temperature": null,
+  "val_ece_before": 0.3723561219156841,
+  "val_ece_before_source": "epoch_005_ece_0.3724.json",
+  "n_val_samples": 1998,
+  "calibrated_at": "2026-04-02T02:28:09.444611+00:00",
+  "thresholds": {
+    "ece": 0.1,
+    "macro_f1": 0.7
+  }
+}

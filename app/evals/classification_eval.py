@@ -139,3 +139,63 @@ class ClassificationEvaluator:
         )
         return report
 
+    def gate(
+        self,
+        report: "ClassificationReport",
+        macro_f1_threshold: float = 0.70,
+        false_action_rate_threshold: float = 0.05,
+    ) -> None:
+        """Raise ``ValueError`` when the report does not meet deployment thresholds.
+
+        Args:
+            report:                    A ``ClassificationReport`` from ``evaluate()``.
+            macro_f1_threshold:        Minimum required macro F1 (default 0.70).
+            false_action_rate_threshold: Maximum allowed false-action rate
+                                        (default 0.05).  Ignored when
+                                        ``report.false_action_rate`` is ``None``
+                                        (i.e. no confidence scores were supplied).
+
+        Raises:
+            TypeError:  If *report* is not a ``ClassificationReport``.
+            ValueError: If any threshold is out of range ``[0, 1]``.
+            ValueError: If the report does not meet the thresholds.
+        """
+        if not isinstance(report, ClassificationReport):
+            raise TypeError(
+                f"'report' must be a ClassificationReport, got {type(report).__name__!r}"
+            )
+        if not (0.0 <= macro_f1_threshold <= 1.0):
+            raise ValueError(
+                f"'macro_f1_threshold' must be in [0, 1], got {macro_f1_threshold!r}"
+            )
+        if not (0.0 <= false_action_rate_threshold <= 1.0):
+            raise ValueError(
+                f"'false_action_rate_threshold' must be in [0, 1], got "
+                f"{false_action_rate_threshold!r}"
+            )
+
+        failures = []
+        if report.macro_f1 < macro_f1_threshold:
+            failures.append(
+                f"macro_f1={report.macro_f1:.4f} < threshold={macro_f1_threshold:.4f}"
+            )
+        if (
+            report.false_action_rate is not None
+            and report.false_action_rate > false_action_rate_threshold
+        ):
+            failures.append(
+                f"false_action_rate={report.false_action_rate:.4f} "
+                f"> threshold={false_action_rate_threshold:.4f}"
+            )
+        if failures:
+            msg = "ClassificationEvaluator.gate FAILED: " + "; ".join(failures)
+            logger.error(msg)
+            raise ValueError(msg)
+        logger.info(
+            "ClassificationEvaluator.gate PASSED: macro_f1=%.4f far=%s "
+            "thresholds=(f1>=%.2f, far<=%.2f)",
+            report.macro_f1,
+            f"{report.false_action_rate:.4f}" if report.false_action_rate is not None else "n/a",
+            macro_f1_threshold, false_action_rate_threshold,
+        )
+

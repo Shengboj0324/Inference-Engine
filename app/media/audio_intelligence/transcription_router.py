@@ -28,7 +28,9 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
-from app.media.audio_intelligence.models import TranscriptSegment
+import math
+
+from app.media.audio_intelligence.models import TranscriptResult, TranscriptSegment
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +193,48 @@ class TranscriptionRouter:
         )
         return segments
 
+    async def transcribe_with_provenance(self, audio_path: str) -> TranscriptResult:
+        """Transcribe *audio_path* and return a ``TranscriptResult`` with backend provenance.
+
+        This is the preferred method for production callers; it carries
+        ``backend_used``, ``mean_confidence``, and ``duration_s`` alongside the
+        segment list so downstream modules can make trust decisions without
+        re-inspecting individual segments.
+
+        Args:
+            audio_path: Path to audio file (MP3, WAV, M4A, OGG, etc.).
+
+        Returns:
+            ``TranscriptResult`` with all provenance fields populated.
+
+        Raises:
+            FileNotFoundError: If *audio_path* does not exist.
+            ValueError: If the path is empty.
+        """
+        segments = await self.transcribe(audio_path)
+        backend  = self._resolve_backend()
+
+        confs = [s.confidence for s in segments if s.confidence is not None]
+        mean_conf: Optional[float] = (sum(confs) / len(confs)) if confs else None
+
+        duration = sum(s.end_s - s.start_s for s in segments)
+        language = segments[0].language if segments else "und"
+
+        logger.debug(
+            "TranscriptionRouter.transcribe_with_provenance: backend=%s "
+            "segments=%d mean_confidence=%s duration_s=%.1f",
+            backend.value, len(segments),
+            f"{mean_conf:.3f}" if mean_conf is not None else "None",
+            duration,
+        )
+        return TranscriptResult(
+            segments=segments,
+            backend_used=backend.value,
+            mean_confidence=mean_conf,
+            duration_s=duration,
+            language=language,
+        )
+
     def resolved_backend(self) -> ASRBackend:
         """Return the resolved backend (triggers resolution if not yet done)."""
         return self._resolve_backend()
@@ -249,22 +293,29 @@ class TranscriptionRouter:
         model = faster_whisper.WhisperModel(self._model_size, device=device, compute_type="int8")
 
         def _sync_transcribe():
-            segments, info = model.transcribe(
+            segments_raw, info = model.transcribe(
                 audio_path,
                 language=self._language,
                 beam_size=5,
                 vad_filter=True,
             )
-            return [
-                TranscriptSegment(
+            result = []
+            for seg in segments_raw:
+                # faster-whisper exposes avg_logprob (negative float).
+                # Convert to a bounded probability via exp(), clamped to [0, 1].
+                avg_logprob = getattr(seg, "avg_logprob", None)
+                if avg_logprob is not None:
+                    conf: Optional[float] = min(1.0, max(0.0, math.exp(avg_logprob)))
+                else:
+                    conf = None
+                result.append(TranscriptSegment(
                     start_s=seg.start,
                     end_s=seg.end,
                     text=seg.text.strip(),
-                    confidence=None,
+                    confidence=conf,
                     language=info.language,
-                )
-                for seg in segments
-            ]
+                ))
+            return result
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _sync_transcribe)

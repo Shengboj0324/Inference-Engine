@@ -51,15 +51,12 @@ jobs:
 
       - name: Run Black
         run: poetry run black --check app tests
-        continue-on-error: true
 
       - name: Run Ruff
         run: poetry run ruff check app tests
-        continue-on-error: true
 
       - name: Run MyPy
         run: poetry run mypy app/ --ignore-missing-imports
-        continue-on-error: true
 
   test:
     name: Run Tests
@@ -150,7 +147,6 @@ jobs:
           SECRET_KEY: test-secret-key-for-ci-testing-only
         run: |
           poetry run pytest tests/unit -v --cov=app --cov-report=xml --cov-report=term
-        continue-on-error: true
 
       - name: Run integration tests
         env:
@@ -161,7 +157,6 @@ jobs:
           SECRET_KEY: test-secret-key-for-ci-testing-only
         run: |
           poetry run pytest tests/integration -v --cov=app --cov-append --cov-report=xml --cov-report=term
-        continue-on-error: true
 
       - name: Run other tests
         env:
@@ -172,14 +167,12 @@ jobs:
           SECRET_KEY: test-secret-key-for-ci-testing-only
         run: |
           poetry run pytest tests/test_*.py -v --cov=app --cov-append --cov-report=xml --cov-report=term
-        continue-on-error: true
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
           file: ./coverage.xml
-          fail_ci_if_error: false
-        continue-on-error: true
+          fail_ci_if_error: true
 
   security:
     name: Security Scan
@@ -227,10 +220,406 @@ jobs:
           poetry run safety check --json || true
         continue-on-error: true
 
+  # ── GAP-13: Import smoke test ────────────────────────────────────────────────
+  # Verifies that all three public packages import cleanly (no missing symbols,
+  # no broken __init__.py, no SDK ImportError from eager imports).
+  smoke-test:
+    name: Import Smoke Test
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Import smoke tests
+        env:
+          ENCRYPTION_KEY: test-encryption-key-32-chars!!
+          OPENAI_API_KEY: sk-test-key-for-ci
+          SECRET_KEY: test-secret-key-for-ci-testing-only
+        run: |
+          poetry run python -c "
+          # Package boundary: lazy imports must NOT pull in heavy deps
+          import app.intelligence
+          import app.scraping
+          import app.connectors
+          print('app.intelligence: OK')
+          print('app.scraping: OK')
+          print('app.connectors: OK')
+
+          # Lazy access must resolve correctly
+          from app.intelligence import MultimodalAnalyzer, CapabilityMode
+          assert MultimodalAnalyzer is not None
+          assert CapabilityMode.STUB == 'stub'
+          print('Lazy attribute resolution: OK')
+          "
+
+  # ── GAP-14: LLM router contract test ─────────────────────────────────────────
+  # Verifies that LLMRouter.complete() exists and has the expected signature.
+  # This caught the missing method that caused runtime AttributeError in 7 callers.
+  contract-test:
+    name: LLM Router Contract Test
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: LLM router contract verification
+        env:
+          ENCRYPTION_KEY: test-encryption-key-32-chars!!
+          OPENAI_API_KEY: sk-test-key-for-ci
+          SECRET_KEY: test-secret-key-for-ci-testing-only
+        run: |
+          poetry run python -c "
+          import inspect
+          from app.llm.router import LLMRouter
+
+          # complete() must exist and be a coroutine function
+          assert hasattr(LLMRouter, 'complete'), 'LLMRouter.complete() is missing'
+          assert inspect.iscoroutinefunction(LLMRouter.complete), \
+              'LLMRouter.complete() must be async'
+
+          sig = inspect.signature(LLMRouter.complete)
+          params = list(sig.parameters)
+          assert 'prompt' in params, \"'prompt' parameter missing from complete()\"
+          assert 'max_tokens' in params, \"'max_tokens' parameter missing from complete()\"
+          assert 'temperature' in params, \"'temperature' parameter missing from complete()\"
+          print('LLMRouter.complete contract: OK')
+
+          # TranscriptResult must exist with provenance fields
+          from app.media.audio_intelligence.models import TranscriptResult
+          fields = TranscriptResult.model_fields
+          assert 'backend_used'    in fields, \"'backend_used' missing from TranscriptResult\"
+          assert 'mean_confidence' in fields, \"'mean_confidence' missing from TranscriptResult\"
+          assert 'duration_s'      in fields, \"'duration_s' missing from TranscriptResult\"
+          print('TranscriptResult provenance contract: OK')
+
+          # All four evaluators must expose gate()
+          from app.evals.classification_eval import ClassificationEvaluator
+          from app.evals.ranking_eval import RankingEvaluator
+          from app.evals.response_eval import ResponseEvaluator
+          from app.evals.adversarial_eval import AdversarialEvaluator
+          for cls in (ClassificationEvaluator, RankingEvaluator, ResponseEvaluator, AdversarialEvaluator):
+              assert hasattr(cls, 'gate'), f'{cls.__name__}.gate() is missing'
+              assert callable(getattr(cls, 'gate')), f'{cls.__name__}.gate() is not callable'
+          print('Evaluator gate() contract: OK')
+
+          # CapabilityMode must be exported from app.intelligence
+          from app.intelligence import CapabilityMode
+          assert CapabilityMode.DISABLED.value == 'disabled'
+          assert CapabilityMode.STUB.value     == 'stub'
+          assert CapabilityMode.LOCAL_MODEL.value  == 'local_model'
+          assert CapabilityMode.REMOTE_MODEL.value == 'remote_model'
+          print('CapabilityMode export contract: OK')
+
+          # VideoGenerationMode must be exported
+          from app.output.generators.visual_generator import VideoGenerationMode
+          assert VideoGenerationMode.SCRIPT_ONLY.value == 'script_only'
+          print('VideoGenerationMode contract: OK')
+          "
+
+  # ── GAP-15: Eval gate ─────────────────────────────────────────────────────────
+  # Reads the latest training checkpoint and verifies metrics against hard gates.
+  # Fails CI if ECE, F1, or other calibration metrics violate deployment thresholds.
+  eval-gate:
+    name: Eval Gate (Checkpoint Metrics)
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Run calibration eval gate
+        env:
+          ENCRYPTION_KEY: test-encryption-key-32-chars!!
+          OPENAI_API_KEY: sk-test-key-for-ci
+          SECRET_KEY: test-secret-key-for-ci-testing-only
+        run: |
+          poetry run python - <<'EOF'
+          """
+          Checkpoint eval gate.
+
+          Reads the most recent checkpoint file from training/checkpoints/,
+          extracts ECE and macro_f1, and fails with a non-zero exit code if
+          either value violates the deployment threshold.
+
+          Thresholds (per Inference_Engine_Post_Update_Strict_Review.md §5):
+            ECE      <= 0.10
+            macro_f1 >= 0.70
+          """
+          import json, sys, glob, os, pathlib
+
+          ECE_THRESHOLD      = 0.10
+          MACRO_F1_THRESHOLD = 0.70
+
+          checkpoint_dir = pathlib.Path("training/checkpoints")
+          if not checkpoint_dir.exists():
+              print("[eval-gate] No training/checkpoints directory — skipping.", flush=True)
+              sys.exit(0)
+
+          files = list(checkpoint_dir.glob("*.json"))
+          if not files:
+              print("[eval-gate] No checkpoint files found — skipping.", flush=True)
+              sys.exit(0)
+
+          # Prefer the most recently written (mtime) checkpoint — this ensures
+          # calibrated checkpoints produced by the post-hoc calibration pipeline
+          # are always selected over older raw training checkpoints, regardless
+          # of their alphabetical filename order.
+          latest = max(files, key=lambda p: p.stat().st_mtime)
+          print(f"[eval-gate] All checkpoints: {[f.name for f in sorted(files)]}", flush=True)
+          print(f"[eval-gate] Evaluating (most recent): {latest.name}", flush=True)
+          data = json.loads(latest.read_text())
+
+          failures = []
+
+          # Support both "ece" (new calibrated checkpoints) and "val_ece"
+          # (legacy format used by the epoch_00x_ece_*.json training checkpoints).
+          # If NEITHER field is present the gate FAILS — a missing ECE field is
+          # treated as a deployment blocker, not a skipped check.
+          ece = data.get("ece")
+          if ece is None:
+              ece = data.get("val_ece")
+          macro_f1 = data.get("macro_f1")
+
+          if ece is not None:
+              print(f"[eval-gate] ECE = {ece:.4f}  (threshold <= {ECE_THRESHOLD})")
+              if ece > ECE_THRESHOLD:
+                  failures.append(f"ECE={ece:.4f} exceeds threshold of {ECE_THRESHOLD}")
+          else:
+              failures.append(
+                  "Neither 'ece' nor 'val_ece' found in checkpoint — "
+                  "checkpoint must be produced by the calibration pipeline"
+              )
+              print("[eval-gate] ERROR: no ECE field in checkpoint", flush=True)
+
+          if macro_f1 is not None:
+              print(f"[eval-gate] macro_f1 = {macro_f1:.4f}  (threshold >= {MACRO_F1_THRESHOLD})")
+              if macro_f1 < MACRO_F1_THRESHOLD:
+                  failures.append(f"macro_f1={macro_f1:.4f} below threshold of {MACRO_F1_THRESHOLD}")
+          else:
+              failures.append(
+                  "'macro_f1' not found in checkpoint — "
+                  "checkpoint must be produced by the calibration pipeline"
+              )
+              print("[eval-gate] ERROR: no macro_f1 field in checkpoint", flush=True)
+
+          if failures:
+              print("\n[eval-gate] FAILED:", flush=True)
+              for f in failures:
+                  print(f"  ✗ {f}", flush=True)
+              print(
+                "\nModel is not ready for deployment. Retrain or fine-tune to "
+                "meet the calibration thresholds before merging.\n",
+                flush=True,
+              )
+              sys.exit(1)
+
+          print("\n[eval-gate] PASSED — checkpoint meets all deployment thresholds.", flush=True)
+          EOF
+
+  # ── Retrieval gate ─────────────────────────────────────────────────────────
+  # Verifies that the ChunkStore + RetrievalEvaluator stack can achieve
+  # Recall@10 >= 0.70 and MRR >= 0.50 on a synthetic keyword-retrieval fixture.
+  # Fails CI if either metric falls below its threshold.
+  retrieval-gate:
+    name: Retrieval Gate (Recall@k / MRR)
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Run retrieval gate
+        env:
+          ENCRYPTION_KEY: test-encryption-key-32-chars!!
+          OPENAI_API_KEY: sk-test-key-for-ci
+          SECRET_KEY: test-secret-key-for-ci-testing-only
+        run: |
+          poetry run python - <<'EOF'
+          """
+          Retrieval gate.
+
+          Builds a synthetic ChunkStore with 30 labelled documents across three
+          source families, then evaluates keyword-based retrieval using
+          RetrievalEvaluator.  Fails CI with a non-zero exit code if either:
+
+            Recall@10 < 0.70   (fraction of queries with a relevant hit in top-10)
+            MRR       < 0.50   (mean reciprocal rank)
+
+          These thresholds match the deployment contract in the roadmap.
+          A keyword retriever is used (no embeddings required in CI) to keep the
+          gate fast and dependency-free.
+          """
+          import sys
+
+          RECALL_THRESHOLD = 0.70
+          MRR_THRESHOLD    = 0.50
+
+          from app.intelligence.retrieval.chunk_store import ChunkStore, ChunkRecord
+          from app.intelligence.retrieval.retrieval_evaluator import (
+              RetrievalEvaluator, RetrievalQuery,
+          )
+
+          # ── Build synthetic corpus ──────────────────────────────────────────
+          store = ChunkStore()
+
+          CORPUS = [
+              # (obs_id, source_family, text)
+              ("obs-001", "research",          "attention mechanism transformer self-attention multi-head"),
+              ("obs-002", "research",          "large language models scaling laws GPT training"),
+              ("obs-003", "research",          "diffusion models image generation stable diffusion"),
+              ("obs-004", "developer_release", "pytorch 2.0 release torch compile performance"),
+              ("obs-005", "developer_release", "kubernetes 1.29 breaking changes api deprecation"),
+              ("obs-006", "developer_release", "vllm continuous batching async openai compatibility"),
+              ("obs-007", "media_audio",       "lex fridman podcast sam altman openai gpt4"),
+              ("obs-008", "media_audio",       "gradient descent episode reinforcement learning reward"),
+              ("obs-009", "social",            "huggingface open source llama2 community"),
+              ("obs-010", "social",            "reddit machinelearning discussion benchmark leaderboard"),
+              ("obs-011", "research",          "retrieval augmented generation rag dense retrieval"),
+              ("obs-012", "research",          "mixture of experts sparse moe inference efficiency"),
+              ("obs-013", "developer_release", "transformers library huggingface tokenizer update"),
+              ("obs-014", "developer_release", "langchain breaking changes v0.2 migration guide"),
+              ("obs-015", "research",          "chain of thought prompting zero-shot reasoning"),
+              ("obs-016", "media_audio",       "a16z podcast ai investment enterprise saas"),
+              ("obs-017", "social",            "twitter ai ethics responsible model deployment"),
+              ("obs-018", "research",          "constitutional ai anthropic rlhf safety alignment"),
+              ("obs-019", "developer_release", "openai api function calling json mode response"),
+              ("obs-020", "research",          "neural network pruning quantization int8 inference"),
+              ("obs-021", "research",          "vision transformer vit image classification benchmark"),
+              ("obs-022", "developer_release", "docker buildkit secrets multi-stage build cache"),
+              ("obs-023", "media_audio",       "machine learning street talk yann lecun meta ai"),
+              ("obs-024", "social",            "github trending repositories ml llm open source week"),
+              ("obs-025", "research",          "sparse attention long context window position embedding"),
+              ("obs-026", "developer_release", "ray cluster distributed training autoscaling workers"),
+              ("obs-027", "research",          "emergent abilities large models few-shot prompting"),
+              ("obs-028", "media_audio",       "ycombinator ai startups founder interview product market fit"),
+              ("obs-029", "social",            "linkedin post ml engineer career skills demand pytorch"),
+              ("obs-030", "developer_release", "fastapi async endpoints pydantic v2 breaking changes"),
+          ]
+
+          chunk_ids: dict[str, str] = {}
+          for obs_id, family, text in CORPUS:
+              cid = store.ingest(ChunkRecord(
+                  observation_id=obs_id,
+                  source_family=family,
+                  text=text,
+              ))
+              chunk_ids[obs_id] = cid
+
+          print(f"[retrieval-gate] Corpus: {store.count()} chunks indexed", flush=True)
+
+          # ── Define labelled queries ─────────────────────────────────────────
+          QUERIES = [
+              RetrievalQuery("q01",  "attention transformer",         {chunk_ids["obs-001"]}),
+              RetrievalQuery("q02",  "large language model scaling",  {chunk_ids["obs-002"]}),
+              RetrievalQuery("q03",  "diffusion image generation",    {chunk_ids["obs-003"]}),
+              RetrievalQuery("q04",  "pytorch compile performance",   {chunk_ids["obs-004"]}),
+              RetrievalQuery("q05",  "kubernetes api deprecation",    {chunk_ids["obs-005"]}),
+              RetrievalQuery("q06",  "vllm batching openai",          {chunk_ids["obs-006"]}),
+              RetrievalQuery("q07",  "sam altman openai podcast",     {chunk_ids["obs-007"]}),
+              RetrievalQuery("q08",  "reinforcement learning reward", {chunk_ids["obs-008"]}),
+              RetrievalQuery("q09",  "llama2 huggingface open source",{chunk_ids["obs-009"]}),
+              RetrievalQuery("q10",  "retrieval augmented generation",{chunk_ids["obs-011"]}),
+              RetrievalQuery("q11",  "mixture of experts sparse moe", {chunk_ids["obs-012"]}),
+              RetrievalQuery("q12",  "langchain migration breaking",  {chunk_ids["obs-014"]}),
+              RetrievalQuery("q13",  "chain thought prompting",       {chunk_ids["obs-015"]}),
+              RetrievalQuery("q14",  "safety alignment rlhf anthropic",{chunk_ids["obs-018"]}),
+              RetrievalQuery("q15",  "model pruning quantization int8",{chunk_ids["obs-020"]}),
+          ]
+
+          # ── Keyword retriever backed by ChunkStore ──────────────────────────
+          def keyword_retriever(query: str) -> list[str]:
+              hits = store.keyword_search(query, top_k=10)
+              return [h.record.chunk_id for h in hits]
+
+          # ── Evaluate ────────────────────────────────────────────────────────
+          evaluator = RetrievalEvaluator()
+          metrics   = evaluator.evaluate(QUERIES, keyword_retriever, k=10)
+
+          print(f"[retrieval-gate] {metrics}", flush=True)
+          print(f"[retrieval-gate] Recall@10 = {metrics.recall_at_k:.4f}  "
+                f"(threshold >= {RECALL_THRESHOLD})", flush=True)
+          print(f"[retrieval-gate] MRR       = {metrics.mrr:.4f}  "
+                f"(threshold >= {MRR_THRESHOLD})", flush=True)
+
+          failures = []
+          if metrics.recall_at_k < RECALL_THRESHOLD:
+              failures.append(
+                  f"Recall@10={metrics.recall_at_k:.4f} < threshold {RECALL_THRESHOLD}"
+              )
+          if metrics.mrr < MRR_THRESHOLD:
+              failures.append(
+                  f"MRR={metrics.mrr:.4f} < threshold {MRR_THRESHOLD}"
+              )
+
+          if failures:
+              print("\n[retrieval-gate] FAILED:", flush=True)
+              for f in failures:
+                  print(f"  ✗ {f}", flush=True)
+              print(
+                  "\nRetrieval quality is below deployment thresholds. "
+                  "Investigate corpus quality, chunking parameters, or "
+                  "retriever implementation before merging.\n",
+                  flush=True,
+              )
+              sys.exit(1)
+
+          print("\n[retrieval-gate] PASSED — retrieval meets all thresholds.", flush=True)
+          EOF
+
   build:
     name: Build Docker Image
     runs-on: ubuntu-latest
-    needs: [lint]
+    needs: [lint, smoke-test, contract-test, eval-gate, retrieval-gate]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -247,5 +636,4 @@ jobs:
           tags: social-media-radar:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-        continue-on-error: true
 

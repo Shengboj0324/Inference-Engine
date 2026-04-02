@@ -30,6 +30,7 @@ Design for production
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import logging
 from typing import Any, Dict, List, Optional, TypedDict
@@ -37,6 +38,32 @@ from typing import Any, Dict, List, Optional, TypedDict
 from app.domain.raw_models import RawObservation
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# CapabilityMode — explicit execution-state enum
+# ---------------------------------------------------------------------------
+
+class CapabilityMode(str, enum.Enum):
+    """Represents the active execution tier of a ``MultimodalAnalyzer``.
+
+    Values
+    ------
+    DISABLED
+        No visual analysis attempted; ``visual_to_text`` always returns ``""``.
+    STUB
+        Deterministic synthetic results used (test / CI environments or when
+        no vision client is available in production).
+    LOCAL_MODEL
+        Analysis performed by a locally-loaded model (e.g. LLaVA via Ollama).
+    REMOTE_MODEL
+        Analysis performed by a remote vision API (e.g. GPT-4o, Claude 3.5
+        Sonnet, Gemini Pro Vision).
+    """
+    DISABLED     = "disabled"
+    STUB         = "stub"
+    LOCAL_MODEL  = "local_model"
+    REMOTE_MODEL = "remote_model"
 
 
 # ---------------------------------------------------------------------------
@@ -405,11 +432,44 @@ class MultimodalAnalyzer:
         self,
         model_name: str = "stub",
         vision_client: Optional[Any] = None,
+        execution_mode: CapabilityMode = CapabilityMode.STUB,
     ) -> None:
+        if not isinstance(model_name, str):
+            raise TypeError(f"model_name must be str, got {type(model_name).__name__!r}")
+        if not model_name.strip():
+            raise ValueError("model_name must not be empty")
+        if not isinstance(execution_mode, CapabilityMode):
+            raise TypeError(
+                f"execution_mode must be a CapabilityMode, got {type(execution_mode).__name__!r}"
+            )
         self.model_name = model_name
         self._vision_client = vision_client
+        self._execution_mode = execution_mode
+        logger.info(
+            "MultimodalAnalyzer init: model=%s execution_mode=%s vision_client=%s",
+            model_name,
+            execution_mode.value,
+            "injected" if vision_client is not None else "none",
+        )
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    @property
+    def execution_mode(self) -> CapabilityMode:
+        """Current execution tier of this analyzer.
+
+        Returns ``STUB`` when no vision client is configured,
+        ``DISABLED`` when explicitly disabled, ``LOCAL_MODEL`` or
+        ``REMOTE_MODEL`` when a real vision client is active.
+
+        Callers must check this property before trusting analysis confidence
+        scores — stub-mode results carry no real-model provenance.
+        """
+        if self._execution_mode == CapabilityMode.DISABLED:
+            return CapabilityMode.DISABLED
+        if self._vision_client is not None:
+            return self._execution_mode  # LOCAL_MODEL or REMOTE_MODEL as declared
+        return CapabilityMode.STUB
 
     def analyze_image(self, url: str) -> ImageAnalysisResult:
         """Return structured analysis of the image at *url*.
@@ -417,27 +477,49 @@ class MultimodalAnalyzer:
         Calls ``vision_client(url, 'image')`` when a client is injected;
         otherwise returns a deterministic stub suitable for test environments.
         Never raises — on client failure the stub result is returned.
+        Logs the active ``execution_mode`` on every call.
         """
+        if not isinstance(url, str):
+            raise TypeError(f"url must be str, got {type(url).__name__!r}")
+        if not url.strip():
+            raise ValueError("url must not be empty")
+        mode = self.execution_mode
+        logger.debug("MultimodalAnalyzer.analyze_image: url=%s mode=%s", url, mode.value)
+        if mode == CapabilityMode.DISABLED:
+            return self._stub_image_result(url)
         if self._vision_client is not None:
             try:
                 raw = self._vision_client(url, "image")
                 return self._parse_image_result(raw, url)
             except Exception as exc:
-                logger.warning("MultimodalAnalyzer: image analysis failed: %s", exc)
+                logger.warning(
+                    "MultimodalAnalyzer: image analysis failed (mode=%s): %s", mode.value, exc
+                )
         return self._stub_image_result(url)
 
     def analyze_video(self, url: str) -> VideoAnalysisResult:
         """Return structured analysis of the video at *url*.
 
         Calls ``vision_client(url, 'video')`` when a client is injected;
-        otherwise returns a deterministic stub.  Never raises.
+        otherwise returns a deterministic stub.  Logs the active
+        ``execution_mode`` on every call.  Never raises.
         """
+        if not isinstance(url, str):
+            raise TypeError(f"url must be str, got {type(url).__name__!r}")
+        if not url.strip():
+            raise ValueError("url must not be empty")
+        mode = self.execution_mode
+        logger.debug("MultimodalAnalyzer.analyze_video: url=%s mode=%s", url, mode.value)
+        if mode == CapabilityMode.DISABLED:
+            return self._stub_video_result(url)
         if self._vision_client is not None:
             try:
                 raw = self._vision_client(url, "video")
                 return self._parse_video_result(raw, url)
             except Exception as exc:
-                logger.warning("MultimodalAnalyzer: video analysis failed: %s", exc)
+                logger.warning(
+                    "MultimodalAnalyzer: video analysis failed (mode=%s): %s", mode.value, exc
+                )
         return self._stub_video_result(url)
 
     def visual_to_text(self, observation: RawObservation) -> str:
@@ -463,6 +545,14 @@ class MultimodalAnalyzer:
         Returns an empty string when no visual metadata is found so callers
         can check truthiness before appending.
         """
+        mode = self.execution_mode
+        logger.debug(
+            "MultimodalAnalyzer.visual_to_text: observation_id=%s mode=%s",
+            observation.id, mode.value,
+        )
+        if mode == CapabilityMode.DISABLED:
+            return ""
+
         meta = observation.platform_metadata or {}
         parts: List[str] = []
 

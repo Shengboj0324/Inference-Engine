@@ -81,21 +81,44 @@ class PDFIngestor:
         backend:      Force backend: ``"pdfplumber"``, ``"pypdf"``, ``"stub"``.
     """
 
+    #: Set to ``True`` to raise ``RuntimeError`` when only the stub backend
+    #: is available.  Must be ``True`` in production to surface misconfigured
+    #: environments rather than silently returning stub content.
+    PRODUCTION_GUARD: bool = False
+
     def __init__(
         self,
         max_pages: int = 0,
         min_chars: int = 50,
         backend: Optional[str] = None,
+        production_safe: bool = False,
     ) -> None:
+        """
+        Args:
+            max_pages: Maximum pages to extract (0 = all pages).
+            min_chars: Minimum characters per page to include.
+            backend: Force a specific backend: ``"pdfplumber"``, ``"pypdf"``,
+                     or ``"stub"``.  ``None`` = auto-select.
+            production_safe: When ``True``, raises ``RuntimeError`` if only the
+                             stub backend is available.  Set to ``True`` in all
+                             production deployments; leave ``False`` for CI/tests.
+        """
+        if not isinstance(max_pages, int):
+            raise TypeError(f"'max_pages' must be int, got {type(max_pages).__name__!r}")
         if max_pages < 0:
             raise ValueError(f"'max_pages' must be >= 0, got {max_pages!r}")
+        if not isinstance(min_chars, int):
+            raise TypeError(f"'min_chars' must be int, got {type(min_chars).__name__!r}")
         if min_chars < 0:
             raise ValueError(f"'min_chars' must be >= 0, got {min_chars!r}")
         if backend is not None and backend not in {"pdfplumber", "pypdf", "stub"}:
             raise ValueError(f"'backend' must be one of 'pdfplumber', 'pypdf', 'stub', got {backend!r}")
+        if not isinstance(production_safe, bool):
+            raise TypeError(f"'production_safe' must be bool, got {type(production_safe).__name__!r}")
         self._max_pages = max_pages
         self._min_chars = min_chars
         self._forced_backend = backend
+        self._production_safe = production_safe
 
     def ingest(self, pdf_path: str) -> PDFDocument:
         """Extract text and structure from a PDF file.
@@ -118,13 +141,27 @@ class PDFIngestor:
 
         t0 = time.perf_counter()
         backend = self._forced_backend or self._select_backend()
-        logger.info("PDFIngestor: backend=%s path=%s", backend, pdf_path)
+
+        if backend == "stub" and self._production_safe:
+            raise RuntimeError(
+                "PDFIngestor: no real PDF extraction backend is available "
+                "(pdfplumber and pypdf are both missing) but production_safe=True "
+                "prevents silent stub fallback.  Install 'pdfplumber' or 'pypdf' "
+                "before deploying, or set production_safe=False for CI/testing."
+            )
+
+        logger.info("PDFIngestor: backend=%s production_safe=%s path=%s",
+                    backend, self._production_safe, pdf_path)
 
         if backend == "pdfplumber":
             doc = self._ingest_pdfplumber(pdf_path)
         elif backend == "pypdf":
             doc = self._ingest_pypdf(pdf_path)
         else:
+            logger.warning(
+                "PDFIngestor: falling back to stub for %s — no extraction "
+                "backend available (pdfplumber/pypdf not installed)", pdf_path
+            )
             doc = self._ingest_stub(pdf_path)
 
         doc.extraction_backend = backend

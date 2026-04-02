@@ -30,10 +30,12 @@ from typing import Any, List, Optional
 from app.personalization.interest_graph import InterestGraph
 from app.personalization.models import (
     DigestCandidate,
+    FeedbackEvent,
     RankedDigestItem,
     RankingWeights,
 )
 from app.personalization.topic_embedding_profile import TopicEmbeddingProfile, _cosine_similarity
+from app.personalization.novelty_scorer import NoveltyScorer
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +65,24 @@ class UserDigestRanker:
     """Multi-signal digest ranker personalized to a user's interest graph.
 
     Args:
-        interest_graph:      Per-user ``InterestGraph``; may be None (scores zero).
-        embedding_profile:   Per-user ``TopicEmbeddingProfile``; may be None.
-        weights:             ``RankingWeights`` (normalized automatically).
-        novelty_tradeoff:    Optional ``NoveltyRelevanceTradeoff`` for dynamic α.
-        top_interest_k:      How many top interests to use for topic relevance.
-        recency_half_life_h: Half-life in hours for recency score.
-        boost_weight:        Weight of personalization_boost in final score [0, 1].
+        interest_graph:       Per-user ``InterestGraph``; may be None (scores zero).
+        embedding_profile:    Per-user ``TopicEmbeddingProfile``; may be None.
+        weights:              ``RankingWeights`` (normalized automatically).
+        novelty_tradeoff:     Optional ``NoveltyRelevanceTradeoff`` for dynamic α.
+        novelty_scorer:       Optional live ``NoveltyScorer`` (overrides pre-computed
+                              ``DigestCandidate.novelty_score``).
+        watchlist_graph:      Optional ``WatchlistGraph``.  Items whose ``topic_ids``
+                              or ``entity_ids`` match a watched node receive an
+                              additional boost proportional to that node's priority.
+        feedback_learner:     Optional ``FeedbackLearner``.  When provided,
+                              :meth:`apply_feedback` delegates to it so that the
+                              embedded ``InterestGraph`` is updated after each user
+                              interaction.  The same ``InterestGraph`` instance
+                              should be shared between this ranker and the learner.
+        top_interest_k:       How many top interests to use for topic relevance.
+        recency_half_life_h:  Half-life in hours for recency score.
+        boost_weight:         Weight of personalization_boost in final score [0, 1].
+        watchlist_boost_weight: Additional weight for watchlist-matched items [0, 1].
     """
 
     def __init__(
@@ -78,28 +91,44 @@ class UserDigestRanker:
         embedding_profile: Optional[TopicEmbeddingProfile] = None,
         weights: Optional[RankingWeights] = None,
         novelty_tradeoff: Optional[Any] = None,
+        novelty_scorer: Optional[NoveltyScorer] = None,
+        watchlist_graph: Optional[Any] = None,
+        feedback_learner: Optional[Any] = None,
         top_interest_k: int = 20,
         recency_half_life_h: float = _RECENCY_HALF_LIFE_HOURS,
         boost_weight: float = 0.1,
+        watchlist_boost_weight: float = 0.10,
     ) -> None:
         if interest_graph is not None and not isinstance(interest_graph, InterestGraph):
             raise TypeError(f"'interest_graph' must be InterestGraph or None")
         if embedding_profile is not None and not isinstance(embedding_profile, TopicEmbeddingProfile):
             raise TypeError(f"'embedding_profile' must be TopicEmbeddingProfile or None")
+        if novelty_scorer is not None and not isinstance(novelty_scorer, NoveltyScorer):
+            raise TypeError(f"'novelty_scorer' must be NoveltyScorer or None")
         if top_interest_k <= 0:
             raise ValueError(f"'top_interest_k' must be positive, got {top_interest_k!r}")
         if recency_half_life_h <= 0:
             raise ValueError(f"'recency_half_life_h' must be positive, got {recency_half_life_h!r}")
         if not (0.0 <= boost_weight <= 1.0):
             raise ValueError(f"'boost_weight' must be in [0, 1], got {boost_weight!r}")
+        if not (0.0 <= watchlist_boost_weight <= 1.0):
+            raise ValueError(
+                f"'watchlist_boost_weight' must be in [0, 1], got {watchlist_boost_weight!r}"
+            )
 
         self._graph = interest_graph
         self._profile = embedding_profile
         self._weights = (weights or RankingWeights()).normalized()
         self._tradeoff = novelty_tradeoff
+        self._novelty_scorer = novelty_scorer
+        # WatchlistGraph — duck-typed so tests can inject plain mocks
+        self._watchlist_graph = watchlist_graph
+        # FeedbackLearner — duck-typed; must have .process_feedback(event)
+        self._feedback_learner = feedback_learner
         self._top_k = top_interest_k
         self._half_life = recency_half_life_h
         self._boost_weight = boost_weight
+        self._watchlist_boost_weight = watchlist_boost_weight
 
     def rank(
         self,
@@ -177,7 +206,18 @@ class UserDigestRanker:
         # 4–6. Pass-through signals
         eng = candidate.engagement_score
         tru = candidate.trust_score
-        nov = candidate.novelty_score
+        # Use live NoveltyScorer if provided; fall back to pre-computed field
+        if self._novelty_scorer is not None:
+            try:
+                nov = self._novelty_scorer.score(candidate)
+            except Exception as exc:
+                logger.warning(
+                    "UserDigestRanker: NoveltyScorer.score failed for item=%s: %s",
+                    candidate.item_id, exc,
+                )
+                nov = candidate.novelty_score
+        else:
+            nov = candidate.novelty_score
 
         # Apply novelty-relevance tradeoff if configured
         if self._tradeoff is not None:
@@ -205,7 +245,34 @@ class UserDigestRanker:
             if match_weights:
                 boost = min(1.0, sum(match_weights) / len(match_weights))
 
-        final = min(1.0, base_score * (1.0 - self._boost_weight) + boost * self._boost_weight)
+        # Watchlist boost: items whose topic/entity IDs match a watched node
+        # receive a boost proportional to that node's priority.
+        watchlist_boost = 0.0
+        if self._watchlist_graph is not None:
+            try:
+                candidate_ids = set(candidate.topic_ids) | set(candidate.entity_ids)
+                if candidate_ids:
+                    watched = self._watchlist_graph.watched_nodes()
+                    matched = [n for n in watched if n.node_id in candidate_ids]
+                    if matched:
+                        watchlist_boost = min(
+                            1.0,
+                            sum(n.priority for n in matched) / len(matched),
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "UserDigestRanker: watchlist_graph.watched_nodes() failed "
+                    "for item=%s: %s", candidate.item_id, exc,
+                )
+
+        # Combine: base_score → personalization boost → watchlist boost
+        # Order of blending: first apply personalization boost, then watchlist
+        after_boost = min(1.0, base_score * (1.0 - self._boost_weight) + boost * self._boost_weight)
+        final = min(
+            1.0,
+            after_boost * (1.0 - self._watchlist_boost_weight)
+            + watchlist_boost * self._watchlist_boost_weight,
+        )
 
         return RankedDigestItem(
             item_id=candidate.item_id,
@@ -225,6 +292,68 @@ class UserDigestRanker:
                 "trust": round(tru, 4),
                 "novelty": round(nov, 4),
                 "boost": round(boost, 4),
+                "watchlist_boost": round(watchlist_boost, 4),
             },
         )
+
+    # ------------------------------------------------------------------
+    # Feedback integration
+    # ------------------------------------------------------------------
+
+    @property
+    def watchlist_graph(self) -> Optional[Any]:
+        """The ``WatchlistGraph`` injected at construction, or ``None``."""
+        return self._watchlist_graph
+
+    @property
+    def feedback_learner(self) -> Optional[Any]:
+        """The ``FeedbackLearner`` injected at construction, or ``None``."""
+        return self._feedback_learner
+
+    def apply_feedback(self, event: "FeedbackEvent") -> None:
+        """Process a user feedback event and update interest graph + tradeoff.
+
+        Delegates to the embedded ``FeedbackLearner`` (if provided) to update
+        the ``InterestGraph`` weights.  If a ``NoveltyRelevanceTradeoff`` is
+        also present, it is updated so that future ``rank()`` calls reflect the
+        shifted exploration-vs-exploitation balance.
+
+        This is the canonical integration point between user interactions and
+        the personalization layer.
+
+        Args:
+            event: A ``FeedbackEvent`` representing one user interaction.
+
+        Raises:
+            TypeError: If *event* is not a ``FeedbackEvent``.
+
+        Notes:
+            Errors from the ``FeedbackLearner`` or ``NoveltyRelevanceTradeoff``
+            are caught, logged, and do NOT propagate — the caller must not assume
+            these subsystems are infallible.
+        """
+        if not isinstance(event, FeedbackEvent):
+            raise TypeError(f"Expected FeedbackEvent, got {type(event)!r}")
+
+        # Update interest graph via FeedbackLearner
+        if self._feedback_learner is not None:
+            try:
+                self._feedback_learner.process_feedback(event)
+            except Exception as exc:
+                logger.warning(
+                    "UserDigestRanker.apply_feedback: FeedbackLearner failed "
+                    "for user=%s item=%s: %s",
+                    event.user_id, event.item_id, exc,
+                )
+
+        # Update novelty-vs-relevance tradeoff alpha
+        if self._tradeoff is not None:
+            try:
+                self._tradeoff.update_from_feedback(event)
+            except Exception as exc:
+                logger.warning(
+                    "UserDigestRanker.apply_feedback: NoveltyRelevanceTradeoff "
+                    "update failed for user=%s: %s",
+                    event.user_id, exc,
+                )
 

@@ -482,6 +482,59 @@ class LLMRouter:
 
         return response.content
 
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.7,
+        strategy: RoutingStrategy = RoutingStrategy.BALANCED,
+        **kwargs,
+    ) -> str:
+        """Thin completion alias used by audio-intelligence and document-intelligence modules.
+
+        This method is intentionally a transparent delegate to ``generate_simple``
+        so that callers do not need to import ``RoutingStrategy`` directly.
+
+        Args:
+            prompt: User-facing prompt text.
+            system_prompt: Optional system instruction.
+            max_tokens: Upper bound on generated tokens (``None`` = model default).
+            temperature: Sampling temperature in ``[0.0, 2.0]``.
+            strategy: Routing strategy (default: ``BALANCED``).
+            **kwargs: Forwarded verbatim to the underlying provider client.
+
+        Returns:
+            Generated text as a plain string.
+
+        Raises:
+            TypeError: If *prompt* is not a ``str``.
+            ValueError: If *prompt* is empty or *temperature* is outside ``[0.0, 2.0]``.
+            LLMError: If all configured models fail.
+        """
+        if not isinstance(prompt, str):
+            raise TypeError(f"prompt must be a str, got {type(prompt).__name__!r}")
+        if not prompt.strip():
+            raise ValueError("prompt must not be empty or whitespace-only")
+        if not isinstance(temperature, (int, float)):
+            raise TypeError(f"temperature must be a float, got {type(temperature).__name__!r}")
+        if not (0.0 <= float(temperature) <= 2.0):
+            raise ValueError(f"temperature must be in [0.0, 2.0], got {temperature!r}")
+
+        logger.debug(
+            "LLMRouter.complete: max_tokens=%s temperature=%s strategy=%s",
+            max_tokens, temperature, strategy.value,
+        )
+        return await self.generate_simple(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            strategy=strategy,
+            temperature=float(temperature),
+            max_tokens=max_tokens,
+            **kwargs,
+        )
+
     def get_stats(self) -> dict:
         """Get router statistics.
 

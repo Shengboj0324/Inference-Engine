@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
@@ -137,6 +137,66 @@ class RankingEvaluator:
         if not top_k:
             return 0.0
         return sum(1 for sid in top_k if sid in relevant) / len(top_k)
+
+    def gate(
+        self,
+        report: "RankingReport",
+        ndcg_at_k: int = 10,
+        ndcg_threshold: float = 0.60,
+        opportunity_hit_rate_threshold: Optional[float] = None,
+    ) -> None:
+        """Raise ``ValueError`` when the report does not meet deployment thresholds.
+
+        Args:
+            report:                         A ``RankingReport`` from ``evaluate()``.
+            ndcg_at_k:                      The ``k`` value to gate on (default 10).
+                                            Must be present in ``report.ndcg``.
+            ndcg_threshold:                 Minimum required NDCG@k (default 0.60).
+            opportunity_hit_rate_threshold: Optional minimum required
+                                            opportunity-hit-rate@k (default: not checked).
+
+        Raises:
+            TypeError:  If *report* is not a ``RankingReport``.
+            ValueError: If *ndcg_at_k* is not a positive int.
+            ValueError: If the report does not meet the thresholds.
+            KeyError:   If *ndcg_at_k* is not in ``report.ndcg``.
+        """
+        if not isinstance(report, RankingReport):
+            raise TypeError(
+                f"'report' must be a RankingReport, got {type(report).__name__!r}"
+            )
+        if not isinstance(ndcg_at_k, int) or ndcg_at_k < 1:
+            raise ValueError(f"'ndcg_at_k' must be a positive int, got {ndcg_at_k!r}")
+        if not (0.0 <= ndcg_threshold <= 1.0):
+            raise ValueError(
+                f"'ndcg_threshold' must be in [0, 1], got {ndcg_threshold!r}"
+            )
+        if ndcg_at_k not in report.ndcg:
+            raise KeyError(
+                f"ndcg_at_k={ndcg_at_k} not found in report.ndcg; "
+                f"available k values: {sorted(report.ndcg)}"
+            )
+
+        failures = []
+        actual_ndcg = report.ndcg[ndcg_at_k]
+        if actual_ndcg < ndcg_threshold:
+            failures.append(
+                f"NDCG@{ndcg_at_k}={actual_ndcg:.4f} < threshold={ndcg_threshold:.4f}"
+            )
+        if opportunity_hit_rate_threshold is not None and ndcg_at_k in report.opportunity_hit_rate:
+            ohr = report.opportunity_hit_rate[ndcg_at_k]
+            if ohr < opportunity_hit_rate_threshold:
+                failures.append(
+                    f"OHR@{ndcg_at_k}={ohr:.4f} < threshold={opportunity_hit_rate_threshold:.4f}"
+                )
+        if failures:
+            msg = "RankingEvaluator.gate FAILED: " + "; ".join(failures)
+            logger.error(msg)
+            raise ValueError(msg)
+        logger.info(
+            "RankingEvaluator.gate PASSED: NDCG@%d=%.4f threshold=%.2f",
+            ndcg_at_k, actual_ndcg, ndcg_threshold,
+        )
 
     @staticmethod
     def _first_rank(ranked: Sequence[str], relevant: Set[str]) -> float:

@@ -46,6 +46,58 @@ class TranscriptSegment(BaseModel, frozen=True):
         return timedelta(seconds=self.duration_s)
 
 
+class TranscriptResult(BaseModel, frozen=True):
+    """Complete transcription result with backend provenance.
+
+    Wraps the raw segment list produced by ``TranscriptionRouter.transcribe()``
+    and adds backend identification and aggregate confidence so downstream
+    callers can make trust decisions without re-inspecting individual segments.
+
+    Attributes:
+        segments:        Time-aligned ASR segments (may be empty for silent audio).
+        backend_used:    ASR backend that produced this result (e.g.
+                         ``"faster_whisper"``, ``"whisper"``, ``"openai"``,
+                         ``"stub"``).
+        mean_confidence: Mean of per-segment confidence scores; ``None`` if the
+                         backend does not emit per-segment confidence (e.g.
+                         ``"whisper"`` or ``"openai"`` backends in verbose_json
+                         mode without ``avg_logprob`` entries).
+        duration_s:      Total audio duration in seconds (sum of all segment
+                         durations; ``0.0`` for empty results).
+        language:        Detected language BCP-47 code (taken from the first
+                         segment; ``"und"`` if no segments were produced).
+    """
+
+    segments: List[TranscriptSegment] = Field(default_factory=list)
+    backend_used: str = Field(..., min_length=1)
+    mean_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    duration_s: float = Field(default=0.0, ge=0.0)
+    language: str = "und"
+
+    @model_validator(mode="after")
+    def _derive_fields(self) -> "TranscriptResult":
+        """Validate that mean_confidence is consistent with segment data."""
+        confs = [s.confidence for s in self.segments if s.confidence is not None]
+        if self.mean_confidence is not None and confs:
+            computed = sum(confs) / len(confs)
+            if abs(computed - self.mean_confidence) > 0.01:
+                raise ValueError(
+                    f"mean_confidence {self.mean_confidence:.4f} deviates "
+                    f"more than 0.01 from computed mean {computed:.4f}"
+                )
+        return self
+
+    @property
+    def full_text(self) -> str:
+        """Concatenated transcript text across all segments."""
+        return " ".join(s.text for s in self.segments if s.text)
+
+    @property
+    def is_stub(self) -> bool:
+        """True when the backend is the no-op stub (testing / CI only)."""
+        return self.backend_used == "stub"
+
+
 class DiarizedSegment(BaseModel, frozen=True):
     """A TranscriptSegment annotated with speaker identity.
 

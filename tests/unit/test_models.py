@@ -3,6 +3,7 @@
 from datetime import datetime
 from uuid import uuid4
 
+import numpy as np
 import pytest
 
 from app.core.models import (
@@ -725,3 +726,188 @@ class TestFeedbackStore:
         )
         after_t = cal._scalars.get("complaint", 1.0)
         assert after_t != before_t
+
+
+# ===========================================================================
+# TemperatureScaler tests (post-hoc calibration — GAP-R1)
+# ===========================================================================
+
+class TestTemperatureScaler:
+    """Unit tests for training.calibration.temperature_scaling.TemperatureScaler."""
+
+    @staticmethod
+    def _make_data(n: int = 200, seed: int = 0) -> tuple:
+        """Synthetic overconfident model: confidences drawn from Beta(8,2) ≈ 0.8."""
+        rng = np.random.default_rng(seed)
+        probs  = rng.beta(8, 2, n)
+        labels = (rng.random(n) < 0.60).astype(float)   # model is ~60% accurate
+        return probs, labels
+
+    def test_fit_returns_self(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        probs, labels = self._make_data()
+        ts = TemperatureScaler()
+        result = ts.fit(probs, labels)
+        assert result is ts
+
+    def test_temperature_attribute_set_after_fit(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        probs, labels = self._make_data()
+        ts = TemperatureScaler().fit(probs, labels)
+        assert ts.temperature_ is not None
+        assert ts.temperature_ > 0.0
+
+    def test_overconfident_model_gets_t_greater_than_one(self):
+        """For an overconfident model (high confidence, low accuracy) T* > 1."""
+        from training.calibration.temperature_scaling import TemperatureScaler
+        probs, labels = self._make_data()
+        ts = TemperatureScaler().fit(probs, labels)
+        assert ts.temperature_ > 1.0
+
+    def test_calibrate_returns_array_in_unit_interval(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        probs, labels = self._make_data()
+        ts = TemperatureScaler().fit(probs, labels)
+        cal = ts.calibrate(probs)
+        assert cal.shape == probs.shape
+        assert np.all(cal >= 0.0)
+        assert np.all(cal <= 1.0)
+
+    def test_calibrate_before_fit_raises(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        with pytest.raises(RuntimeError, match="before fit"):
+            TemperatureScaler().calibrate(np.array([0.5, 0.7]))
+
+    def test_empty_probs_raises(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        with pytest.raises(ValueError, match="non-empty"):
+            TemperatureScaler().fit(np.array([]), np.array([]))
+
+    def test_mismatched_lengths_raises(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        with pytest.raises(ValueError, match="same length"):
+            TemperatureScaler().fit(np.array([0.5, 0.6]), np.array([1]))
+
+    def test_probs_out_of_range_raises(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            TemperatureScaler().fit(np.array([0.5, 1.5]), np.array([1, 0]))
+
+    def test_invalid_labels_raises(self):
+        from training.calibration.temperature_scaling import TemperatureScaler
+        with pytest.raises(ValueError, match="0 and 1"):
+            TemperatureScaler().fit(np.array([0.5, 0.6]), np.array([2, 3]))
+
+    def test_nll_decreases_after_calibration(self):
+        """NLL after fitting must be <= NLL at T=1 (uncalibrated)."""
+        from training.calibration.temperature_scaling import TemperatureScaler
+        probs, labels = self._make_data()
+        ts = TemperatureScaler().fit(probs, labels)
+        assert ts.nll_after_ is not None
+        assert ts.nll_before_ is not None
+        assert ts.nll_after_ <= ts.nll_before_ + 1e-6
+
+
+# ===========================================================================
+# IsotonicCalibrator tests (post-hoc calibration — GAP-R1)
+# ===========================================================================
+
+class TestIsotonicCalibrator:
+    """Unit tests for training.calibration.isotonic_calibration.IsotonicCalibrator."""
+
+    @staticmethod
+    def _make_anti_correlated(n: int = 300, seed: int = 42) -> tuple:
+        """Data where high confidence → more likely wrong (like the actual dataset)."""
+        rng = np.random.default_rng(seed)
+        probs  = rng.uniform(0.05, 0.99, n)
+        # Anti-correlated: higher confidence → lower accuracy
+        labels = (rng.random(n) < (1.0 - probs * 0.8)).astype(float)
+        return probs, labels
+
+    def test_fit_returns_self(self):
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        probs, labels = self._make_anti_correlated()
+        iso = IsotonicCalibrator()
+        result = iso.fit(probs, labels)
+        assert result is iso
+
+    def test_iso_attribute_set_after_fit(self):
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        probs, labels = self._make_anti_correlated()
+        iso = IsotonicCalibrator().fit(probs, labels)
+        assert iso.iso_ is not None
+
+    def test_anti_correlated_direction_is_decreasing(self):
+        """Anti-correlated data must produce a decreasing isotonic fit."""
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        probs, labels = self._make_anti_correlated()
+        iso = IsotonicCalibrator().fit(probs, labels)
+        # sklearn returns numpy.bool_, not Python bool — use == not `is`
+        assert not iso.increasing_, f"Expected decreasing fit; got increasing_={iso.increasing_}"
+
+    def test_calibrate_returns_array_in_unit_interval(self):
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        probs, labels = self._make_anti_correlated()
+        iso = IsotonicCalibrator().fit(probs, labels)
+        cal = iso.calibrate(probs)
+        assert cal.shape == probs.shape
+        assert np.all(cal >= 0.0)
+        assert np.all(cal <= 1.0)
+
+    def test_calibrate_before_fit_raises(self):
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        with pytest.raises(RuntimeError, match="before fit"):
+            IsotonicCalibrator().calibrate(np.array([0.5, 0.7]))
+
+    def test_empty_probs_raises(self):
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        with pytest.raises(ValueError, match="non-empty"):
+            IsotonicCalibrator().fit(np.array([]), np.array([]))
+
+    def test_mismatched_lengths_raises(self):
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        with pytest.raises(ValueError, match="same length"):
+            IsotonicCalibrator().fit(np.array([0.5, 0.7]), np.array([1]))
+
+    def test_probs_out_of_range_raises(self):
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            IsotonicCalibrator().fit(np.array([-0.1, 0.5]), np.array([0, 1]))
+
+    def test_ece_reduces_on_train_data(self):
+        """Isotonic regression must reduce ECE on the training data to near 0."""
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        from app.intelligence.calibration import Calibrator
+        probs, labels = self._make_anti_correlated(n=500)
+        iso = IsotonicCalibrator().fit(probs, labels)
+        cal = iso.calibrate(probs)
+        # Use existing Calibrator.compute_ece
+        raw_ece = Calibrator.compute_ece(probs.tolist(), labels.tolist())
+        cal_ece = Calibrator.compute_ece(cal.tolist(), labels.tolist())
+        assert cal_ece < raw_ece, f"Calibrated ECE ({cal_ece:.4f}) must be < raw ECE ({raw_ece:.4f})"
+
+    def test_real_dataset_holdout_ece(self):
+        """On the actual signal-classification dataset: ECE must be <= 0.10 on val split."""
+        import json
+        from pathlib import Path
+        from training.calibration.isotonic_calibration import IsotonicCalibrator
+        from app.intelligence.calibration import Calibrator
+        dataset_path = Path("training/signal_classification_dataset.jsonl")
+        if not dataset_path.exists():
+            pytest.skip("Dataset not found — skipping integration calibration test")
+        records = [json.loads(l) for l in dataset_path.open() if l.strip()]
+        rng = np.random.default_rng(42)
+        idx = rng.permutation(len(records))
+        n_train = int(0.8 * len(records))
+        train_idx, val_idx = idx[:n_train], idx[n_train:]
+        train_recs = [records[i] for i in train_idx]
+        val_recs   = [records[i] for i in val_idx]
+        train_p = np.array([r["confidence"] for r in train_recs])
+        train_l = np.array([0 if r["is_hard_negative"] else 1 for r in train_recs], dtype=float)
+        val_p   = np.array([r["confidence"] for r in val_recs])
+        val_l   = np.array([0 if r["is_hard_negative"] else 1 for r in val_recs], dtype=float)
+        iso = IsotonicCalibrator().fit(train_p, train_l)
+        cal = iso.calibrate(val_p)
+        ece = Calibrator.compute_ece(cal.tolist(), val_l.tolist())
+        assert ece <= 0.10, f"ECE={ece:.4f} exceeds deployment threshold 0.10"
+

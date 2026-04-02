@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import enum
 import io
 import logging
 import time
@@ -171,12 +172,63 @@ class InfographicGenerator(BaseOutputGenerator):
         return True
 
 
-class VideoGenerator(BaseOutputGenerator):
-    """Generate AI video summaries (placeholder for future implementation)."""
+class VideoGenerationMode(str, enum.Enum):
+    """Execution mode for ``VideoGenerator``.
 
-    def __init__(self, preferences: OutputPreferences):
+    Values
+    ------
+    SCRIPT_ONLY
+        Produces a structured Markdown script without rendering video.
+        This is the current production-ready mode.  Downstream callers
+        should use the script for TTS or human narration.
+    LOCAL_RENDER
+        Produces a video file using locally-installed tools (FFmpeg + TTS).
+        Requires ``ffmpeg`` and a TTS backend to be installed.
+    REMOTE_RENDER
+        Delegates rendering to a remote video-generation API (e.g. Sora,
+        Runway ML).  Requires valid API credentials.
+    """
+    SCRIPT_ONLY   = "script_only"
+    LOCAL_RENDER  = "local_render"
+    REMOTE_RENDER = "remote_render"
+
+
+class VideoGenerator(BaseOutputGenerator):
+    """Generate AI video summaries.
+
+    ``VideoGenerator`` explicitly tracks its ``generation_mode`` so callers
+    are never silently handed a script when they expect a rendered video.
+
+    Args:
+        preferences:      Output preferences (inherited from ``BaseOutputGenerator``).
+        generation_mode:  Active execution tier.  Defaults to ``SCRIPT_ONLY``
+                          (the only fully-implemented mode).  Setting
+                          ``LOCAL_RENDER`` or ``REMOTE_RENDER`` without the
+                          necessary dependencies or credentials raises
+                          ``RuntimeError`` on first ``generate()`` call.
+    """
+
+    def __init__(
+        self,
+        preferences: OutputPreferences,
+        generation_mode: VideoGenerationMode = VideoGenerationMode.SCRIPT_ONLY,
+    ) -> None:
         """Initialize video generator."""
         super().__init__(preferences)
+        if not isinstance(generation_mode, VideoGenerationMode):
+            raise TypeError(
+                f"'generation_mode' must be a VideoGenerationMode, "
+                f"got {type(generation_mode).__name__!r}"
+            )
+        self._generation_mode = generation_mode
+        logger.info(
+            "VideoGenerator init: generation_mode=%s", generation_mode.value
+        )
+
+    @property
+    def generation_mode(self) -> VideoGenerationMode:
+        """The active video generation mode."""
+        return self._generation_mode
 
     async def generate(
         self,
@@ -185,20 +237,49 @@ class VideoGenerator(BaseOutputGenerator):
         items: List[ContentItem],
         **kwargs,
     ) -> GeneratedOutput:
-        """Generate video summary.
+        """Generate a video summary in the configured ``generation_mode``.
 
-        This is a placeholder. In production, this would:
-        1. Generate script from clusters
-        2. Use TTS to create voiceover
-        3. Generate visuals using AI (Stable Diffusion, etc.)
-        4. Combine with video editing tools (FFmpeg)
-        5. Add background music and transitions
+        Currently only ``SCRIPT_ONLY`` is fully implemented.  Requesting
+        ``LOCAL_RENDER`` or ``REMOTE_RENDER`` raises ``NotImplementedError``
+        unless the caller injects a ``renderer`` kwarg (integration hook for
+        future backends).
+
+        Args:
+            request:  Output request metadata.
+            clusters: Topic clusters to summarise.
+            items:    Source content items.
+            **kwargs: Reserved for future renderer injection
+                      (``renderer`` callable for LOCAL_RENDER/REMOTE_RENDER).
+
+        Returns:
+            ``GeneratedOutput`` with the script as ``content`` and
+            ``generation_mode`` recorded in ``metadata.extra_metadata``.
+
+        Raises:
+            NotImplementedError: When mode is ``LOCAL_RENDER`` or
+                                 ``REMOTE_RENDER`` and no ``renderer`` kwarg
+                                 is provided.
         """
+        mode = self._generation_mode
+        logger.info(
+            "VideoGenerator.generate: mode=%s clusters=%d items=%d",
+            mode.value, len(clusters), len(items),
+        )
         start_time = time.time()
 
-        # For now, return a placeholder
-        script = self._generate_script(clusters, items)
+        if mode in (VideoGenerationMode.LOCAL_RENDER, VideoGenerationMode.REMOTE_RENDER):
+            renderer = kwargs.get("renderer")
+            if renderer is None:
+                raise NotImplementedError(
+                    f"VideoGenerator mode='{mode.value}' requires a 'renderer' "
+                    "callable to be passed as a kwarg.  "
+                    "Install the required backend and inject it, or use "
+                    "VideoGenerationMode.SCRIPT_ONLY for the current release."
+                )
+            return await renderer(request, clusters, items)
 
+        # SCRIPT_ONLY — fully implemented
+        script = self._generate_script(clusters, items)
         generation_time_ms = int((time.time() - start_time) * 1000)
 
         metadata = OutputMetadata(
@@ -207,17 +288,27 @@ class VideoGenerator(BaseOutputGenerator):
             word_count=len(script.split()),
         )
 
+        summary = (
+            f"AI-generated video script ({len(clusters)} topic clusters, "
+            f"{len(items)} source items). "
+            f"Generation mode: {mode.value}. "
+            "Render with a TTS + FFmpeg pipeline to produce the final video."
+        )
+
         output = GeneratedOutput(
             user_id=request.user_id,
             digest_id=request.digest_id,
             preferences_id=request.preferences_id or self.preferences.id,
             format=OutputFormat.VIDEO,
-            content=script,  # Video script for now
+            content=script,
             metadata=metadata,
-            title="Daily Intelligence Video",
-            summary="AI-generated video summary (script only - video generation coming soon)",
+            title="Daily Intelligence Video Script",
+            summary=summary,
         )
-
+        logger.debug(
+            "VideoGenerator.generate: done mode=%s script_words=%d latency_ms=%d",
+            mode.value, len(script.split()), generation_time_ms,
+        )
         return output
 
     def _generate_script(self, clusters: List[Cluster], items: List[ContentItem]) -> str:

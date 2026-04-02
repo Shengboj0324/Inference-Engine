@@ -1636,3 +1636,61 @@ class TestCrossComponentPackageImports:
         assert 0.2 <= score <= 0.95
         summary = audit.get_summary(cfg.tenant_id)
         assert summary["total_events"] == 1
+
+
+
+# ===========================================================================
+# GAP-1: LLMRouter.complete() contract tests
+# ===========================================================================
+
+class TestLLMRouterComplete:
+    """Verify LLMRouter.complete() exists, is async, and validates inputs (GAP-1)."""
+
+    def test_complete_exists(self):
+        import inspect
+        from app.llm.router import LLMRouter
+        assert hasattr(LLMRouter, "complete"), "LLMRouter.complete() is missing"
+        assert inspect.iscoroutinefunction(LLMRouter.complete), \
+            "LLMRouter.complete() must be an async coroutine"
+
+    def test_complete_signature_has_required_params(self):
+        import inspect
+        from app.llm.router import LLMRouter
+        sig = inspect.signature(LLMRouter.complete)
+        params = list(sig.parameters)
+        for p in ("prompt", "max_tokens", "temperature"):
+            assert p in params, f"'{p}' missing from LLMRouter.complete() signature"
+
+    def test_complete_empty_prompt_raises(self):
+        import asyncio
+        from app.llm.router import LLMRouter
+        router = LLMRouter.__new__(LLMRouter)
+        with pytest.raises(ValueError, match="empty"):
+            asyncio.run(router.complete("   "))
+
+    def test_complete_wrong_prompt_type_raises(self):
+        import asyncio
+        from app.llm.router import LLMRouter
+        router = LLMRouter.__new__(LLMRouter)
+        with pytest.raises(TypeError, match="prompt"):
+            asyncio.run(router.complete(42))  # type: ignore
+
+    def test_complete_temperature_out_of_range_raises(self):
+        import asyncio
+        from app.llm.router import LLMRouter
+        router = LLMRouter.__new__(LLMRouter)
+        with pytest.raises(ValueError, match="temperature"):
+            asyncio.run(router.complete("hello", temperature=5.0))
+
+    def test_complete_delegates_to_generate_simple(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.llm.router import LLMRouter
+        router = LLMRouter.__new__(LLMRouter)
+        router.generate_simple = AsyncMock(return_value="mocked response")
+        result = asyncio.run(router.complete("hello", max_tokens=100, temperature=0.5))
+        assert result == "mocked response"
+        router.generate_simple.assert_awaited_once()
+        call_kwargs = router.generate_simple.call_args
+        assert call_kwargs.kwargs["max_tokens"] == 100
+        assert call_kwargs.kwargs["temperature"] == 0.5

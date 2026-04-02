@@ -271,3 +271,56 @@ class AdversarialEvaluator:
         )
         return report
 
+    def gate(
+        self,
+        report: "AdversarialReport",
+        min_correct_abstain_rate: float = 0.80,
+        max_false_positive_rate: float = 0.05,
+    ) -> None:
+        """Raise ``ValueError`` when the report does not meet robustness thresholds.
+
+        Args:
+            report:                    An ``AdversarialReport`` from ``evaluate()``.
+            min_correct_abstain_rate:  Minimum required correct-abstain rate
+                                       (default 0.80 = 80%).
+            max_false_positive_rate:   Maximum allowed false-positive rate
+                                       (default 0.05 = 5%).
+
+        Raises:
+            TypeError:  If *report* is not an ``AdversarialReport``.
+            ValueError: If a threshold is out of range ``[0, 1]``.
+            ValueError: If the report violates any threshold.
+        """
+        if not isinstance(report, AdversarialReport):
+            raise TypeError(
+                f"'report' must be an AdversarialReport, got {type(report).__name__!r}"
+            )
+        for name, val in (
+            ("min_correct_abstain_rate", min_correct_abstain_rate),
+            ("max_false_positive_rate", max_false_positive_rate),
+        ):
+            if not (0.0 <= val <= 1.0):
+                raise ValueError(f"'{name}' must be in [0, 1], got {val!r}")
+
+        failures = []
+        if report.correct_abstain_rate < min_correct_abstain_rate:
+            failures.append(
+                f"correct_abstain_rate={report.correct_abstain_rate:.4f} "
+                f"< threshold={min_correct_abstain_rate:.4f}"
+            )
+        if report.false_positive_rate > max_false_positive_rate:
+            failures.append(
+                f"false_positive_rate={report.false_positive_rate:.4f} "
+                f"> threshold={max_false_positive_rate:.4f}"
+            )
+        if failures:
+            msg = "AdversarialEvaluator.gate FAILED: " + "; ".join(failures)
+            logger.error(msg)
+            raise ValueError(msg)
+        logger.info(
+            "AdversarialEvaluator.gate PASSED: correct_abstain=%.4f fp=%.4f "
+            "thresholds=(min_abstain>=%.2f, max_fp<=%.2f)",
+            report.correct_abstain_rate, report.false_positive_rate,
+            min_correct_abstain_rate, max_false_positive_rate,
+        )
+

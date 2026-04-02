@@ -466,6 +466,116 @@ class DigestModeRouter:
         return dispatch[mode](candidates, **kwargs)
 
     # ------------------------------------------------------------------
+    # Ranked-item bridge
+    # ------------------------------------------------------------------
+
+    def render_from_ranked(
+        self,
+        mode: DeliveryMode,
+        ranked_items: List[Any],
+        *,
+        originals: Optional[List[Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Render a digest directly from ``UserDigestRanker`` output.
+
+        This is the canonical bridge between the personalization layer
+        (``UserDigestRanker.rank()``) and the output layer
+        (``DigestModeRouter.render()``).
+
+        It converts each ``RankedDigestItem`` into the ``_CandidateDict``
+        format expected by the mode handlers, then delegates to
+        :meth:`render`.
+
+        When *originals* (the list of ``DigestCandidate`` objects that were
+        ranked) is supplied, their rich metadata (``title``, ``entity_ids``,
+        ``topic_ids``, ``published_at``, ``source_platform``) is merged into
+        the candidate dict.  Without *originals*, sensible defaults are used.
+
+        Args:
+            mode:         The :class:`DeliveryMode` to render.
+            ranked_items: ``List[RankedDigestItem]`` returned by
+                          ``UserDigestRanker.rank()``.  Must be a non-empty
+                          list of objects with at least ``item_id`` and
+                          ``final_score`` attributes.
+            originals:    Optional list of ``DigestCandidate`` objects in the
+                          same domain.  Looked up by ``item_id`` to enrich
+                          the candidate dicts.
+            **kwargs:     Extra keyword arguments forwarded verbatim to the
+                          mode handler (e.g. ``user_id`` for
+                          ``PERSONALIZED_STREAM``, ``subject`` for
+                          ``DEEP_DIVE``).
+
+        Returns:
+            The result produced by the appropriate mode handler (same type
+            as ``render()``).
+
+        Raises:
+            TypeError:  If *mode* is not a ``DeliveryMode``, or
+                        *ranked_items* is not a list.
+            ValueError: If *ranked_items* is empty.
+        """
+        if not isinstance(mode, DeliveryMode):
+            raise TypeError(f"'mode' must be DeliveryMode, got {type(mode)!r}")
+        if not isinstance(ranked_items, list):
+            raise TypeError(
+                f"'ranked_items' must be a list, got {type(ranked_items)!r}"
+            )
+        if not ranked_items:
+            raise ValueError("'ranked_items' must not be empty")
+
+        # Build lookup table from originals
+        orig_by_id: Dict[str, Any] = {}
+        if originals:
+            for cand in originals:
+                try:
+                    orig_by_id[str(getattr(cand, "item_id", ""))] = cand
+                except Exception:
+                    pass
+
+        candidates: List[_CandidateDict] = []
+        for item in ranked_items:
+            try:
+                iid = str(getattr(item, "item_id", ""))
+                orig = orig_by_id.get(iid)
+                # Core fields from RankedDigestItem
+                cand: _CandidateDict = {
+                    "item_id": iid,
+                    "title": (
+                        getattr(orig, "title", None) or iid
+                    ),
+                    "importance": float(getattr(item, "final_score", 0.5)),
+                    "trust_score": float(getattr(item, "trust_score", 0.5)),
+                    "entity_ids": list(getattr(orig, "entity_ids", []) or []),
+                    "topic_ids": list(getattr(orig, "topic_ids", []) or []),
+                    "published_at": getattr(orig, "published_at", None),
+                    "sources": (
+                        [getattr(orig, "source_platform", "")]
+                        if orig and getattr(orig, "source_platform", "")
+                        else []
+                    ),
+                    "evidence_count": 1,
+                }
+                candidates.append(cand)
+            except Exception as exc:
+                logger.warning(
+                    "DigestModeRouter.render_from_ranked: skipping item "
+                    "(error building candidate dict): %s", exc,
+                )
+
+        if not candidates:
+            raise ValueError(
+                "render_from_ranked: no valid candidate dicts could be built "
+                "from ranked_items"
+            )
+
+        logger.debug(
+            "render_from_ranked: mode=%r, %d ranked → %d candidates",
+            mode.value, len(ranked_items), len(candidates),
+        )
+        return self.render(mode, candidates, **kwargs)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 

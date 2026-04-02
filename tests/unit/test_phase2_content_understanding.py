@@ -169,6 +169,53 @@ class TestTranscriptionRouter:
         assert len(segs) == 1
         assert segs[0].text == "[STUB TRANSCRIPT]"
 
+    # ── GAP-2 tests: TranscriptResult provenance ────────────────────────────
+    def test_transcribe_with_provenance_returns_transcript_result(self, tmp_path):
+        """transcribe_with_provenance() must return a TranscriptResult (GAP-2)."""
+        from app.media.audio_intelligence.transcription_router import TranscriptionRouter, ASRBackend
+        from app.media.audio_intelligence.models import TranscriptResult
+        f = tmp_path / "audio.mp3"
+        f.write_bytes(b"fake audio")
+        router = TranscriptionRouter(backend=ASRBackend.STUB, apply_corrections=False)
+        result = asyncio.run(router.transcribe_with_provenance(str(f)))
+        assert isinstance(result, TranscriptResult)
+
+    def test_transcribe_with_provenance_backend_used_populated(self, tmp_path):
+        """backend_used must be the resolved ASR backend name (GAP-2)."""
+        from app.media.audio_intelligence.transcription_router import TranscriptionRouter, ASRBackend
+        f = tmp_path / "audio.mp3"
+        f.write_bytes(b"fake audio")
+        router = TranscriptionRouter(backend=ASRBackend.STUB, apply_corrections=False)
+        result = asyncio.run(router.transcribe_with_provenance(str(f)))
+        assert result.backend_used == "stub"
+
+    def test_transcribe_with_provenance_is_stub_property(self, tmp_path):
+        """TranscriptResult.is_stub must be True when backend is stub (GAP-2)."""
+        from app.media.audio_intelligence.transcription_router import TranscriptionRouter, ASRBackend
+        f = tmp_path / "audio.mp3"
+        f.write_bytes(b"fake audio")
+        router = TranscriptionRouter(backend=ASRBackend.STUB, apply_corrections=False)
+        result = asyncio.run(router.transcribe_with_provenance(str(f)))
+        assert result.is_stub is True
+
+    def test_transcribe_with_provenance_full_text(self, tmp_path):
+        """TranscriptResult.full_text must concatenate segment texts (GAP-2)."""
+        from app.media.audio_intelligence.transcription_router import TranscriptionRouter, ASRBackend
+        f = tmp_path / "audio.mp3"
+        f.write_bytes(b"fake audio")
+        router = TranscriptionRouter(backend=ASRBackend.STUB, apply_corrections=False)
+        result = asyncio.run(router.transcribe_with_provenance(str(f)))
+        assert "[STUB TRANSCRIPT]" in result.full_text
+
+    def test_transcript_result_mean_confidence_none_for_stub(self, tmp_path):
+        """Stub backend produces no confidence — mean_confidence must be None (GAP-2)."""
+        from app.media.audio_intelligence.transcription_router import TranscriptionRouter, ASRBackend
+        f = tmp_path / "audio.mp3"
+        f.write_bytes(b"fake audio")
+        router = TranscriptionRouter(backend=ASRBackend.STUB, apply_corrections=False)
+        result = asyncio.run(router.transcribe_with_provenance(str(f)))
+        assert result.mean_confidence is None
+
 
 # ===========================================================================
 # Group 3: Diarizer
@@ -565,6 +612,31 @@ class TestPDFIngestor:
         text = "Introduction\nThis is the intro text.\n\nResults\nHere are our results."
         offsets = PDFIngestor._detect_headings(text)
         assert "Introduction" in offsets or "Results" in offsets
+
+    # ── GAP-3 tests: PDFIngestor production guard ────────────────────────────
+    def test_production_safe_raises_when_stub_only(self, tmp_path):
+        """production_safe=True must raise RuntimeError when only stub is available (GAP-3)."""
+        from app.document_intelligence.pdf_ingestor import PDFIngestor
+        f = tmp_path / "test.pdf"
+        f.write_bytes(b"%PDF-1.4 stub")
+        ingestor = PDFIngestor(backend="stub", production_safe=True)
+        with pytest.raises(RuntimeError, match="production_safe"):
+            ingestor.ingest(str(f))
+
+    def test_production_safe_false_allows_stub(self, tmp_path):
+        """production_safe=False (default) must allow stub fallback (GAP-3)."""
+        from app.document_intelligence.pdf_ingestor import PDFIngestor
+        f = tmp_path / "test.pdf"
+        f.write_bytes(b"%PDF-1.4 stub")
+        ingestor = PDFIngestor(backend="stub", production_safe=False)
+        doc = ingestor.ingest(str(f))
+        assert doc.extraction_backend == "stub"
+
+    def test_production_safe_wrong_type_raises(self):
+        """production_safe must be bool — wrong type must raise TypeError (GAP-3)."""
+        from app.document_intelligence.pdf_ingestor import PDFIngestor
+        with pytest.raises(TypeError):
+            PDFIngestor(production_safe="yes")  # type: ignore
 
 
 # ===========================================================================
