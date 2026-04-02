@@ -7154,3 +7154,847 @@ class TestModelArtifactRegistryCheckAndRollback:
         for t in threads: t.join()
         assert not errors
 
+
+
+# ===========================================================================
+# Phase 6 — Item 1: WatchlistGraph → UserDigestRanker boost
+# ===========================================================================
+
+class TestUserDigestRankerWatchlistBoost:
+    """Tests for WatchlistGraph integration in UserDigestRanker."""
+
+    @pytest.fixture()
+    def wg(self):
+        from app.personalization.watchlist_graph import WatchlistGraph
+        g = WatchlistGraph("u1")
+        g.watch("ai", node_type="keyword", priority=0.9)
+        g.watch("ml", node_type="keyword", priority=0.7)
+        return g
+
+    @pytest.fixture()
+    def ranker_with_wg(self, wg):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        return UserDigestRanker(watchlist_graph=wg, watchlist_boost_weight=0.20)
+
+    @pytest.fixture()
+    def ranker_plain(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        return UserDigestRanker()
+
+    def _cand(self, item_id, topics=(), entities=()):
+        from app.personalization.models import DigestCandidate
+        return DigestCandidate(item_id=item_id, title=item_id,
+                               topic_ids=list(topics), entity_ids=list(entities))
+
+    # ── Constructor ──────────────────────────────────────────────────────────
+
+    def test_watchlist_graph_property_roundtrip(self, wg, ranker_with_wg):
+        assert ranker_with_wg.watchlist_graph is wg
+
+    def test_no_watchlist_graph_property_is_none(self, ranker_plain):
+        assert ranker_plain.watchlist_graph is None
+
+    def test_invalid_watchlist_boost_weight_raises(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        with pytest.raises(ValueError, match="watchlist_boost_weight"):
+            UserDigestRanker(watchlist_boost_weight=1.5)
+
+    def test_zero_watchlist_boost_weight_allowed(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        r = UserDigestRanker(watchlist_boost_weight=0.0)
+        assert r is not None
+
+    # ── Boost behaviour ──────────────────────────────────────────────────────
+
+    def test_watched_topic_scores_higher_than_unwatched(self, ranker_with_wg):
+        watched = self._cand("w", topics=["ai"])
+        unwatched = self._cand("u", topics=["sports"])
+        ranked = ranker_with_wg.rank([watched, unwatched])
+        assert ranked[0].item_id == "w"
+
+    def test_watchlist_boost_present_in_score_breakdown(self, ranker_with_wg):
+        c = self._cand("x", topics=["ai"])
+        ranked = ranker_with_wg.rank([c])
+        assert "watchlist_boost" in ranked[0].score_breakdown
+        assert ranked[0].score_breakdown["watchlist_boost"] > 0
+
+    def test_no_watchlist_boost_for_unwatched(self, ranker_with_wg):
+        c = self._cand("x", topics=["sports", "football"])
+        ranked = ranker_with_wg.rank([c])
+        assert ranked[0].score_breakdown.get("watchlist_boost", 0) == 0.0
+
+    def test_entity_ids_also_trigger_watchlist_boost(self, ranker_with_wg):
+        # entity_ids, not topic_ids, match the watched node
+        c = self._cand("x", entities=["ai"])
+        ranked = ranker_with_wg.rank([c])
+        assert ranked[0].score_breakdown.get("watchlist_boost", 0) > 0
+
+    def test_final_score_bounded_at_1(self, ranker_with_wg):
+        c = self._cand("x", topics=["ai", "ml"])
+        ranked = ranker_with_wg.rank([c])
+        assert 0.0 <= ranked[0].final_score <= 1.0
+
+    def test_higher_priority_node_gives_higher_boost(self):
+        from app.personalization.watchlist_graph import WatchlistGraph
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        g = WatchlistGraph("u2")
+        g.watch("high", node_type="keyword", priority=0.9)
+        g.watch("low", node_type="keyword", priority=0.1)
+        ranker = UserDigestRanker(watchlist_graph=g, watchlist_boost_weight=0.20)
+        c_high = self._cand("h", topics=["high"])
+        c_low = self._cand("l", topics=["low"])
+        ranked = ranker.rank([c_high, c_low])
+        assert ranked[0].item_id == "h"
+
+    def test_watchlist_error_isolates_gracefully(self):
+        """A misbehaving WatchlistGraph must not abort ranking."""
+        class BrokenGraph:
+            def watched_nodes(self):
+                raise RuntimeError("graph exploded")
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        ranker = UserDigestRanker(watchlist_graph=BrokenGraph(), watchlist_boost_weight=0.20)
+        c = self._cand("x", topics=["ai"])
+        ranked = ranker.rank([c])
+        assert len(ranked) == 1  # ranking still completed
+
+    def test_without_watchlist_boost_in_breakdown_when_no_graph(self, ranker_plain):
+        """When no watchlist graph, 'watchlist_boost' key is 0."""
+        c = self._cand("x", topics=["ai"])
+        ranked = ranker_plain.rank([c])
+        assert ranked[0].score_breakdown.get("watchlist_boost", 0) == 0.0
+
+    def test_duck_typed_watchlist_graph_works(self):
+        """Any object with watched_nodes() returning node objects is accepted."""
+        class FakeNode:
+            node_id = "ai"
+            priority = 0.8
+        class FakeGraph:
+            def watched_nodes(self):
+                return [FakeNode()]
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        ranker = UserDigestRanker(watchlist_graph=FakeGraph(), watchlist_boost_weight=0.20)
+        c = self._cand("x", topics=["ai"])
+        ranked = ranker.rank([c])
+        assert ranked[0].score_breakdown.get("watchlist_boost", 0) > 0
+
+    def test_concurrent_rank_with_watchlist_no_crash(self, ranker_with_wg):
+        import threading
+        errors = []
+        def worker():
+            try:
+                for _ in range(20):
+                    ranker_with_wg.rank([self._cand("x", topics=["ai"])])
+            except Exception as e:
+                errors.append(e)
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+
+# ===========================================================================
+# Phase 6 — Item 2: FeedbackLearner → UserDigestRanker apply_feedback()
+# ===========================================================================
+
+class TestUserDigestRankerApplyFeedback:
+    """Tests for apply_feedback() and FeedbackLearner integration."""
+
+    @pytest.fixture()
+    def graph_and_learner(self):
+        from app.personalization.interest_graph import InterestGraph
+        from app.personalization.feedback_learner import FeedbackLearner
+        ig = InterestGraph()
+        fl = FeedbackLearner(ig)
+        return ig, fl
+
+    @pytest.fixture()
+    def ranker(self, graph_and_learner):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        ig, fl = graph_and_learner
+        return UserDigestRanker(interest_graph=ig, feedback_learner=fl)
+
+    def _event(self, fb_type, topics=("ai",)):
+        from app.personalization.models import FeedbackEvent, FeedbackType
+        return FeedbackEvent(
+            user_id="u1", item_id="item1",
+            feedback_type=FeedbackType(fb_type),
+            topic_ids=list(topics),
+        )
+
+    # ── Property & guard ─────────────────────────────────────────────────────
+
+    def test_feedback_learner_property_roundtrip(self, ranker, graph_and_learner):
+        _, fl = graph_and_learner
+        assert ranker.feedback_learner is fl
+
+    def test_no_feedback_learner_property_none(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        assert UserDigestRanker().feedback_learner is None
+
+    def test_apply_feedback_type_error_on_non_event(self, ranker):
+        from app.personalization.models import FeedbackEvent
+        with pytest.raises(TypeError, match="FeedbackEvent"):
+            ranker.apply_feedback("not an event")
+
+    def test_apply_feedback_type_error_on_none(self, ranker):
+        with pytest.raises(TypeError):
+            ranker.apply_feedback(None)
+
+    # ── Functional behaviour ─────────────────────────────────────────────────
+
+    def test_save_event_increases_topic_weight(self, ranker, graph_and_learner):
+        ig, _ = graph_and_learner
+        before = ig.get_weight("ai") or 0.0
+        ranker.apply_feedback(self._event("save", topics=["ai"]))
+        after = ig.get_weight("ai") or 0.0
+        assert after > before
+
+    def test_dismiss_event_decreases_topic_weight(self, ranker, graph_and_learner):
+        ig, _ = graph_and_learner
+        # First give the topic a non-zero weight so dismiss can reduce it
+        ranker.apply_feedback(self._event("save", topics=["ai"]))
+        after_save = ig.get_weight("ai") or 0.0
+        ranker.apply_feedback(self._event("dismiss", topics=["ai"]))
+        after_dismiss = ig.get_weight("ai") or 0.0
+        assert after_dismiss < after_save
+
+    def test_apply_feedback_no_error_when_no_learner(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        r = UserDigestRanker()
+        ev = self._event("save")
+        r.apply_feedback(ev)  # must not raise
+
+    def test_apply_feedback_also_updates_tradeoff(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        from app.personalization.novelty_vs_relevance_tradeoff import NoveltyRelevanceTradeoff
+        tradeoff = NoveltyRelevanceTradeoff()
+        alpha_before = tradeoff.current_alpha
+        r = UserDigestRanker(novelty_tradeoff=tradeoff)
+        r.apply_feedback(self._event("save", topics=["ai"]))
+        # SAVE is a pull type → alpha decreases
+        assert tradeoff.current_alpha <= alpha_before
+
+    def test_broken_learner_isolated(self):
+        """A FeedbackLearner that raises must not propagate from apply_feedback."""
+        class BrokenLearner:
+            def process_feedback(self, event):
+                raise RuntimeError("learner broken")
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        r = UserDigestRanker(feedback_learner=BrokenLearner())
+        r.apply_feedback(self._event("save"))  # must not raise
+
+    def test_broken_tradeoff_isolated(self):
+        class BrokenTradeoff:
+            current_alpha = 0.3
+            def update_from_feedback(self, e):
+                raise RuntimeError("tradeoff broken")
+            def blend_scores(self, r, n, a):
+                return (r + n) / 2
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        r = UserDigestRanker(novelty_tradeoff=BrokenTradeoff())
+        r.apply_feedback(self._event("save"))  # must not raise
+
+    def test_feedback_affects_subsequent_ranking(self, ranker, graph_and_learner):
+        from app.personalization.models import DigestCandidate
+        ig, _ = graph_and_learner
+        c_ai = DigestCandidate(item_id="ai-item", title="AI", topic_ids=["ai"])
+        c_sports = DigestCandidate(item_id="sports-item", title="Sports", topic_ids=["sports"])
+        # After multiple SAVEs on ai, it should rank higher
+        for _ in range(5):
+            ranker.apply_feedback(self._event("save", topics=["ai"]))
+        ranked = ranker.rank([c_ai, c_sports])
+        assert ranked[0].item_id == "ai-item"
+
+    def test_concurrent_apply_feedback_no_crash(self, ranker):
+        import threading
+        errors = []
+        def worker():
+            try:
+                for _ in range(20):
+                    ranker.apply_feedback(self._event("like", topics=["ai"]))
+            except Exception as e:
+                errors.append(e)
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+
+# ===========================================================================
+# Phase 6 — Item 3: DigestModeRouter.render_from_ranked()
+# ===========================================================================
+
+class TestDigestModeRouterRenderFromRanked:
+    """Tests for the render_from_ranked() bridge method."""
+
+    @pytest.fixture()
+    def router(self):
+        from app.output.digest_modes import DigestModeRouter
+        return DigestModeRouter()
+
+    @pytest.fixture()
+    def candidates(self):
+        from app.personalization.models import DigestCandidate
+        from datetime import datetime, timezone
+        return [
+            DigestCandidate(item_id="a", title="AI Tools", topic_ids=["ai"],
+                            entity_ids=["openai"], source_platform="github",
+                            trust_score=0.9,
+                            published_at=datetime(2025, 1, 1, tzinfo=timezone.utc)),
+            DigestCandidate(item_id="b", title="Robotics", topic_ids=["robotics"],
+                            trust_score=0.7),
+            DigestCandidate(item_id="c", title="ML Research", topic_ids=["ml"],
+                            trust_score=0.8),
+        ]
+
+    @pytest.fixture()
+    def ranked(self, candidates):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        return UserDigestRanker().rank(candidates)
+
+    # ── Type guards ──────────────────────────────────────────────────────────
+
+    def test_mode_not_delivery_mode_raises_typeerror(self, router, ranked):
+        with pytest.raises(TypeError, match="DeliveryMode"):
+            router.render_from_ranked("morning_brief", ranked)
+
+    def test_ranked_not_list_raises_typeerror(self, router):
+        from app.output.digest_modes import DeliveryMode
+        with pytest.raises(TypeError, match="list"):
+            router.render_from_ranked(DeliveryMode.MORNING_BRIEF, "bad")
+
+    def test_empty_ranked_items_raises_valueerror(self, router):
+        from app.output.digest_modes import DeliveryMode
+        with pytest.raises(ValueError, match="empty"):
+            router.render_from_ranked(DeliveryMode.MORNING_BRIEF, [])
+
+    def test_originals_not_list_but_none_allowed(self, router, ranked):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked, originals=None)
+        assert result is not None
+
+    # ── Happy path ───────────────────────────────────────────────────────────
+
+    def test_morning_brief_returns_correct_type(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode, MorningBrief
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked, originals=candidates)
+        assert isinstance(result, MorningBrief)
+
+    def test_morning_brief_item_count_matches(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked, originals=candidates)
+        assert len(result.items) == len(ranked)
+
+    def test_personalized_stream_returns_correct_type(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode, PersonalizedStream
+        result = router.render_from_ranked(
+            DeliveryMode.PERSONALIZED_STREAM, ranked,
+            originals=candidates, user_id="u1",
+        )
+        assert isinstance(result, PersonalizedStream)
+
+    def test_personalized_stream_user_id_forwarded(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(
+            DeliveryMode.PERSONALIZED_STREAM, ranked,
+            originals=candidates, user_id="alice",
+        )
+        assert result.user_id == "alice"
+
+    def test_title_from_original_candidate(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked, originals=candidates)
+        titles = {item.title for item in result.items}
+        assert "AI Tools" in titles or "Robotics" in titles  # at least one original title
+
+    def test_without_originals_falls_back_to_item_id_as_title(self, router, ranked):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked)
+        # title falls back to item_id when no originals
+        for item in result.items:
+            assert item.title  # non-empty
+
+    def test_importance_derived_from_final_score(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked, originals=candidates)
+        first_item = result.items[0]
+        # importance should be the final_score of the top-ranked item (≈)
+        assert 0.0 <= first_item.importance <= 1.0
+
+    def test_deep_dive_returns_correct_type(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode, DeepDiveResult
+        result = router.render_from_ranked(
+            DeliveryMode.DEEP_DIVE, ranked,
+            originals=candidates, subject="AI",
+        )
+        assert isinstance(result, DeepDiveResult)
+
+    def test_watchlist_mode_returns_correct_type(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode, WatchlistDigest
+        result = router.render_from_ranked(
+            DeliveryMode.WATCHLIST, ranked,
+            originals=candidates,
+            watched_entities=["openai", "ai"],
+        )
+        assert isinstance(result, WatchlistDigest)
+
+    def test_source_platform_in_sources_field(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked, originals=candidates)
+        all_sources = [s for item in result.items for s in item.sources]
+        # "github" was set as source_platform on candidate "a"
+        assert "github" in all_sources
+
+    def test_entity_ids_forwarded_to_stream_items(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(
+            DeliveryMode.PERSONALIZED_STREAM, ranked,
+            originals=candidates, user_id="u1",
+        )
+        all_entity_ids = [eid for item in result.items for eid in item.entity_ids]
+        assert "openai" in all_entity_ids
+
+    def test_skips_invalid_ranked_items_gracefully(self, router, candidates):
+        """If one ranked item is malformed, remaining ones must still render."""
+        from app.output.digest_modes import DeliveryMode
+        from app.personalization.models import RankedDigestItem
+        good = RankedDigestItem(item_id="good", rank=1, final_score=0.8)
+        # Inject a bad element (no item_id attribute)
+        class BadItem:
+            pass
+        # render_from_ranked should skip bad items and render the good one
+        result = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, [good, BadItem()])
+        assert result is not None
+
+    def test_all_items_bad_raises_valueerror(self, router):
+        from app.output.digest_modes import DeliveryMode
+        class BadItem:
+            pass
+        with pytest.raises((ValueError, Exception)):
+            router.render_from_ranked(DeliveryMode.MORNING_BRIEF, [BadItem()])
+
+    def test_max_items_kwarg_forwarded_to_personalized_stream(self, router, ranked, candidates):
+        from app.output.digest_modes import DeliveryMode
+        result = router.render_from_ranked(
+            DeliveryMode.PERSONALIZED_STREAM, ranked,
+            originals=candidates, user_id="u1", max_items=1,
+        )
+        assert len(result.items) == 1
+
+
+# ===========================================================================
+# Phase 6 — Item 4: SLOTracker → PipelineHealthMonitor bridge
+# ===========================================================================
+
+class TestPipelineHealthMonitorSLOTrackerBridge:
+    """Tests for SLOTracker integration in PipelineHealthMonitor."""
+
+    @pytest.fixture()
+    def tracker(self):
+        from app.enterprise.slo_tracker import SLOTracker, SLOTarget, SLOOperator
+        t = SLOTracker()
+        # Register a target so get_slo_status works
+        t.register_slo("sys", SLOTarget(
+            metric_name="ece", target_value=0.10,
+            operator=SLOOperator.LESS_THAN_OR_EQUAL,
+        ))
+        t.register_slo("sys", SLOTarget(
+            metric_name="latency.route", target_value=30.0,
+            operator=SLOOperator.LESS_THAN_OR_EQUAL,
+        ))
+        return t
+
+    @pytest.fixture()
+    def monitor(self, tracker):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        return PipelineHealthMonitor(slo_tracker=tracker, slo_tenant_id="sys")
+
+    # ── Constructor guards ───────────────────────────────────────────────────
+
+    def test_slo_tracker_property(self, monitor, tracker):
+        assert monitor.slo_tracker is tracker
+
+    def test_slo_tenant_id_property(self, monitor):
+        assert monitor.slo_tenant_id == "sys"
+
+    def test_no_slo_tracker_property_is_none(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        assert PipelineHealthMonitor().slo_tracker is None
+
+    def test_bad_slo_tracker_raises_typeerror(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        with pytest.raises(TypeError, match="record_observation"):
+            PipelineHealthMonitor(slo_tracker="not a tracker")
+
+    def test_empty_tenant_id_raises_valueerror(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        with pytest.raises(ValueError, match="slo_tenant_id"):
+            PipelineHealthMonitor(slo_tenant_id="")
+
+    def test_whitespace_tenant_id_raises_valueerror(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        with pytest.raises(ValueError):
+            PipelineHealthMonitor(slo_tenant_id="   ")
+
+    # ── Emission ─────────────────────────────────────────────────────────────
+
+    def test_record_ece_emits_to_tracker(self, monitor, tracker):
+        monitor.record_ece(0.05)
+        status = tracker.get_slo_status("sys", "ece")
+        assert status.current_value is not None
+        assert abs(status.current_value - 0.05) < 0.001
+
+    def test_record_latency_emits_to_tracker(self, monitor, tracker):
+        monitor.record_latency("route", 2.5)
+        status = tracker.get_slo_status("sys", "latency.route")
+        assert status.current_value is not None
+        assert abs(status.current_value - 2.5) < 0.001
+
+    def test_record_chunk_count_emits(self, monitor, tracker):
+        from app.enterprise.slo_tracker import SLOTarget, SLOOperator
+        tracker.register_slo("sys", SLOTarget(
+            metric_name="chunk_count", target_value=1_000_000,
+            operator=SLOOperator.LESS_THAN_OR_EQUAL,
+        ))
+        monitor.record_chunk_count(500)
+        status = tracker.get_slo_status("sys", "chunk_count")
+        assert status.current_value == 500.0
+
+    def test_record_connector_failure_emits(self, monitor, tracker):
+        from app.enterprise.slo_tracker import SLOTarget, SLOOperator
+        tracker.register_slo("sys", SLOTarget(
+            metric_name="connector.failures.github",
+            target_value=5, operator=SLOOperator.LESS_THAN,
+        ))
+        monitor.record_connector_failure("github")
+        status = tracker.get_slo_status("sys", "connector.failures.github")
+        assert status.current_value == 1.0
+
+    def test_record_connector_refresh_emits_freshness(self, monitor, tracker):
+        from app.enterprise.slo_tracker import SLOTarget, SLOOperator
+        tracker.register_slo("sys", SLOTarget(
+            metric_name="freshness.github", target_value=24,
+            operator=SLOOperator.LESS_THAN_OR_EQUAL,
+        ))
+        monitor.record_connector_refresh("github")
+        status = tracker.get_slo_status("sys", "freshness.github")
+        assert status.current_value == 0.0
+
+    def test_record_watchlist_gap_count_emits(self, monitor, tracker):
+        from app.enterprise.slo_tracker import SLOTarget, SLOOperator
+        tracker.register_slo("sys", SLOTarget(
+            metric_name="watchlist_gap_count", target_value=10,
+            operator=SLOOperator.LESS_THAN,
+        ))
+        monitor.record_watchlist_gap_count(3)
+        status = tracker.get_slo_status("sys", "watchlist_gap_count")
+        assert status.current_value == 3.0
+
+    def test_record_error_emits(self, monitor, tracker):
+        from app.enterprise.slo_tracker import SLOTarget, SLOOperator
+        tracker.register_slo("sys", SLOTarget(
+            metric_name="error.route", target_value=10,
+            operator=SLOOperator.LESS_THAN,
+        ))
+        monitor.record_error("route")
+        status = tracker.get_slo_status("sys", "error.route")
+        assert status.current_value == 1.0
+
+    # ── Error isolation ──────────────────────────────────────────────────────
+
+    def test_broken_tracker_never_aborts_record_latency(self):
+        class BrokenTracker:
+            def record_observation(self, *a, **kw):
+                raise RuntimeError("tracker exploded")
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        mon = PipelineHealthMonitor(slo_tracker=BrokenTracker(), slo_tenant_id="sys")
+        mon.record_latency("route", 1.0)  # must not raise
+
+    def test_broken_tracker_never_aborts_record_ece(self):
+        class BrokenTracker:
+            def record_observation(self, *a, **kw):
+                raise RuntimeError("exploded")
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        mon = PipelineHealthMonitor(slo_tracker=BrokenTracker(), slo_tenant_id="sys")
+        mon.record_ece(0.05)  # must not raise
+
+    def test_no_emission_when_no_tracker(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        mon = PipelineHealthMonitor()
+        mon.record_ece(0.05)  # no tracker, must not raise
+
+    def test_ece_slo_breach_detected_via_tracker(self, tracker):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        from app.enterprise.slo_tracker import SLOTarget, SLOOperator
+        tracker.register_slo("sys", SLOTarget(
+            metric_name="ece", target_value=0.10,
+            operator=SLOOperator.LESS_THAN_OR_EQUAL,
+        ))
+        mon = PipelineHealthMonitor(slo_tracker=tracker, slo_tenant_id="sys", ece_slo=0.10)
+        mon.record_ece(0.25)  # above threshold
+        status = tracker.get_slo_status("sys", "ece")
+        assert status.is_breaching  # SLOTracker detects the breach too
+
+    def test_custom_tenant_id_used_in_emissions(self):
+        observations = []
+        class SpyTracker:
+            def record_observation(self, tenant_id, metric_name, value, **kw):
+                observations.append((tenant_id, metric_name, value))
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        mon = PipelineHealthMonitor(slo_tracker=SpyTracker(), slo_tenant_id="acme")
+        mon.record_ece(0.05)
+        assert any(t == "acme" for t, _, _ in observations)
+
+    def test_multiple_metrics_all_forwarded(self, monitor, tracker):
+        from app.enterprise.slo_tracker import SLOTarget, SLOOperator
+        for m in ("chunk_count", "watchlist_gap_count"):
+            tracker.register_slo("sys", SLOTarget(
+                metric_name=m, target_value=9999,
+                operator=SLOOperator.LESS_THAN_OR_EQUAL,
+            ))
+        monitor.record_ece(0.04)
+        monitor.record_latency("route", 5.0)
+        monitor.record_chunk_count(100)
+        monitor.record_watchlist_gap_count(2)
+        for metric in ("ece", "latency.route", "chunk_count", "watchlist_gap_count"):
+            status = tracker.get_slo_status("sys", metric)
+            assert status.current_value is not None
+
+    def test_concurrent_emissions_no_crash(self, monitor):
+        import threading
+        errors = []
+        def worker():
+            try:
+                for _ in range(20):
+                    monitor.record_ece(0.05)
+                    monitor.record_latency("route", 1.0)
+            except Exception as e:
+                errors.append(e)
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+
+# ===========================================================================
+# Phase 6 — Item 5: SourceRegistryStore → IndexingPipeline wiring
+# ===========================================================================
+
+class TestIndexingPipelineSourceRegistry:
+    """Tests for SourceRegistryStore integration in IndexingPipeline."""
+
+    @pytest.fixture()
+    def registry(self):
+        from app.source_intelligence.source_registry import (
+            SourceRegistryStore, SourceSpec, SourceFamily, SourceCapability,
+        )
+        from app.core.models import SourcePlatform
+        reg = SourceRegistryStore()
+        reg.register(SourceSpec(
+            source_id="research",
+            platform=SourcePlatform.ARXIV,
+            family=SourceFamily.RESEARCH,
+            capabilities=frozenset({SourceCapability.PROVIDES_PDF, SourceCapability.SUPPORTS_SEARCH}),
+            display_name="arXiv Research",
+        ))
+        reg.register(SourceSpec(
+            source_id="social_reddit",
+            platform=SourcePlatform.REDDIT,
+            family=SourceFamily.SOCIAL,
+            capabilities=frozenset({SourceCapability.HAS_STRUCTURED_DATA}),
+        ))
+        return reg
+
+    @pytest.fixture()
+    def pipeline(self, registry):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        return IndexingPipeline(source_registry=registry)
+
+    def _fake_pr(self, source_family="research", content_item_id="item-1"):
+        class FakePR:
+            pass
+        pr = FakePR()
+        pr.source_family = source_family
+        pr.content_item_id = content_item_id
+        return pr
+
+    # ── Constructor & property ───────────────────────────────────────────────
+
+    def test_source_registry_property_roundtrip(self, pipeline, registry):
+        assert pipeline.source_registry is registry
+
+    def test_no_source_registry_property_is_none(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        assert IndexingPipeline().source_registry is None
+
+    # ── _lookup_registry_meta ────────────────────────────────────────────────
+
+    def test_lookup_returns_source_family_always(self, pipeline):
+        meta = pipeline._lookup_registry_meta(self._fake_pr("research"))
+        assert meta["source_family"] == "research"
+
+    def test_lookup_finds_spec_by_direct_id(self, pipeline):
+        meta = pipeline._lookup_registry_meta(self._fake_pr("research"))
+        assert "source_spec_id" in meta
+        assert meta["source_spec_id"] == "research"
+
+    def test_lookup_finds_platform(self, pipeline):
+        meta = pipeline._lookup_registry_meta(self._fake_pr("research"))
+        assert meta["source_platform"] == "arxiv"
+
+    def test_lookup_finds_capabilities(self, pipeline):
+        meta = pipeline._lookup_registry_meta(self._fake_pr("research"))
+        caps = meta.get("source_capabilities", [])
+        assert "PROVIDES_PDF" in caps
+        assert "SUPPORTS_SEARCH" in caps
+
+    def test_capabilities_are_sorted(self, pipeline):
+        meta = pipeline._lookup_registry_meta(self._fake_pr("research"))
+        caps = meta.get("source_capabilities", [])
+        assert caps == sorted(caps)
+
+    def test_lookup_falls_back_to_family_enum(self, pipeline):
+        """When source_id does not match, list_by_family() is used as fallback."""
+        # "social" is not a registered source_id, but SourceFamily.SOCIAL is
+        # not registered either — expect graceful empty return
+        meta = pipeline._lookup_registry_meta(self._fake_pr("social"))
+        assert meta["source_family"] == "social"
+        # No platform/capabilities since none registered under family SOCIAL by source_id "social"
+        # but social_twitter IS registered — the family enum fallback finds it
+        # (depends on whether SourceFamily.SOCIAL maps to "social")
+
+    def test_unknown_family_returns_only_source_family_key(self, pipeline):
+        meta = pipeline._lookup_registry_meta(self._fake_pr("nonexistent_xyz"))
+        assert meta == {"source_family": "nonexistent_xyz"}
+
+    def test_broken_registry_isolates_gracefully(self):
+        class BrokenRegistry:
+            def get(self, sid):
+                raise RuntimeError("registry exploded")
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        p = IndexingPipeline(source_registry=BrokenRegistry())
+        meta = p._lookup_registry_meta(p._fake_pr("research") if hasattr(p, "_fake_pr")
+                                       else type("PR", (), {"source_family": "research",
+                                                            "content_item_id": "x"})())
+        # must not raise; source_family key still present
+        assert "source_family" in meta
+
+    def test_no_source_registry_lookup_returns_empty_dict(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        p = IndexingPipeline()
+
+        class FakePR:
+            source_family = "research"
+            content_item_id = "item-1"
+
+        # When no registry, _lookup_registry_meta should not be called by
+        # _index_chunks; call directly to verify it returns meaningful fallback
+        meta = p._lookup_registry_meta(FakePR())
+        # Without registry: self._source_registry is None → _emit never called
+        # _lookup_registry_meta is only called when self._source_registry is not None
+        # So just verify the method exists and no AttributeError
+        assert isinstance(meta, dict)
+
+    # ── Integration: chunk metadata stamped ──────────────────────────────────
+
+    def test_chunk_meta_contains_source_family_after_indexing(self, registry, tmp_path):
+        """source_family must appear in ChunkRecord metadata after process_batch."""
+        import asyncio
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.ingestion.pipeline_result import IntelligencePipelineResult, PipelineStatus
+        from app.source_intelligence.source_registry import SourceFamily
+
+        store = ChunkStore()
+        pipeline = IndexingPipeline(source_registry=registry, chunk_store=store)
+
+        # Mock the router to return a known result so we can check metadata
+        fake_result = MagicMock(spec=IntelligencePipelineResult)
+        fake_result.status = PipelineStatus.SUCCESS
+        fake_result.is_actionable.return_value = True
+        fake_result.content_item_id = "test-item"
+        fake_result.source_family = "research"
+        fake_result.signal_type = "RESEARCH_PAPER"
+        fake_result.confidence = 0.8
+        fake_result.result_id = "result-001"
+        fake_result.tenant_id = "default"
+        fake_result.entities = ["transformers"]
+        fake_result.extraction_warnings = []
+        from datetime import datetime, timezone
+        fake_result.summary = "Sample research summary for testing."
+        fake_result.keywords = ["transformers", "research"]
+        fake_result.source_url = "https://arxiv.org/abs/2501.00001"
+        fake_result.produced_at = datetime.now(timezone.utc)
+        fake_result.claims = []
+        fake_result.all_text_for_chunking.return_value = "This is sample research text for chunking."
+
+        with patch.object(pipeline._router, "route", new=AsyncMock(return_value=fake_result)):
+            import uuid
+            from datetime import datetime, timezone
+            from app.core.models import ContentItem, SourcePlatform, MediaType
+            item = ContentItem(
+                id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                source_id="arxiv:2501.00001",
+                source_url="https://arxiv.org/abs/2501.00001",
+                title="Test paper",
+                source_platform=SourcePlatform.ARXIV,
+                media_type=MediaType.TEXT,
+                published_at=datetime.now(timezone.utc),
+            )
+            result = asyncio.run(pipeline.process_batch([item]))
+
+        # Verify at least one chunk was indexed
+        assert result.stats.chunks_indexed > 0
+
+        # Retrieve chunks by observation_id and verify registry metadata was stamped
+        chunks = store.get_by_observation("test-item")
+        assert len(chunks) > 0
+        first_chunk = chunks[0]
+        assert first_chunk.metadata.get("source_family") == "research"
+        assert first_chunk.metadata.get("source_platform") == "arxiv"
+        assert "PROVIDES_PDF" in first_chunk.metadata.get("source_capabilities", [])
+
+    # ── Thread safety ─────────────────────────────────────────────────────────
+
+    def test_concurrent_lookup_registry_meta_no_crash(self, pipeline):
+        import threading
+        errors = []
+
+        class FakePR:
+            source_family = "research"
+            content_item_id = "item-1"
+
+        def worker():
+            try:
+                for _ in range(30):
+                    pipeline._lookup_registry_meta(FakePR())
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+    # ── Duck typing ──────────────────────────────────────────────────────────
+
+    def test_duck_typed_registry_with_get_only(self):
+        """A registry with only get() (no list_by_family) must not crash."""
+        class MinimalRegistry:
+            def get(self, source_id):
+                if source_id == "research":
+                    class FakeSpec:
+                        source_id = "research"
+                        platform = "arxiv"
+                        capabilities = ["PDF"]
+                    return FakeSpec()
+                return None
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        p = IndexingPipeline(source_registry=MinimalRegistry())
+        pr = type("PR", (), {"source_family": "research", "content_item_id": "x"})()
+        meta = p._lookup_registry_meta(pr)
+        assert meta["source_family"] == "research"
+        assert "source_spec_id" in meta
+

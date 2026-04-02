@@ -536,14 +536,20 @@ class DigestModeRouter:
         candidates: List[_CandidateDict] = []
         for item in ranked_items:
             try:
-                iid = str(getattr(item, "item_id", ""))
+                iid = str(getattr(item, "item_id", "") or "")
+                if not iid:
+                    # item_id is required by all mode handlers — skip silently
+                    logger.warning(
+                        "DigestModeRouter.render_from_ranked: skipping item "
+                        "with empty/missing item_id: %r", type(item)
+                    )
+                    continue
                 orig = orig_by_id.get(iid)
+                title = (getattr(orig, "title", None) or iid) or iid
                 # Core fields from RankedDigestItem
                 cand: _CandidateDict = {
                     "item_id": iid,
-                    "title": (
-                        getattr(orig, "title", None) or iid
-                    ),
+                    "title": title,
                     "importance": float(getattr(item, "final_score", 0.5)),
                     "trust_score": float(getattr(item, "trust_score", 0.5)),
                     "entity_ids": list(getattr(orig, "entity_ids", []) or []),

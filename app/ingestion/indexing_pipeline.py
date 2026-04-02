@@ -181,6 +181,7 @@ class IndexingPipeline:
         watchlist_graph:  Optional[Any]                   = None,
         health_monitor:   Optional[Any]                   = None,
         trust_scorer:     Optional[Any]                   = None,
+        source_registry:  Optional[Any]                   = None,
         chunk_size:       int   = 800,
         chunk_overlap:    int   = 100,
         route_timeout_s:  float = 60.0,
@@ -203,6 +204,11 @@ class IndexingPipeline:
         # for each result's source_family is stamped into ChunkRecord metadata
         # and into the health monitor (very low trust triggers a warning).
         self._trust_scorer    = trust_scorer
+        # Optional SourceRegistryStore — when provided, the source spec
+        # (family, platform, capabilities) is looked up per pipeline result and
+        # stamped into ChunkRecord metadata.  Duck-typed: must have ``get(id)``
+        # and optionally ``list_by_family(family)`` methods.
+        self._source_registry = source_registry
         # Per-tenant ChunkStore registry.  The injected ``chunk_store`` (or the
         # auto-created default) becomes the "default" tenant's store.
         self._tenant_stores: Dict[str, ChunkStore] = {"default": self._store}
@@ -308,6 +314,11 @@ class IndexingPipeline:
         if tenant_id not in self._tenant_stores:
             self._tenant_stores[tenant_id] = ChunkStore()
         return self._tenant_stores[tenant_id]
+
+    @property
+    def source_registry(self) -> Optional[Any]:
+        """The ``SourceRegistryStore`` injected at construction, or ``None``."""
+        return self._source_registry
 
     @property
     def watchlist_graph(self) -> Optional[Any]:
@@ -451,6 +462,11 @@ class IndexingPipeline:
                         "source_family=%r item=%s: %s",
                         pr.source_family, pr.content_item_id, exc,
                     )
+            # ── Source registry enrichment ───────────────────────────────
+            registry_meta: Dict[str, Any] = {}
+            if self._source_registry is not None:
+                registry_meta = self._lookup_registry_meta(pr)
+
             try:
                 chunk_meta: Dict[str, Any] = {
                     "signal_type": pr.signal_type,
@@ -460,6 +476,7 @@ class IndexingPipeline:
                 }
                 if trust_score is not None:
                     chunk_meta["trust_score"] = trust_score
+                chunk_meta.update(registry_meta)
                 ids = target_store.chunk_text(
                     observation_id=str(pr.content_item_id),
                     text=text,
@@ -474,6 +491,72 @@ class IndexingPipeline:
                     "IndexingPipeline: chunk indexing failed for item %s: %s",
                     pr.content_item_id, exc,
                 )
+
+    # ------------------------------------------------------------------
+    # Source registry enrichment helper
+    # ------------------------------------------------------------------
+
+    def _lookup_registry_meta(
+        self, pr: "IntelligencePipelineResult"
+    ) -> Dict[str, Any]:
+        """Return a dict of source-registry fields to stamp into chunk metadata.
+
+        Strategy
+        --------
+        1. Try ``source_registry.get(pr.source_family)`` — works when the
+           registry source_id happens to match the pipeline's source_family
+           string (e.g. ``"social"``).
+        2. Fall back to ``source_registry.list_by_family(family_enum)`` and take
+           the first spec — handles cases where individual sources (e.g.
+           ``"twitter"``) are stored under the broader family enum.
+        3. If both attempts fail or the registry raises, log and return ``{}``.
+
+        The returned dict always contains ``source_family`` (string) and may
+        contain ``source_platform``, ``source_capabilities``, and
+        ``source_spec_id`` when a matching spec is found.
+
+        Args:
+            pr: The ``IntelligencePipelineResult`` whose ``source_family`` drives
+                the registry lookup.
+
+        Returns:
+            Dict of metadata keys ready to be merged into ``chunk_meta``.
+        """
+        meta: Dict[str, Any] = {"source_family": pr.source_family}
+        try:
+            spec = None
+            # Attempt 1: direct lookup by source_family string as source_id
+            try:
+                spec = self._source_registry.get(pr.source_family)
+            except (KeyError, LookupError):
+                spec = None
+            # Attempt 2: list_by_family with enum coercion
+            if spec is None and hasattr(self._source_registry, "list_by_family"):
+                try:
+                    # Lazy import to avoid circular deps
+                    from app.source_intelligence.source_registry import SourceFamily
+                    family_enum = SourceFamily(pr.source_family)
+                    specs = self._source_registry.list_by_family(family_enum)
+                    spec = specs[0] if specs else None
+                except (ValueError, IndexError, ImportError):
+                    spec = None
+            # Stamp whatever we found
+            if spec is not None:
+                if hasattr(spec, "source_id"):
+                    meta["source_spec_id"] = str(spec.source_id)
+                if hasattr(spec, "platform"):
+                    meta["source_platform"] = getattr(spec.platform, "value", str(spec.platform))
+                if hasattr(spec, "capabilities"):
+                    meta["source_capabilities"] = sorted(
+                        getattr(c, "name", str(c)) for c in (spec.capabilities or [])
+                    )
+        except Exception as exc:
+            logger.warning(
+                "IndexingPipeline: source_registry lookup failed for "
+                "source_family=%r item=%s: %s",
+                pr.source_family, pr.content_item_id, exc,
+            )
+        return meta
 
     # ------------------------------------------------------------------
     # Phase 3: build clusterer input dicts
