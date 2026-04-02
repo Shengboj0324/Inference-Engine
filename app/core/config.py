@@ -148,6 +148,37 @@ class Settings(BaseSettings):
     enable_auto_clustering: bool = Field(default=True)
     enable_personalization: bool = Field(default=True)
 
+    # ── Production safety contract (Recommendation §1 / Priority 0) ──────────
+    # When True (automatic in production environment), every capability that
+    # cannot resolve a real backend will raise RuntimeError at startup or at
+    # call time rather than silently degrading to stub / synthetic output.
+    production_strict_mode: bool = Field(
+        default=False,
+        description=(
+            "Fail-closed mode: stubs and partially-implemented backends are "
+            "rejected at startup and call time.  Automatically True when "
+            "environment='production'.  Override with PRODUCTION_STRICT_MODE=true."
+        ),
+    )
+
+    # Enabled-capability declarations — each flag must be backed by a real
+    # backend when production_strict_mode is True.
+    enable_multimodal_vision: bool = Field(
+        default=True,
+        description="Enable image/video analysis via MultimodalAnalyzer.",
+    )
+    enable_pdf_extraction: bool = Field(
+        default=True,
+        description="Enable PDF ingestion via PDFIngestor (requires pdfplumber or pypdf).",
+    )
+    enable_asr: bool = Field(
+        default=True,
+        description=(
+            "Enable audio transcription via TranscriptionRouter "
+            "(requires faster-whisper, whisper, or OPENAI_API_KEY)."
+        ),
+    )
+
     @field_validator("environment")
     @classmethod
     def validate_environment(cls, v: str) -> str:
@@ -262,30 +293,36 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
-        """Validate production-specific settings."""
+        """Validate production-specific settings and enforce fail-closed defaults."""
         if self.environment == "production":
-            # Check for default secrets
+            # Auto-enable strict mode unless explicitly overridden to False via env
+            if not self.production_strict_mode:
+                object.__setattr__(self, "production_strict_mode", True)
+
             if self.secret_key == "change-this-in-production":
                 raise ValueError(
                     "SECRET_KEY must be changed in production! "
                     "Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
                 )
-
             if self.encryption_key == "change-this-32-byte-key-base64==":
                 raise ValueError(
                     "ENCRYPTION_KEY must be changed in production! "
                     "Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
                 )
-
-            # Warn about localhost in production
             if "localhost" in self.database_url:
                 import warnings
-                warnings.warn("Using localhost database in production!")
-
+                warnings.warn(
+                    "Using localhost database in production — "
+                    "set DATABASE_URL to a remote host before going live.",
+                    stacklevel=2,
+                )
             if "localhost" in self.redis_url:
                 import warnings
-                warnings.warn("Using localhost Redis in production!")
-
+                warnings.warn(
+                    "Using localhost Redis in production — "
+                    "set REDIS_URL to a remote host before going live.",
+                    stacklevel=2,
+                )
         return self
 
     @property
@@ -302,6 +339,11 @@ class Settings(BaseSettings):
     def is_testing(self) -> bool:
         """Check if running in test mode."""
         return self.environment == "test"
+
+    @property
+    def is_strict(self) -> bool:
+        """True when fail-closed production safety is active."""
+        return self.production_strict_mode
 
 
 # Global settings instance (singleton — constructed once at import time)

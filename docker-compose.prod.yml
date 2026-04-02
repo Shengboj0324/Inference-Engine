@@ -1,0 +1,214 @@
+# Production Docker Compose — Social Media Radar
+#
+# Key differences from docker-compose.yml (dev):
+#   - No --reload; no bind-mount of source tree
+#   - Pinned image digests (update via: docker pull <image> && docker inspect)
+#   - Infrastructure ports NOT published to host (internal network only)
+#   - Resource limits on every service
+#   - restart: unless-stopped on all long-lived services
+#   - Secrets via env_file (swap for Docker Secrets / Vault in full prod)
+#   - Isolated bridge network; only API exposed to host
+#   - LOG_LEVEL=warning in workers
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml logs -f api
+
+version: '3.8'
+
+# ---------------------------------------------------------------------------
+# Shared environment injected into every application container
+# ---------------------------------------------------------------------------
+x-app-env: &app-env
+  env_file:
+    - .env.prod                         # must NOT contain dev defaults
+  environment:
+    ENVIRONMENT: production
+    DATABASE_URL: postgresql+asyncpg://radar:${POSTGRES_PASSWORD}@postgres:5432/social_radar
+    DATABASE_SYNC_URL: postgresql://radar:${POSTGRES_PASSWORD}@postgres:5432/social_radar
+    REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+    CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+    S3_ENDPOINT: http://minio:9000
+    LOG_LEVEL: warning
+
+networks:
+  backend:                              # internal — no external access
+    driver: bridge
+    internal: true
+  frontend:                             # api ↔ host only
+    driver: bridge
+
+services:
+
+  # ── PostgreSQL 15 + pgvector ─────────────────────────────────────────────
+  postgres:
+    image: ankane/pgvector@sha256:7e4145e0f9e728c7a0c18a4e51d0c7f02fdb8e94c0e0ef2697778f5cf8ea7be2
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: social_radar
+      POSTGRES_USER: radar
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    # No ports: block exposed to host — accessed only by app containers
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U radar -d social_radar"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ── Redis 7 (password-protected) ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine@sha256:e3b17ba9479deec4b7d1ead2345aab2eb7e4e5a47f74c9af8edcbbb43f79f9a1
+    restart: unless-stopped
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD}
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 768M
+
+  # ── MinIO (S3-compatible object storage) ─────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-01-31T20-65-46Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  # ── Database initialiser (runs once, then exits) ──────────────────────────
+  db-init:
+    image: social-media-radar:${IMAGE_TAG:-latest}
+    command: sh -c "python scripts/init_db.py && alembic upgrade head"
+    <<: *app-env
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── FastAPI application ───────────────────────────────────────────────────
+  api:
+    image: social-media-radar:${IMAGE_TAG:-latest}
+    # No --reload; worker count controlled by API_WORKERS env var (default 4)
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-4}
+    restart: unless-stopped
+    <<: *app-env
+    ports:
+      - "127.0.0.1:8000:8000"           # bind to loopback only; put nginx in front
+    networks:
+      - backend
+      - frontend
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  # ── Celery worker ─────────────────────────────────────────────────────────
+  celery-worker:
+    image: social-media-radar:${IMAGE_TAG:-latest}
+    command: >
+      celery -A app.ingestion.celery_app worker
+        --loglevel=warning
+        --concurrency=${CELERY_CONCURRENCY:-4}
+        --max-tasks-per-child=500
+    restart: unless-stopped
+    <<: *app-env
+    networks:
+      - backend
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  # ── Celery beat ───────────────────────────────────────────────────────────
+  celery-beat:
+    image: social-media-radar:${IMAGE_TAG:-latest}
+    command: celery -A app.ingestion.celery_app beat --loglevel=warning
+    restart: unless-stopped
+    <<: *app-env
+    networks:
+      - backend
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+

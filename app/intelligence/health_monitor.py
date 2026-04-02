@@ -47,7 +47,7 @@ Usage::
     monitor.record_connector_refresh("github_releases")
 
     report = monitor.health_report()
-    print(report.overall_status)   # SLOStatus.GREEN
+    # report.overall_status  → SLOStatus.GREEN
 """
 
 from __future__ import annotations

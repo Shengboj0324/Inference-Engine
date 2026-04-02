@@ -150,6 +150,16 @@ class PDFIngestor:
                 "before deploying, or set production_safe=False for CI/testing."
             )
 
+        # Centralised fail-closed enforcement via ProductionSafetyContract.
+        # This fires regardless of production_safe so that the global
+        # settings.production_strict_mode gate is always respected.
+        if backend == "stub":
+            from app.core.production_guard import get_guard
+            get_guard().require_real_backend(
+                capability="pdf_extraction",
+                resolved_backend="stub",
+            )
+
         logger.info("PDFIngestor: backend=%s production_safe=%s path=%s",
                     backend, self._production_safe, pdf_path)
 

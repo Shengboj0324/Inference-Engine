@@ -260,6 +260,12 @@ class TranscriptionRouter:
                 return self._resolved
         self._resolved = ASRBackend.STUB
         logger.warning("TranscriptionRouter: no ASR backend available; using stub")
+        # Fail-closed in production strict mode — stub ASR must not reach users.
+        from app.core.production_guard import get_guard
+        get_guard().require_real_backend(
+            capability="asr",
+            resolved_backend=ASRBackend.STUB.value,
+        )
         return self._resolved
 
     @staticmethod

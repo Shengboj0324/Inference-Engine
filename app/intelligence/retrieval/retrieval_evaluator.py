@@ -36,7 +36,9 @@ Usage::
 
     evaluator = RetrievalEvaluator()
     metrics = evaluator.evaluate(queries=queries, retriever=my_retriever, k=10)
-    print(metrics.recall_at_k, metrics.mrr, metrics.ndcg_at_k)
+    # metrics.recall_at_k → float
+    # metrics.mrr         → float
+    # metrics.ndcg_at_k   → float
 """
 
 from __future__ import annotations

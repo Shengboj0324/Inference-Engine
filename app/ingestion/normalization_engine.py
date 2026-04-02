@@ -133,6 +133,31 @@ class NormalizationEngine:
             item.raw_text = self._clean_text(item.raw_text)
             transformations += 1
 
+        # ── Prompt-injection / adversarial-content defense ────────────────────
+        # ContentSanitizer runs on title and raw_text *after* basic cleaning so
+        # that HTML-stripped text is matched against injection patterns, not
+        # raw markup.  Any hits are stamped in metadata for audit logging.
+        from app.core.content_sanitizer import get_sanitizer
+        _sanitizer = get_sanitizer()
+        if item.title:
+            _title_result = _sanitizer.sanitize(item.title)
+            if _title_result.modified:
+                item.title = _title_result.text
+                item.metadata["sanitized_title"] = True
+                item.metadata["sanitized_title_hits"] = [
+                    h.threat_class for h in _title_result.hits
+                ]
+                transformations += 1
+        if item.raw_text:
+            _text_result = _sanitizer.sanitize(item.raw_text)
+            if _text_result.modified:
+                item.raw_text = _text_result.text
+                item.metadata["sanitized_text"] = True
+                item.metadata["sanitized_text_hits"] = [
+                    h.threat_class for h in _text_result.hits
+                ]
+                transformations += 1
+
         # Normalize URLs
         if self.normalize_urls:
             item.source_url = self._normalize_url(item.source_url)

@@ -21,7 +21,8 @@ Usage
 -----
     evaluator = AdversarialEvaluator()
     results = await evaluator.evaluate(inference_pipeline)
-    print(results.abstain_rate, results.false_positive_rate)
+    # results.abstain_rate          → float
+    # results.false_positive_rate   → float
 """
 
 from __future__ import annotations

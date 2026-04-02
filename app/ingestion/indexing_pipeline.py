@@ -34,9 +34,9 @@ Usage::
 
     pipeline = IndexingPipeline()
     result = await pipeline.process_batch(items)
-    print(result.stats)          # IndexingStats
-    print(result.bundles)        # List[EventBundle] after dedup
-    print(result.pipeline_results)  # List[IntelligencePipelineResult]
+    # result.stats            → IndexingStats
+    # result.bundles          → List[EventBundle] after dedup
+    # result.pipeline_results → List[IntelligencePipelineResult]
 """
 
 from __future__ import annotations

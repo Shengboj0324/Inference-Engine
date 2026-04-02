@@ -34,7 +34,7 @@ Typical usage::
 
     report = graph.coverage_report()
     for gap in report.gaps:
-        print(gap)   # WatchlistCoverageGap(node="vLLM", missing=["research"])
+        # gap → WatchlistCoverageGap(node="vLLM", missing=["research"])
 """
 
 from __future__ import annotations

@@ -445,6 +445,17 @@ class MultimodalAnalyzer:
         self.model_name = model_name
         self._vision_client = vision_client
         self._execution_mode = execution_mode
+
+        # ── Production safety contract ────────────────────────────────────────
+        # Fail-closed in strict mode: STUB mode is not acceptable for any
+        # user-facing result path when production_strict_mode=True.
+        from app.core.production_guard import get_guard
+        if execution_mode == CapabilityMode.STUB:
+            get_guard().require_real_backend(
+                capability="multimodal_vision",
+                resolved_backend="stub",
+            )
+
         logger.info(
             "MultimodalAnalyzer init: model=%s execution_mode=%s vision_client=%s",
             model_name,
