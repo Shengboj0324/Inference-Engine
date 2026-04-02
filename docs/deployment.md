@@ -1,252 +1,196 @@
-# Deployment Guide
+# Deployment Reference
 
-This guide covers deploying Social Media Radar in various environments.
+## System Requirements
 
-## Quick Start (Development)
+| Component | Minimum | Notes |
+|---|---|---|
+| Python | 3.11 | `asyncpg>=0.28.0`, `numpy>=1.24` required for ARM64 wheels |
+| PostgreSQL | 15 + pgvector | `CREATE EXTENSION IF NOT EXISTS vector;` before first migration |
+| Redis | 7 | Celery broker and result backend |
+| RAM | 8 GB | 16 GB required when running Ollama 7B+ locally |
+| Docker Engine | 24.0 + Compose v2 | For the Docker path only |
 
-### Prerequisites
-- Docker and Docker Compose
-- Python 3.11+
-- Poetry (for local development)
+---
 
-### Steps
+## Option A — Docker Compose
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/yourusername/social-media-radar.git
-   cd social-media-radar
-   ```
-
-2. **Configure environment**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API keys and settings
-   ```
-
-3. **Start services with Docker Compose**
-   ```bash
-   docker-compose up -d
-   ```
-
-4. **Run database migrations**
-   ```bash
-   docker-compose exec api alembic upgrade head
-   ```
-
-5. **Access the API**
-   - API: http://localhost:8000
-   - API Docs: http://localhost:8000/docs
-   - MinIO Console: http://localhost:9001
-
-## Local Development (Without Docker)
-
-### Prerequisites
-- PostgreSQL 15+ with pgvector extension
-- Redis 7+
-- Python 3.11+
-- Poetry
-
-### Steps
-
-1. **Install dependencies**
-   ```bash
-   poetry install
-   ```
-
-2. **Start PostgreSQL and Redis**
-   ```bash
-   # Using Homebrew on macOS
-   brew services start postgresql@15
-   brew services start redis
-   
-   # Or using Docker
-   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=radar_password ankane/pgvector
-   docker run -d -p 6379:6379 redis:7-alpine
-   ```
-
-3. **Create database**
-   ```bash
-   createdb social_radar
-   psql social_radar -c "CREATE EXTENSION vector;"
-   ```
-
-4. **Run migrations**
-   ```bash
-   poetry run alembic upgrade head
-   ```
-
-5. **Start the API server**
-   ```bash
-   poetry run uvicorn app.api.main:app --reload
-   ```
-
-6. **Start Celery worker (in another terminal)**
-   ```bash
-   poetry run celery -A app.ingestion.celery_app worker --loglevel=info
-   ```
-
-7. **Start Celery beat (in another terminal)**
-   ```bash
-   poetry run celery -A app.ingestion.celery_app beat --loglevel=info
-   ```
-
-## Production Deployment
-
-### Environment Variables
-
-Critical environment variables for production:
+Starts `postgres`, `redis`, `minio`, `api`, `celery-worker`, and `celery-beat`. Migrations run automatically via the `db-init` service.
 
 ```bash
-# Security - MUST CHANGE
-SECRET_KEY=<generate-strong-random-key>
-ENCRYPTION_KEY=<generate-32-byte-base64-key>
+git clone https://github.com/yourusername/social-media-radar.git
+cd social-media-radar
+cp .env.example .env
+
+# Generate secrets
+python3 -c "import secrets; print('SECRET_KEY=' + secrets.token_urlsafe(32))"
+python3 -c "import secrets; print('ENCRYPTION_KEY=' + secrets.token_urlsafe(32))"
+# Paste both into .env, then add OPENAI_API_KEY and/or ANTHROPIC_API_KEY
+
+docker compose up
+
+# After the stack is healthy, seed the calibrator
+docker compose exec api python training/calibrate.py --epochs 5
+
+# Verify
+curl -s http://localhost:8000/health
+# → {"status": "healthy", "database": "ok", "redis": "ok"}
+```
+
+**Service map:**
+
+| Service | Address |
+|---|---|
+| FastAPI | `http://localhost:8000` |
+| OpenAPI UI | `http://localhost:8000/docs` |
+| MinIO console | `http://localhost:9001` (admin/minioadmin) |
+| PostgreSQL | `localhost:5432` |
+| Redis | `localhost:6379` |
+
+---
+
+## Option B — Bare Metal (macOS)
+
+```bash
+# System dependencies
+brew install postgresql@15 pgvector redis minio/stable/minio python@3.11
+echo 'export PATH="/opt/homebrew/opt/postgresql@15/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+brew services start postgresql@15 redis
+xcode-select --install
+
+# Project setup
+git clone https://github.com/yourusername/social-media-radar.git && cd social-media-radar
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip && pip install -r requirements.txt
+
+# Configure .env
+cp .env.example .env
+# DATABASE_URL=postgresql+asyncpg://<user>@localhost:5432/social_radar
+# DATABASE_SYNC_URL=postgresql://<user>@localhost:5432/social_radar
+# REDIS_URL=redis://localhost:6379/0
+# SECRET_KEY=<token_urlsafe(32)>   ENCRYPTION_KEY=<token_urlsafe(32)>
+# OPENAI_API_KEY=sk-...
 
 # Database
-DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
-DATABASE_SYNC_URL=postgresql://user:pass@host:5432/dbname
+createdb social_radar
+python scripts/init_db.py      # enables pgvector extension
+alembic upgrade head
 
-# Redis
-REDIS_URL=redis://host:6379/0
+# Calibration
+python training/calibrate.py --epochs 5
 
-# LLM API Keys
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Object Storage (S3)
-S3_ENDPOINT=https://s3.amazonaws.com
-S3_ACCESS_KEY=...
-S3_SECRET_KEY=...
-S3_BUCKET=radar-content
-
-# API Settings
-API_WORKERS=4
-CORS_ORIGINS=["https://yourdomain.com"]
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FORMAT=json
+# Start (three terminals)
+uvicorn app.api.main:app --reload --host 0.0.0.0 --port 8000
+celery -A app.ingestion.celery_app worker --loglevel=info
+celery -A app.ingestion.celery_app beat --loglevel=info
 ```
 
-### Docker Compose (Production)
+---
 
-Create `docker-compose.prod.yml`:
+## Option C — Bare Metal (Ubuntu 22.04 / WSL2)
 
-```yaml
-version: '3.8'
-
-services:
-  api:
-    image: your-registry/social-media-radar:latest
-    restart: always
-    env_file: .env.production
-    ports:
-      - "8000:8000"
-    depends_on:
-      - postgres
-      - redis
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  celery-worker:
-    image: your-registry/social-media-radar:latest
-    restart: always
-    command: celery -A app.ingestion.celery_app worker --loglevel=info
-    env_file: .env.production
-    depends_on:
-      - postgres
-      - redis
-
-  celery-beat:
-    image: your-registry/social-media-radar:latest
-    restart: always
-    command: celery -A app.ingestion.celery_app beat --loglevel=info
-    env_file: .env.production
-    depends_on:
-      - postgres
-      - redis
-```
-
-### Kubernetes Deployment
-
-See `infra/k8s/` for Kubernetes manifests.
-
-Key components:
-- `deployment.yaml` - API and worker deployments
-- `service.yaml` - Service definitions
-- `ingress.yaml` - Ingress configuration
-- `configmap.yaml` - Configuration
-- `secrets.yaml` - Sensitive credentials
-
-Deploy:
 ```bash
-kubectl apply -f infra/k8s/
+sudo apt-get update && sudo apt-get install -y \
+    python3.11 python3.11-venv python3.11-dev \
+    postgresql-15 postgresql-15-pgvector redis-server libpq-dev gcc
+sudo systemctl enable --now postgresql redis-server
+sudo -u postgres psql -c "CREATE USER radar WITH PASSWORD 'radar_password';"
+sudo -u postgres psql -c "CREATE DATABASE social_radar OWNER radar;"
 ```
+
+Follow Steps 2–6 from Option B, setting `DATABASE_URL` to `postgresql+asyncpg://radar:radar_password@localhost:5432/social_radar`.
+
+---
+
+## Fully Offline (Ollama)
+
+No LLM API keys required. Set in `.env`:
+
+```bash
+LOCAL_LLM_URL=http://localhost:11434
+LOCAL_LLM_MODEL=llama3.1:8b
+```
+
+`LLMRouter` will prefer `LOCAL_LLM_URL` when set. All 18 signal types can route locally; the two-tier separation (frontier vs. fine-tuned) is preserved — risk types go to the configured primary model, which in this case is also the local model.
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `SECRET_KEY` | ✅ | JWT signing key — generate with `secrets.token_urlsafe(32)` |
+| `ENCRYPTION_KEY` | ✅ | Credential vault key — generate with `secrets.token_urlsafe(32)` |
+| `DATABASE_URL` | ✅ | `postgresql+asyncpg://user:pass@host:5432/dbname` |
+| `DATABASE_SYNC_URL` | ✅ | Same but `postgresql://` (sync driver for Alembic) |
+| `REDIS_URL` | ✅ | `redis://host:6379/0` |
+| `OPENAI_API_KEY` | ✴️ | Required unless `LOCAL_LLM_URL` is set |
+| `ANTHROPIC_API_KEY` | ✴️ | Required if Anthropic routing is active |
+| `LOCAL_LLM_URL` | — | Ollama endpoint; disables cloud LLM requirement |
+| `LOCAL_LLM_MODEL` | — | e.g., `llama3.1:8b` |
+| `S3_ENDPOINT` | — | MinIO or S3 URL for media storage |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | — | Object storage credentials |
+| `CORS_ORIGINS` | — | JSON array of allowed origins, e.g., `["https://app.example.com"]` |
+| `API_WORKERS` | — | Uvicorn worker count (default 4) |
+| `LOG_LEVEL` | — | `DEBUG` / `INFO` / `WARNING` (default `INFO`) |
+
+---
 
 ## Database Migrations
 
-### Creating a new migration
 ```bash
-alembic revision --autogenerate -m "Description of changes"
-```
-
-### Applying migrations
-```bash
+# Apply all pending migrations
 alembic upgrade head
-```
 
-### Rolling back
-```bash
+# Create a new migration after model changes
+alembic revision --autogenerate -m "description"
+
+# Roll back one step
 alembic downgrade -1
 ```
 
+The `pgvector` extension must exist before the first migration:
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+---
+
+## Kubernetes
+
+Manifests are in `deployment/kubernetes/`. The HPA (`hpa.yaml`) targets 70% CPU utilisation with `minReplicas=2` and `maxReplicas=10`.
+
+```bash
+kubectl apply -f deployment/kubernetes/llm-secrets.yaml
+kubectl apply -f deployment/kubernetes/llm-deployment.yaml
+kubectl apply -f deployment/kubernetes/hpa.yaml
+```
+
+---
+
 ## Monitoring
 
-### Health Checks
-- API: `GET /health`
-- Database: Check PostgreSQL connection
-- Redis: Check Redis connection
-- Celery: Monitor task queue length
+Prometheus scrapes `http://api:8000/metrics`. Grafana dashboard JSON is at `deployment/grafana/dashboards/llm-overview.json`. Import via:
 
-### Logging
-- Structured JSON logging in production
-- Centralized logging with ELK/Loki recommended
-- Log levels: DEBUG, INFO, WARNING, ERROR, CRITICAL
+```bash
+curl -X POST http://localhost:3000/api/dashboards/db \
+  -H "Content-Type: application/json" \
+  -d @deployment/grafana/dashboards/llm-overview.json
+```
 
-### Metrics
-- API request latency
-- Task processing time
-- Content fetch success rate
-- LLM API usage and costs
-- Database query performance
+Key metrics: `llm_requests_total`, `llm_request_duration_seconds`, `llm_cost_total`, `llm_circuit_breaker_state`.
 
-## Scaling
+---
 
-### Horizontal Scaling
-- Run multiple API instances behind load balancer
-- Run multiple Celery workers
-- Use Redis Sentinel for HA
-- Use PostgreSQL replication
+## Troubleshooting
 
-### Vertical Scaling
-- Increase API worker count
-- Increase database resources
-- Increase Redis memory
-- Use faster storage for embeddings
-
-## Security Checklist
-
-- [ ] Change default passwords
-- [ ] Use strong SECRET_KEY and ENCRYPTION_KEY
-- [ ] Enable HTTPS/TLS
-- [ ] Configure CORS properly
-- [ ] Set up firewall rules
-- [ ] Enable database encryption at rest
-- [ ] Rotate API keys regularly
-- [ ] Set up backup and disaster recovery
-- [ ] Enable audit logging
-- [ ] Implement rate limiting
-- [ ] Use secrets management (Vault, AWS Secrets Manager)
+| Symptom | Fix |
+|---|---|
+| `pg_isready: command not found` | Add PostgreSQL 15 bin to `PATH` |
+| `ImportError: No module named 'asyncpg'` | `source .venv/bin/activate` |
+| `FATAL: role "radar" does not exist` | `createuser radar` |
+| `redis.exceptions.ConnectionError` | `brew services start redis` or `sudo systemctl start redis` |
+| `InvalidToken` on credential decrypt | `python scripts/migrate_credentials.py` |
+| `db-init exited with code 1` (Docker) | Increase postgres healthcheck `retries` in `docker-compose.yml` |
+| `pgvector` type error on insert | `CREATE EXTENSION IF NOT EXISTS vector;` not run |
+| Abstention rate > 20% on live traffic | Rerun `training/calibrate.py --epochs 5` or lower `confidence_required` |
 

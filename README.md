@@ -4,7 +4,7 @@ A locally-deployed inference pipeline for structured signal classification from 
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: 4616 passed](https://img.shields.io/badge/tests-4616%20passed-brightgreen.svg)](./docs/TESTING_GUIDE.md)
+[![Tests: 4616 passed](https://img.shields.io/badge/tests-4616%20passed-brightgreen.svg)](./docs/test_campaign.md)
 
 [Architecture](#architecture) • [New Components](#newly-implemented-components) • [Deployment](#local-deployment-guide) • [Getting Started](#getting-started--your-first-signal) • [Performance](#performance-reference) • [Testing](#running-the-test-suite)
 
@@ -673,11 +673,11 @@ Used internally by `ContextMemoryStore` to cluster related past observations for
 
 | Document | Description |
 |---|---|
-| [Architecture](docs/architecture.md) | System design and component relationships |
-| [Testing Guide](docs/TESTING_GUIDE.md) | Test organisation and conventions |
-| [Training](docs/TRAINING.md) | Calibration dataset format and training |
-| [LLM Deployment](docs/LLM_DEPLOYMENT_GUIDE.md) | LLM provider configuration |
-| [Deployment](docs/deployment.md) | Production Docker and cloud deployment |
+| [Architecture](docs/architecture.md) | Full pipeline diagram, data models, technology stack |
+| [Deployment](docs/deployment.md) | Docker Compose, bare-metal, Kubernetes, env vars, migrations |
+| [LLM Routing](docs/llm_routing.md) | Two-tier routing, circuit breaker, Prometheus metrics, LoRA fine-tuning |
+| [Calibration](docs/calibration.md) | Temperature scaling, federated blending, online update formula, seed dataset format |
+| [Test Campaign](docs/test_campaign.md) | Six-tier test architecture, quality rubric, defect registry |
 | API Reference | `http://localhost:8000/docs` (live, requires running server) |
 
 ---

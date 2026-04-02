@@ -1,172 +1,179 @@
-# Social Media Radar - System Architecture
+# Architecture
 
-## Overview
-
-Social Media Radar is a compliance-first, multi-channel intelligence aggregation system that provides personalized daily briefings from diverse content sources. The system operates as a **user-authorized aggregator**, not a scraper, ensuring all data access is properly licensed and authenticated.
-
-## Design Principles
-
-1. **Compliance-First**: Only use official APIs, RSS feeds, or properly licensed sources
-2. **User-Owned Auth**: Users provide their own OAuth tokens, API keys, and subscriptions
-3. **Privacy-Preserving**: Per-user data segregation, encrypted credentials, audit trails
-4. **Pluggable Architecture**: Easy to add new sources without modifying core logic
-5. **LLM-Agnostic**: Support both hosted (OpenAI/Anthropic) and self-hosted models
-
-## System Layers
-
-### 1. Ingestion & Connectors Layer
-- **Purpose**: Pull content from each platform using user-provided authentication
-- **Components**:
-  - Connector Framework (base classes and interfaces)
-  - Platform-specific connectors (Reddit, YouTube, TikTok, etc.)
-  - Scheduler for periodic fetching
-  - Rate limiting and error handling
-
-### 2. Normalization & Storage Layer
-- **Purpose**: Unify diverse content into a single schema
-- **Components**:
-  - ContentItem unified model
-  - Postgres for metadata and relationships
-  - pgvector for embeddings
-  - MinIO/S3 for media and transcripts
-
-### 3. Intelligence & Relevance Layer
-- **Purpose**: Determine what content matters to each user
-- **Components**:
-  - User interest profiling
-  - Relevance scoring engine
-  - Content clustering (HDBSCAN/hierarchical)
-  - Deduplication and diversity enforcement
-
-### 4. Summarization & Generation Layer
-- **Purpose**: Create actionable insights from raw content
-- **Components**:
-  - Multi-document summarization
-  - Cross-platform perspective analysis
-  - Daily digest generation
-  - Custom content generation (ELI5, contrarian views, etc.)
-
-### 5. Delivery Layer
-- **Purpose**: Expose intelligence through multiple interfaces
-- **Components**:
-  - FastAPI REST API
-  - MCP (Model Context Protocol) server
-  - CLI tools
-  - Future: Email/Slack/webhook delivery
-
-## Data Flow
+## Pipeline Stages
 
 ```
-User Profile + Auth
-       ↓
-Scheduled Ingestion Jobs
-       ↓
-Raw Content → Queue (Redis Streams)
-       ↓
-Normalization & Enrichment
-  - Language detection
-  - NLP (NER, keywords, topics)
-  - Embedding generation
-  - Transcript extraction (ASR if needed)
-       ↓
-ContentItem Storage (Postgres + pgvector)
-       ↓
-Relevance Filtering & Ranking
-  - User interest matching
-  - Recency weighting
-  - Engagement signals
-       ↓
-Clustering & Storyline Detection
-       ↓
-LLM Summarization
-       ↓
-Daily Digest / API Response
+ContentItem / RawObservation
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  Stage A  NormalizationEngine                          │
+  │  title+body merge · language detection · spaCy NER    │
+  │  engagement/freshness features · embedding (1536-dim)  │
+  │  MultimodalAnalyzer._extract_media_urls()              │
+  │    → platform_metadata | ContentItem.metadata |        │
+  │       ContentItem.media_urls (ext-classified)          │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  DataResidencyGuard                                    │
+  │  author → SHA-256 pseudonym (anon_<16 hex>)           │
+  │  PII URL params → <redacted>                           │
+  │  email/phone tokens in text                            │
+  │  RedactionAuditEntry written before text proceeds     │
+  │  verify_clean() raises DataResidencyViolationError     │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  Stage B  CandidateRetriever                           │
+  │  HNSW similarity (pgvector) against ExemplarBank       │
+  │  entity-conditioned vocabulary rules                   │
+  │  per-platform base-rate priors                         │
+  │  output: List[SignalCandidate] (top-k, ranked)         │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  E6  DeliberationEngine  (4 steps)                     │
+  │  A: ContextMemoryStore → top-5 historical observations │
+  │  B: prune candidates below retrieval score threshold   │
+  │  C: escalate risk types (score>0.5) → audit log        │
+  │  D: select reasoning mode →                            │
+  │       len>1500 or candidates>6 → multi_agent           │
+  │       top-2 within 0.1 or conf_req>0.85 → cot          │
+  │       else → single_call                               │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+   ┌────┴───────────────────────────────┐
+   │                                    │
+   ▼                                    ▼
+E1 ChainOfThoughtReasoner    E3 MultiAgentOrchestrator
+   step-by-step scratchpad       sub-tasks with per-task PII scrub
+   │                                    │
+   └────────────────┬───────────────────┘
+                    │
+  ┌─────────────────▼──────────────────────────────────────┐
+  │  Stage C  LLMAdjudicator                               │
+  │  structured JSON-schema prompt                         │
+  │  few-shot context from E5 ContextMemoryStore           │
+  │  LLMRouter: _FRONTIER_SIGNAL_TYPES → GPT-4o tier      │
+  │             remaining 14 → fine-tuned / Ollama tier    │
+  │  fallback: exponential back-off + circuit breaker      │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  E2  ConfidenceCalibrator                              │
+  │  sigmoid(logit / T_eff)                                │
+  │  T_eff = α·T_user + (1−α)·T_global  (federated)       │
+  │  α → 0.7 after 500 confirmed analyst outcomes          │
+  │  E4 FeedbackStore: one gradient step per correction    │
+  │    T ← max(T_MIN, T − lr·(p_cal−y)·(−logit/T²))      │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  Stage D  AbstentionDecider                            │
+  │  7 typed AbstentionReason enum values                  │
+  │  default threshold: 0.7 (post-calibration)             │
+  │  abstentions logged, never enter signal queue          │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  IndexingPipeline.process_batch()  — 7 phases          │
+  │  1. route → IntelligencePipelineResult                 │
+  │  2. chunk; stamp multimodal_evidence in ChunkRecord    │
+  │     item_map passed for ContentItem fallback lookup    │
+  │  3. SourceTrustScorer → trust_score per chunk          │
+  │  4. EventClusterer + WatchlistGraph coverage           │
+  │  5. CrossSourceDeduper.deduplicate_cross_bundle()      │
+  │     Jaccard similarity; trust-weighted primary         │
+  │  6. GroundedSummaryBuilder → source_attributions,      │
+  │     contradictions, uncertainty_annotations            │
+  │  7. QualityGate(min_confidence) → QualityGateResult   │
+  │  per-tenant ChunkStore partitions (SQLite in-proc)     │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  ┌─────▼──────────────────────────────────────────────────┐
+  │  AutoResearchPipeline.run()  — async orchestrator      │
+  │  1. AcquisitionScheduler.next_batch()                  │
+  │     priority sort · trust gate · exponential back-off  │
+  │     PipelineHealthMonitor circuit breaking             │
+  │  2. process_batch(items, tenant_id)                    │
+  │  3. build_grounded_summary(…, tenant_id)               │
+  │     reads _tenant_stores[tenant_id] (not default)      │
+  │  4. QualityGate evaluation                             │
+  │  5. WatchlistGraph.coverage_report() → gap_count       │
+  │  6. PipelineHealthMonitor.health_report() → SLOStatus  │
+  │  7. emit ResearchReport                                │
+  └─────┬──────────────────────────────────────────────────┘
+        │
+  PostgreSQL + pgvector · REST API · SSE stream
+  ActionableSignal · ResearchReport · GroundedSummary
 ```
+
+---
 
 ## Core Data Models
 
-### ContentItem
+### `ContentItem`
 ```python
-- id: UUID
-- source_platform: str (reddit, youtube, tiktok, etc.)
-- source_id: str (native platform ID)
-- author: str
-- channel/feed: str
-- title: str
-- raw_text: str
-- media_type: enum (text, video, image, mixed)
-- media_urls: list[str]
-- published_at: datetime
-- fetched_at: datetime
-- topics: list[str]
-- lang: str
-- embedding: vector(1536)
-- metadata: jsonb
+id: UUID
+source_platform: SourcePlatform  # enum; 19 values
+source_id: str
+source_url: str
+title: str
+raw_text: str
+media_type: MediaType            # TEXT | IMAGE | VIDEO | MIXED
+media_urls: List[str]            # duck-typed by MultimodalAnalyzer
+published_at: datetime           # UTC
+topics: List[str]
+metadata: Dict[str, Any]         # image_url / video_url keys consumed by MultimodalAnalyzer
+embedding: Optional[List[float]] # 1536-dim (text-embedding-3-large default)
 ```
 
-### UserProfile
+### `NormalizedObservation`
+Output of `NormalizationEngine`. Adds `language`, `entities`, `engagement_score`, `freshness_score`, `embedding` to `ContentItem` fields. Stored in PostgreSQL as `NormalizedObservationDB` with `embedding vector(1536)`.
+
+### `ChunkRecord`
 ```python
-- id: UUID
-- interest_topics: list[str]
-- negative_filters: list[str]
-- interest_embedding: vector(1536)
-- platform_configs: jsonb
+chunk_id: str
+observation_id: str
+text: str
+metadata: Dict[str, Any]   # includes multimodal_evidence: List[Dict]
+trust_score: Optional[float]
+tenant_id: str
 ```
 
-### Cluster
+### `IntelligencePipelineResult`
+Output of `ContentPipelineRouter.route()`. Carries `content_item_id`, `source_family`, `is_actionable()`, `all_text_for_chunking()`, `summary`.
+
+### `ResearchReport`
 ```python
-- id: UUID
-- user_id: UUID
-- created_at: datetime
-- topic: str
-- summary: str
-- items: list[ContentItem]
-- relevance_score: float
+query: str
+tenant_id: str
+chunks_indexed: int
+confidence_score_mean: float          # ∈ [0, 1]
+quality_gate_rejection_rate: float    # ∈ [0, 1]
+quality_gate_outcomes: List[QualityGateResult]
+watchlist_gap_count: int
+slo_health_status: Optional[SLOStatus]
+grounded_summaries: List[GroundedSummary]
+wall_s: float
+generated_at: datetime                # UTC
 ```
+
+---
 
 ## Technology Stack
 
-### Backend
-- **Language**: Python 3.11+
-- **API Framework**: FastAPI
-- **Task Queue**: Celery + Redis
-- **Scheduler**: Celery Beat
-- **Database**: PostgreSQL 15+ with pgvector
-- **Vector Store**: pgvector (primary), Qdrant (optional)
-- **Object Storage**: MinIO (local) / S3 (production)
-- **Message Queue**: Redis Streams
-
-### AI/ML
-- **Embeddings**: OpenAI text-embedding-3-large (default), BGE-m3 (OSS)
-- **LLM**: OpenAI/Anthropic (default), Llama 3.x via vLLM (OSS)
-- **NLP**: spaCy, transformers
-- **ASR**: OpenAI Whisper (for video transcription)
-- **Clustering**: scikit-learn (HDBSCAN, hierarchical)
-
-### Infrastructure
-- **Containerization**: Docker + Docker Compose
-- **Orchestration**: Kubernetes (optional, for scale)
-- **Monitoring**: Prometheus + Grafana
-- **Logging**: Structured logging with Python logging
-
-## Security & Privacy
-
-### Authentication & Authorization
-- OAuth 2.0 for platform integrations
-- API key management with encryption at rest
-- Per-user token isolation
-- No shared credentials
-
-### Data Protection
-- Encrypted credential storage (libsodium/KMS)
-- Per-user data segregation
-- Audit logging for all data access
-- GDPR-compliant export/delete endpoints
-
-### Compliance
-- No ToS violations
-- No paywall bypassing
-- Fair use for transcription
-- Rate limit compliance
-- User consent for all data collection
+| Layer | Component |
+|---|---|
+| API | FastAPI + Uvicorn (async); SSE via `EventSourceResponse` |
+| Task queue | Celery + Redis Streams; Beat for 15-min ingestion cron |
+| Database | PostgreSQL 15 + pgvector (`vector(1536)`); async via asyncpg |
+| In-proc vector store | `ChunkStore` — SQLite per tenant (zero-config) |
+| Object storage | MinIO (local) / S3-compatible |
+| Embeddings | `text-embedding-3-large` (default); BGE-m3 (OSS fallback) |
+| LLM (frontier) | GPT-4o / Claude 3.5 Sonnet |
+| LLM (fine-tuned) | GPT-4o-mini fine-tuned or Ollama (`llama3.1:8b`) |
+| NLP | spaCy `en_core_web_sm`; fallback 512-dim BoW |
+| Monitoring | Prometheus + Grafana (`deployment/grafana/`) |
+| Containerisation | Docker Compose; Kubernetes manifests in `deployment/kubernetes/` |
 
