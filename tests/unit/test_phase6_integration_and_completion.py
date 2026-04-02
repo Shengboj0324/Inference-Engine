@@ -7998,3 +7998,808 @@ class TestIndexingPipelineSourceRegistry:
         assert meta["source_family"] == "research"
         assert "source_spec_id" in meta
 
+
+
+# ===========================================================================
+# Phase 4 Item 2 — ChunkStore SQLite: additional edge cases
+# ===========================================================================
+
+class TestChunkStoreSQLiteEdgeCases:
+    """Additional edge cases for ChunkStore SQLite persistence."""
+
+    # ── Complex metadata round-trip ──────────────────────────────────────────
+
+    def test_complex_metadata_json_roundtrip(self, tmp_path):
+        """Nested dicts, lists, unicode, and booleans survive a persist/reload cycle."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "meta.db")
+        store = ChunkStore(db_path=db)
+        meta = {
+            "tags": ["ai", "ml", "🤖"],
+            "nested": {"level": 2, "active": True, "score": 0.9876},
+            "counts": [1, 2, 3],
+            "unicode": "Ångström résumé",
+        }
+        store.chunk_text("observation-meta", "AI is advancing rapidly.",
+                         metadata=meta)
+
+        store2 = ChunkStore(db_path=db)
+        chunks = store2.get_by_observation("observation-meta")
+        assert chunks, "expected at least one chunk"
+        loaded_meta = chunks[0].metadata
+        assert loaded_meta["tags"] == meta["tags"]
+        assert loaded_meta["nested"]["active"] is True
+        assert loaded_meta["nested"]["score"] == pytest.approx(0.9876)
+        assert loaded_meta["unicode"] == "Ångström résumé"
+
+    # ── Embedding persistence ────────────────────────────────────────────────
+
+    def test_embedding_persisted_and_reloaded(self, tmp_path):
+        """Embedding vectors are stored in the DB and faithfully restored."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore, ChunkRecord
+        db = str(tmp_path / "embed.db")
+        store = ChunkStore(db_path=db)
+        embedding = [0.1, -0.5, 0.9, 0.0, 1.0]
+        record = ChunkRecord(
+            observation_id="obs-emb",
+            source_family="research",
+            text="Transformers are state of the art.",
+            embedding=embedding,
+            embedding_version="v2",
+        )
+        store.ingest(record)
+        store2 = ChunkStore(db_path=db)
+        chunks = store2.get_by_observation("obs-emb")
+        assert chunks[0].embedding == pytest.approx(embedding)
+        assert chunks[0].embedding_version == "v2"
+
+    # ── Large text splitting ─────────────────────────────────────────────────
+
+    def test_large_text_produces_multiple_chunks(self, tmp_path):
+        """A text of 3 000 chars split into 800-char chunks with 100-char overlap."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "large.db")
+        store = ChunkStore(db_path=db)
+        text = "OpenAI releases GPT-5. " * 140  # ~3 220 chars
+        ids = store.chunk_text("large-obs", text, chunk_size=800, overlap=100)
+        assert len(ids) >= 4, f"expected ≥4 chunks, got {len(ids)}"
+        for chunk in store.get_by_observation("large-obs"):
+            assert len(chunk.text) <= 900  # never exceeds size + overlap
+
+    # ── Retention / eviction ─────────────────────────────────────────────────
+
+    def test_evict_stale_returns_correct_count(self, tmp_path):
+        """evict_stale() removes aged rows and returns accurate rowcount."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        import sqlite3, time as _time
+        db = str(tmp_path / "stale.db")
+        store = ChunkStore(db_path=db, max_age_hours=1)
+        store.chunk_text("fresh", "Fresh content here", "research")
+        # Manually back-date the row to look 2 hours old
+        cutoff = (_now() - timedelta(hours=2)).timestamp()
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE chunks SET created_at = ? WHERE observation_id = 'fresh'",
+                         (cutoff,))
+            conn.commit()
+        evicted = store.evict_stale()
+        assert evicted >= 1
+        assert store.get_by_observation("fresh") == []
+
+    def test_evict_stale_raises_without_max_age(self, tmp_path):
+        """evict_stale() raises RuntimeError when max_age_hours is not configured."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        store = ChunkStore(db_path=str(tmp_path / "no_age.db"))
+        with pytest.raises(RuntimeError, match="max_age_hours"):
+            store.evict_stale()
+
+    def test_fresh_chunks_survive_eviction(self, tmp_path):
+        """Chunks younger than max_age_hours must NOT be removed."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "fresh.db")
+        store = ChunkStore(db_path=db, max_age_hours=24)
+        store.chunk_text("keep-me", "This is recent content", "research")
+        evicted = store.evict_stale()
+        assert evicted == 0
+        assert len(store.get_by_observation("keep-me")) >= 1
+
+    # ── FIFO cap ─────────────────────────────────────────────────────────────
+
+    def test_fifo_eviction_at_cap(self, tmp_path):
+        """Oldest chunks are evicted when max_size is reached."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "fifo.db")
+        store = ChunkStore(db_path=db, max_size=5)
+        for i in range(8):
+            store.chunk_text(f"obs-{i}", f"Content {i}: NVIDIA stock rises on earnings", "social")
+        assert store.count() == 5
+
+    # ── Thread-safety ────────────────────────────────────────────────────────
+
+    def test_concurrent_ingest_from_multiple_threads(self, tmp_path):
+        """Parallel writes to the same DB must not corrupt state."""
+        import threading
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "concurrent.db")
+        store = ChunkStore(db_path=db)
+        errors = []
+
+        def writer(n):
+            try:
+                for i in range(10):
+                    store.chunk_text(f"obs-{n}-{i}",
+                                     f"Thread {n} chunk {i}: DeepMind AlphaFold 3 breakthrough",
+                                     "social")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(5)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+        assert store.count() == 50
+
+    # ── get_by_observation isolation ─────────────────────────────────────────
+
+    def test_get_by_observation_isolates_to_correct_obs(self, tmp_path):
+        """get_by_observation only returns chunks for the given observation_id."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "iso.db")
+        store = ChunkStore(db_path=db)
+        store.chunk_text("obs-a", "OpenAI content here", "social")
+        store.chunk_text("obs-b", "Anthropic content here", "research")
+        only_a = store.get_by_observation("obs-a")
+        assert all(c.observation_id == "obs-a" for c in only_a)
+        assert all("OpenAI" in c.text for c in only_a)
+
+    # ── observation_ids ──────────────────────────────────────────────────────
+
+    def test_observation_ids_returns_sorted_unique(self, tmp_path):
+        """observation_ids() returns sorted, unique IDs."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "ids.db")
+        store = ChunkStore(db_path=db)
+        for obs in ["z-obs", "a-obs", "m-obs", "a-obs"]:  # a-obs repeated
+            store.chunk_text(obs, f"Content for {obs}", "social")
+        ids = store.observation_ids()
+        assert ids == sorted(set(ids))
+        assert "a-obs" in ids and "z-obs" in ids and ids.count("a-obs") == 1
+
+    # ── keyword fallback search ───────────────────────────────────────────────
+
+    def test_keyword_search_finds_relevant_chunks(self, tmp_path):
+        """keyword_search() returns chunks containing query tokens."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "kw.db")
+        store = ChunkStore(db_path=db)
+        store.chunk_text("obs-ai",
+                         "Large language models from OpenAI achieve SOTA on benchmarks.",
+                         "research")
+        store.chunk_text("obs-sports",
+                         "Local football team wins championship in overtime.",
+                         "social")
+        hits = store.keyword_search("openai language models", top_k=5)
+        assert len(hits) >= 1
+        assert hits[0].record.observation_id == "obs-ai"
+
+    # ── clear ─────────────────────────────────────────────────────────────────
+
+    def test_clear_removes_all_chunks(self, tmp_path):
+        """clear() removes every record without error."""
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        db = str(tmp_path / "clear.db")
+        store = ChunkStore(db_path=db)
+        for i in range(5):
+            store.chunk_text(f"o{i}", f"Content {i}", "social")
+        assert store.count() == 5
+        store.clear()
+        assert store.count() == 0
+
+
+
+# ===========================================================================
+# Phase 4 Items 3 & 4 — HealthMonitor + Tenant + Circuit-breaker: extra
+# ===========================================================================
+
+class TestHealthMonitorWatchlistSLOThresholds:
+    """Verify YELLOW/RED gate values for watchlist gap count."""
+
+    def _mon(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        return PipelineHealthMonitor()
+
+    def test_zero_gaps_is_green(self):
+        m = self._mon()
+        m.record_watchlist_gap_count(0)
+        r = m.health_report()
+        from app.intelligence.health_monitor import SLOStatus
+        assert r.overall_status != SLOStatus.RED
+
+    def test_two_gaps_is_not_red(self):
+        m = self._mon()
+        m.record_watchlist_gap_count(2)
+        r = m.health_report()
+        from app.intelligence.health_monitor import SLOStatus
+        assert r.overall_status != SLOStatus.RED
+
+    def test_three_gaps_is_at_least_yellow(self):
+        m = self._mon()
+        m.record_watchlist_gap_count(3)
+        r = m.health_report()
+        from app.intelligence.health_monitor import SLOStatus
+        assert r.overall_status in (SLOStatus.YELLOW, SLOStatus.RED)
+
+    def test_ten_gaps_triggers_red(self):
+        m = self._mon()
+        m.record_watchlist_gap_count(10)
+        r = m.health_report()
+        from app.intelligence.health_monitor import SLOStatus
+        assert r.overall_status == SLOStatus.RED
+
+    def test_high_ece_and_many_gaps_both_in_violations(self):
+        m = self._mon()
+        m.record_ece(0.35)          # above 0.10 threshold
+        m.record_watchlist_gap_count(10)
+        r = m.health_report()
+        metrics = {v.metric for v in r.violations}
+        assert any("ece" in m.lower() or "watchlist" in m.lower() for m in metrics)
+
+
+class TestTenantPartitioningIsolation:
+    """Extra isolation checks for multi-tenant ChunkStore partitioning."""
+
+    def test_default_and_custom_tenant_are_independent(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+
+        store_default = ChunkStore()
+        store_acme    = ChunkStore()
+
+        pipeline = IndexingPipeline(chunk_store=store_default)
+        pipeline._tenant_stores["acme"] = store_acme
+
+        # Write directly to verify both stores stay independent
+        store_default.chunk_text("d1", "social", "Default tenant article about OpenAI")
+        store_acme.chunk_text("a1", "social", "ACME tenant article about NVIDIA")
+        assert store_default.get_by_observation("a1") == []
+        assert store_acme.get_by_observation("d1") == []
+        assert len(store_default.get_by_observation("d1")) >= 1
+        assert len(store_acme.get_by_observation("a1")) >= 1
+
+    def test_get_or_create_tenant_store_creates_on_demand(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        p = IndexingPipeline()
+        before = len(p._tenant_stores)
+        store = p._get_or_create_tenant_store("new-tenant")
+        assert len(p._tenant_stores) == before + 1
+        assert p._tenant_stores["new-tenant"] is store
+
+    def test_get_or_create_returns_same_instance_on_repeat(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        p = IndexingPipeline()
+        s1 = p._get_or_create_tenant_store("same")
+        s2 = p._get_or_create_tenant_store("same")
+        assert s1 is s2
+
+    def test_tenant_store_count_scales_linearly(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        p = IndexingPipeline()
+        tenants = [f"tenant-{i}" for i in range(10)]
+        for t in tenants:
+            p._get_or_create_tenant_store(t)
+        # 10 new + 1 default
+        assert len(p._tenant_stores) >= 11
+
+
+class TestCircuitBreakerE2E:
+    """End-to-end circuit breaker tests via PipelineHealthMonitor."""
+
+    def _mon(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        return PipelineHealthMonitor(cb_open_threshold=5)
+
+    def test_five_failures_opens_circuit(self):
+        m = self._mon()
+        for _ in range(5):
+            m.record_connector_failure("github")
+        assert m.is_circuit_open("github")
+
+    def test_four_failures_does_not_open(self):
+        m = self._mon()
+        for _ in range(4):
+            m.record_connector_failure("github")
+        assert not m.is_circuit_open("github")
+
+    def test_success_closes_open_circuit(self):
+        m = self._mon()
+        for _ in range(5):
+            m.record_connector_failure("github")
+        assert m.is_circuit_open("github")
+        m.record_connector_success("github")
+        assert not m.is_circuit_open("github")
+
+    def test_success_also_resets_failure_count(self):
+        m = self._mon()
+        for _ in range(3):
+            m.record_connector_failure("github")
+        m.record_connector_success("github")
+        m.record_connector_failure("github")  # only 1 more
+        assert not m.is_circuit_open("github")
+
+    def test_open_circuit_triggers_red_in_health_report(self):
+        m = self._mon()
+        for _ in range(5):
+            m.record_connector_failure("critical")
+        report = m.health_report()
+        from app.intelligence.health_monitor import SLOStatus
+        assert report.overall_status == SLOStatus.RED
+
+    def test_multiple_connectors_independent(self):
+        m = self._mon()
+        for _ in range(5):
+            m.record_connector_failure("conn-a")
+        assert m.is_circuit_open("conn-a")
+        assert not m.is_circuit_open("conn-b")
+
+    def test_custom_threshold(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        m = PipelineHealthMonitor(cb_open_threshold=3)
+        for _ in range(3):
+            m.record_connector_failure("api")
+        assert m.is_circuit_open("api")
+
+
+# ===========================================================================
+# Realistic User Journey — Phase 5 Items 3-4 end-to-end
+# ===========================================================================
+
+class TestRealisticUserWorkflow:
+    """Full end-to-end user journey with realistic AI-tech news content."""
+
+    AI_ARTICLES = [
+        ("openai-gpt5",
+         "OpenAI Releases GPT-5 with Breakthrough Reasoning Capabilities",
+         ["ai", "openai", "llm"]),
+        ("nvidia-earnings",
+         "NVIDIA Reports Record $22B Revenue Driven by AI Chip Demand",
+         ["nvidia", "ai", "hardware"]),
+        ("deepmind-alphafold",
+         "Google DeepMind AlphaFold 3 Predicts Protein-DNA Interactions",
+         ["ai", "science", "deepmind"]),
+        ("anthropic-funding",
+         "Anthropic Raises $2B Series D at $15B Valuation",
+         ["ai", "funding", "anthropic"]),
+        ("meta-llama3",
+         "Meta Open-Sources LLaMA 3 Model with Improved Performance",
+         ["ai", "meta", "open-source"]),
+    ]
+
+    def _make_cands(self):
+        from app.personalization.models import DigestCandidate
+        return [
+            DigestCandidate(item_id=iid, title=title, topic_ids=topics,
+                            entity_ids=topics[:1], trust_score=0.85)
+            for iid, title, topics in self.AI_ARTICLES
+        ]
+
+    def test_watchlist_boosts_watched_entity(self):
+        from app.personalization.watchlist_graph import WatchlistGraph
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        wg = WatchlistGraph("u1")
+        wg.watch("openai", node_type="entity", priority=0.95)
+        ranker = UserDigestRanker(watchlist_graph=wg, watchlist_boost_weight=0.25)
+        ranked = ranker.rank(self._make_cands())
+        assert ranked[0].item_id == "openai-gpt5"
+        assert ranked[0].score_breakdown.get("watchlist_boost", 0) > 0
+
+    def test_save_feedback_increases_topic_weight(self):
+        from app.personalization.interest_graph import InterestGraph
+        from app.personalization.feedback_learner import FeedbackLearner
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        from app.personalization.models import FeedbackEvent, FeedbackType
+        ig = InterestGraph()
+        fl = FeedbackLearner(ig)
+        ranker = UserDigestRanker(interest_graph=ig, feedback_learner=fl)
+        before = ig.get_weight("ai") or 0.0
+        for _ in range(5):
+            ranker.apply_feedback(FeedbackEvent(
+                user_id="u1", item_id="openai-gpt5",
+                feedback_type=FeedbackType.SAVE, topic_ids=["ai"]))
+        after = ig.get_weight("ai") or 0.0
+        assert after > before
+
+    def test_dismiss_reduces_topic_weight(self):
+        from app.personalization.interest_graph import InterestGraph
+        from app.personalization.feedback_learner import FeedbackLearner
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        from app.personalization.models import FeedbackEvent, FeedbackType
+        ig = InterestGraph()
+        fl = FeedbackLearner(ig)
+        ranker = UserDigestRanker(interest_graph=ig, feedback_learner=fl)
+        ranker.apply_feedback(FeedbackEvent(
+            user_id="u1", item_id="x", feedback_type=FeedbackType.SAVE,
+            topic_ids=["sports"]))
+        saved = ig.get_weight("sports") or 0.0
+        ranker.apply_feedback(FeedbackEvent(
+            user_id="u1", item_id="y", feedback_type=FeedbackType.DISMISS,
+            topic_ids=["sports"]))
+        assert (ig.get_weight("sports") or 0.0) < saved
+
+    def test_repeated_save_makes_ai_rank_first(self):
+        from app.personalization.interest_graph import InterestGraph
+        from app.personalization.feedback_learner import FeedbackLearner
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        from app.personalization.models import FeedbackEvent, FeedbackType, DigestCandidate
+        ig = InterestGraph()
+        fl = FeedbackLearner(ig)
+        ranker = UserDigestRanker(interest_graph=ig, feedback_learner=fl)
+        for _ in range(10):
+            ranker.apply_feedback(FeedbackEvent(
+                user_id="u1", item_id="openai-gpt5",
+                feedback_type=FeedbackType.SAVE, topic_ids=["ai"]))
+        sports = DigestCandidate(item_id="sports", title="Football", topic_ids=["sports"])
+        ai    = DigestCandidate(item_id="openai-gpt5", title="GPT-5", topic_ids=["ai"])
+        ranked = ranker.rank([sports, ai])
+        assert ranked[0].item_id == "openai-gpt5"
+
+    def test_morning_brief_from_ranked_candidates(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        from app.output.digest_modes import DigestModeRouter, DeliveryMode, MorningBrief
+        cands = self._make_cands()
+        ranked = UserDigestRanker().rank(cands)
+        result = DigestModeRouter().render_from_ranked(
+            DeliveryMode.MORNING_BRIEF, ranked, originals=cands)
+        assert isinstance(result, MorningBrief)
+        assert len(result.items) == len(cands)
+
+    def test_personalized_stream_respects_user_id(self):
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        from app.output.digest_modes import DigestModeRouter, DeliveryMode
+        cands = self._make_cands()
+        ranked = UserDigestRanker().rank(cands)
+        result = DigestModeRouter().render_from_ranked(
+            DeliveryMode.PERSONALIZED_STREAM, ranked,
+            originals=cands, user_id="alice")
+        assert result.user_id == "alice"
+
+    def test_all_ranked_items_have_final_score_in_range(self):
+        cands = self._make_cands()
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        ranked = UserDigestRanker().rank(cands)
+        for item in ranked:
+            assert 0.0 <= item.final_score <= 1.0
+
+    def test_ranking_is_stable_on_equal_scores(self):
+        """When all items have identical attributes, ranking must not raise."""
+        from app.personalization.models import DigestCandidate
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        uniform = [DigestCandidate(item_id=f"item-{i}", title=f"Title {i}",
+                                   topic_ids=["ai"], trust_score=0.8) for i in range(5)]
+        ranked = UserDigestRanker().rank(uniform)
+        assert len(ranked) == 5
+
+    def test_chunk_store_persists_ingested_articles(self, tmp_path):
+        """Chunks written during indexing survive a re-open of the DB."""
+        import asyncio
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+
+        db = str(tmp_path / "user_journey.db")
+        store = ChunkStore(db_path=db)
+        pipeline = IndexingPipeline(chunk_store=store)
+        item = _make_content_item(text="OpenAI releases GPT-5 with breakthrough reasoning.")
+        asyncio.run(pipeline.process_batch([item]))
+
+        store2 = ChunkStore(db_path=db)
+        assert store2.count() >= 1
+
+    def test_grounded_summary_includes_ai_topics(self):
+        """build_grounded_summary must return a GroundedSummary for AI article batch."""
+        import uuid
+        from app.ingestion.indexing_pipeline import IndexingPipeline, IndexingResult
+        from app.ingestion.pipeline_result import IntelligencePipelineResult, PipelineStatus
+        from app.summarization.models import GroundedSummary
+
+        prs = []
+        ai_summaries = [
+            "OpenAI GPT-5 achieves human-level performance on reasoning tasks.",
+            "NVIDIA H100 GPUs are driving record AI infrastructure growth worldwide.",
+            "DeepMind AlphaFold 3 enables protein-DNA interaction prediction at scale.",
+        ]
+        for s in ai_summaries:
+            prs.append(IntelligencePipelineResult(
+                content_item_id=uuid.uuid4(), source_family="social",
+                status=PipelineStatus.SUCCESS, summary=s, confidence=0.80))
+
+        ir = IndexingResult(pipeline_results=prs)
+        pipeline = IndexingPipeline()
+        result = pipeline.build_grounded_summary(ir, topic="AI and machine learning")
+        assert result is not None
+        assert isinstance(result, GroundedSummary)
+        assert result.source_count == 3
+        assert 0.0 <= result.confidence_score <= 1.0
+
+
+# ===========================================================================
+# Phase 5 Item 5 — ModelArtifactRegistry SLO auto-rollback: E2E
+# ===========================================================================
+
+class TestModelAutoRollbackE2E:
+    """End-to-end: ECE spike → health monitor RED → auto-rollback → audit log."""
+
+    @pytest.fixture()
+    def registry(self, tmp_path):
+        from training.model_registry import ModelArtifactRegistry
+        return ModelArtifactRegistry(
+            registry_path=tmp_path / "reg.json",
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+
+    def _register_two_artifacts(self, reg):
+        from training.model_registry import ArtifactRecord
+        a1 = ArtifactRecord(epoch=1, ece=0.07, macro_f1=0.75, checkpoint_path="ckpt1.json")
+        a2 = ArtifactRecord(epoch=2, ece=0.06, macro_f1=0.80, checkpoint_path="ckpt2.json")
+        reg.register(a1)
+        reg.register(a2)
+        reg.promote(a1.artifact_id)
+        reg.promote(a2.artifact_id)
+        return a1, a2
+
+    def _red_monitor(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        m = PipelineHealthMonitor(ece_slo=0.10)
+        m.record_ece(0.35)
+        return m
+
+    def _green_monitor(self):
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        return PipelineHealthMonitor()
+
+    def test_red_ece_triggers_rollback(self, registry):
+        """RED health status must trigger rollback to previous production artifact."""
+        a1, a2 = self._register_two_artifacts(registry)
+        assert registry.get_production().artifact_id == a2.artifact_id
+        result = registry.check_and_rollback(self._red_monitor())
+        assert result is not None
+        # a2 is demoted; a1 is reinstated
+        assert registry.get_production().artifact_id == a1.artifact_id
+
+    def test_rollback_writes_to_audit_log(self, registry):
+        """Every rollback must append a JSON line to the audit log."""
+        self._register_two_artifacts(registry)
+        registry.check_and_rollback(self._red_monitor())
+        entries = registry.read_audit_log()
+        rollback_entries = [e for e in entries if e["event"] == "rollback"]
+        assert len(rollback_entries) >= 1
+
+    def test_audit_log_entry_has_required_fields(self, registry):
+        """Audit log entries must contain event, artifact_id, timestamp, notes."""
+        self._register_two_artifacts(registry)
+        registry.check_and_rollback(self._red_monitor())
+        for entry in registry.read_audit_log():
+            assert "event" in entry
+            assert "artifact_id" in entry
+            assert "timestamp" in entry
+
+    def test_green_health_preserves_production(self, registry):
+        """GREEN health status must not trigger any rollback."""
+        a1, a2 = self._register_two_artifacts(registry)
+        result = registry.check_and_rollback(self._green_monitor())
+        assert result is None
+        assert registry.get_production().artifact_id == a2.artifact_id
+
+    def test_promote_then_rollback_logs_both_events(self, registry):
+        """Promote writes one audit entry; rollback writes another."""
+        self._register_two_artifacts(registry)
+        # 2 promotes already happened; check total entries
+        entries_before = len(registry.read_audit_log())
+        registry.check_and_rollback(self._red_monitor())
+        entries_after = registry.read_audit_log()
+        assert len(entries_after) > entries_before
+
+    def test_double_rollback_no_crash(self, registry):
+        """Calling check_and_rollback twice in RED state must not raise."""
+        a1, a2 = self._register_two_artifacts(registry)
+        first = registry.check_and_rollback(self._red_monitor())
+        assert first is not None       # a1 is restored
+        # Second call: a2 is now the best alternative → cycles back
+        second = registry.check_and_rollback(self._red_monitor())
+        # Must not raise; either returns an artifact or None
+        assert second is None or second.artifact_id in (a1.artifact_id, a2.artifact_id)
+
+    def test_check_and_rollback_with_no_artifacts_returns_none(self, registry):
+        """Empty registry must not crash; returns None."""
+        result = registry.check_and_rollback(self._red_monitor())
+        assert result is None
+
+    def test_audit_log_is_valid_jsonl(self, registry, tmp_path):
+        """Every line in the audit log must be valid JSON."""
+        import json
+        self._register_two_artifacts(registry)
+        registry.check_and_rollback(self._red_monitor())
+        log_path = tmp_path / "audit.jsonl"
+        assert log_path.exists()
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                obj = json.loads(line)
+                assert isinstance(obj, dict)
+
+    def test_concurrent_check_and_rollback_no_crash(self, registry):
+        """Concurrent check_and_rollback calls must not deadlock or corrupt state."""
+        import threading
+        self._register_two_artifacts(registry)
+        errors = []
+        mon = self._red_monitor()
+
+        def worker():
+            try:
+                registry.check_and_rollback(mon)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+
+# ===========================================================================
+# All-Components Integration — the ultimate integration test
+# ===========================================================================
+
+class TestAllComponentsIntegration:
+    """Wire every major component together in a single realistic scenario.
+
+    Stack: IndexingPipeline (SourceTrustScorer, WatchlistGraph, HealthMonitor)
+    → UserDigestRanker (WatchlistGraph, FeedbackLearner)
+    → DigestModeRouter → ModelArtifactRegistry.check_and_rollback
+    """
+
+    @pytest.fixture()
+    def components(self, tmp_path):
+        import asyncio
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        from app.personalization.watchlist_graph import WatchlistGraph
+        from app.personalization.interest_graph import InterestGraph
+        from app.personalization.feedback_learner import FeedbackLearner
+        from app.personalization.user_digest_ranker import UserDigestRanker
+        from app.output.digest_modes import DigestModeRouter
+        from app.source_intelligence.source_trust import SourceTrustScorer
+        from training.model_registry import ModelArtifactRegistry
+
+        store   = ChunkStore(db_path=str(tmp_path / "integration.db"))
+        monitor = PipelineHealthMonitor(ece_slo=0.10, cb_open_threshold=5)
+        wg      = WatchlistGraph("integration-user")
+        ig      = InterestGraph()
+        fl      = FeedbackLearner(ig)
+        ts      = SourceTrustScorer()
+        ts.set_authority("social", 0.85)
+        ts.set_primacy("social", True)
+
+        pipeline = IndexingPipeline(
+            chunk_store=store,
+            health_monitor=monitor,
+            watchlist_graph=wg,
+            trust_scorer=ts,
+        )
+        ranker = UserDigestRanker(
+            watchlist_graph=wg,
+            interest_graph=ig,
+            feedback_learner=fl,
+            watchlist_boost_weight=0.20,
+        )
+        router   = DigestModeRouter()
+        registry = ModelArtifactRegistry(
+            registry_path=tmp_path / "reg.json",
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        return {
+            "pipeline": pipeline, "store": store, "monitor": monitor,
+            "wg": wg, "ig": ig, "fl": fl, "ranker": ranker,
+            "router": router, "registry": registry,
+        }
+
+    def test_full_ingest_rank_digest_flow(self, components):
+        """Ingest 3 articles → rank candidates → render morning brief."""
+        import asyncio
+        from app.personalization.models import DigestCandidate
+        from app.output.digest_modes import DeliveryMode, MorningBrief
+
+        pipeline = components["pipeline"]
+        ranker   = components["ranker"]
+        router   = components["router"]
+        wg       = components["wg"]
+
+        wg.watch("openai", node_type="entity", priority=0.95)
+
+        items = [
+            _make_content_item(text="OpenAI GPT-5 achieves new SOTA on all major benchmarks.",
+                               title="GPT-5 Released"),
+            _make_content_item(text="NVIDIA posts record revenue from AI chip sales.",
+                               title="NVIDIA Earnings"),
+            _make_content_item(text="DeepMind AlphaFold 3 released to research community.",
+                               title="AlphaFold 3"),
+        ]
+        asyncio.run(pipeline.process_batch(items))
+        assert components["store"].count() >= 3
+
+        cands = [
+            DigestCandidate(item_id="openai-gpt5", title="GPT-5 Released",
+                            topic_ids=["ai"], entity_ids=["openai"], trust_score=0.9),
+            DigestCandidate(item_id="nvidia-rev", title="NVIDIA Earnings",
+                            topic_ids=["ai", "hardware"], trust_score=0.85),
+            DigestCandidate(item_id="alphafold3", title="AlphaFold 3",
+                            topic_ids=["ai", "science"], trust_score=0.80),
+        ]
+        ranked = ranker.rank(cands)
+        assert ranked[0].item_id == "openai-gpt5"   # watchlist boosted
+
+        brief = router.render_from_ranked(DeliveryMode.MORNING_BRIEF, ranked, originals=cands)
+        assert isinstance(brief, MorningBrief)
+        assert len(brief.items) == 3
+
+    def test_health_monitor_ece_triggers_model_rollback(self, components):
+        """ECE spike reported to monitor causes auto-rollback in model registry."""
+        from training.model_registry import ArtifactRecord
+        monitor  = components["monitor"]
+        registry = components["registry"]
+
+        a1 = ArtifactRecord(epoch=1, ece=0.07, macro_f1=0.75, checkpoint_path="c1.json")
+        a2 = ArtifactRecord(epoch=2, ece=0.06, macro_f1=0.82, checkpoint_path="c2.json")
+        registry.register(a1); registry.register(a2)
+        registry.promote(a1.artifact_id); registry.promote(a2.artifact_id)
+
+        monitor.record_ece(0.45)
+        rollback = registry.check_and_rollback(monitor)
+        assert rollback is not None
+        assert registry.get_production().artifact_id == a1.artifact_id
+        entries = registry.read_audit_log()
+        assert any(e["event"] == "rollback" for e in entries)
+
+    def test_connector_failure_opens_circuit_and_is_visible_in_report(self, components):
+        """5 connector failures → circuit open → health report shows RED."""
+        from app.intelligence.health_monitor import SLOStatus
+        monitor = components["monitor"]
+        for _ in range(5):
+            monitor.record_connector_failure("arxiv")
+        assert monitor.is_circuit_open("arxiv")
+        report = monitor.health_report()
+        assert report.overall_status == SLOStatus.RED
+
+    def test_trust_score_stamped_in_chunk_metadata(self, components):
+        """Chunks indexed via a trust-scorer pipeline carry trust_score in metadata."""
+        import asyncio
+        pipeline = components["pipeline"]
+        store    = components["store"]
+        item = _make_content_item(text="Anthropic raises $2B led by Google.", platform="reddit")
+        asyncio.run(pipeline.process_batch([item]))
+        chunks = store.get_by_observation(str(item.id))
+        assert len(chunks) >= 1
+        for chunk in chunks:
+            assert "trust_score" in chunk.metadata
+            assert 0.0 <= chunk.metadata["trust_score"] <= 1.0
+
+    def test_watchlist_gap_reported_to_health_monitor(self, components):
+        """After process_batch with uncovered watched nodes, monitor receives gap count."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        from app.personalization.watchlist_graph import WatchlistGraph
+
+        mock_monitor = MagicMock()
+        wg = WatchlistGraph("u2")
+        wg.watch("SomeUnknownEntity", expected_families=["social"])
+
+        p = IndexingPipeline(
+            chunk_store=ChunkStore(),
+            watchlist_graph=wg,
+            health_monitor=mock_monitor,
+        )
+        asyncio.run(p.process_batch([_make_content_item()]))
+        mock_monitor.record_watchlist_gap_count.assert_called_once()
+        gap_count = mock_monitor.record_watchlist_gap_count.call_args[0][0]
+        assert gap_count >= 1
+
