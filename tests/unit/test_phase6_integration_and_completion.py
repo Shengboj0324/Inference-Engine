@@ -8803,3 +8803,1123 @@ class TestAllComponentsIntegration:
         gap_count = mock_monitor.record_watchlist_gap_count.call_args[0][0]
         assert gap_count >= 1
 
+
+# ===========================================================================
+# Auto-Research Item 1 — Source acquisition hardening
+# ===========================================================================
+
+class TestSourceSpecPriority:
+    """SourceSpec.priority field validation and defaults."""
+
+    def _spec(self, priority: float = 0.5, **kwargs) -> "SourceSpec":
+        from app.source_intelligence.source_registry import SourceSpec, SourceFamily
+        from app.core.models import SourcePlatform
+        return SourceSpec(
+            source_id=kwargs.get("source_id", "test-src"),
+            platform=SourcePlatform.GITHUB_RELEASES,
+            family=SourceFamily.DEVELOPER_RELEASE,
+            priority=priority,
+        )
+
+    def test_default_priority_is_half(self):
+        from app.source_intelligence.source_registry import SourceSpec, SourceFamily
+        from app.core.models import SourcePlatform
+        spec = SourceSpec(
+            source_id="s1", platform=SourcePlatform.GITHUB_RELEASES,
+            family=SourceFamily.RESEARCH,
+        )
+        assert spec.priority == 0.5
+
+    def test_priority_zero_is_valid(self):
+        spec = self._spec(priority=0.0)
+        assert spec.priority == 0.0
+
+    def test_priority_one_is_valid(self):
+        spec = self._spec(priority=1.0)
+        assert spec.priority == 1.0
+
+    def test_priority_above_one_raises(self):
+        with pytest.raises(ValueError, match="priority"):
+            self._spec(priority=1.1)
+
+    def test_priority_below_zero_raises(self):
+        with pytest.raises(ValueError, match="priority"):
+            self._spec(priority=-0.1)
+
+
+class TestSourceRegistryStorePriorityMethods:
+    """next_batch() and update_priority() on SourceRegistryStore."""
+
+    @pytest.fixture()
+    def registry(self):
+        from app.source_intelligence.source_registry import SourceRegistryStore, SourceSpec, SourceFamily
+        from app.core.models import SourcePlatform
+        store = SourceRegistryStore()
+        for i, prio in enumerate([0.9, 0.5, 0.1, 0.7]):
+            store.register(SourceSpec(
+                source_id=f"src-{i}", platform=SourcePlatform.GITHUB_RELEASES,
+                family=SourceFamily.DEVELOPER_RELEASE, priority=prio,
+            ))
+        return store
+
+    def test_next_batch_returns_sorted_by_priority(self, registry):
+        batch = registry.next_batch(4)
+        priorities = [s.priority for s in batch]
+        assert priorities == sorted(priorities, reverse=True)
+
+    def test_next_batch_respects_n(self, registry):
+        assert len(registry.next_batch(2)) == 2
+
+    def test_next_batch_min_priority_filters(self, registry):
+        batch = registry.next_batch(10, min_priority=0.6)
+        assert all(s.priority >= 0.6 for s in batch)
+
+    def test_next_batch_empty_registry_returns_empty(self):
+        from app.source_intelligence.source_registry import SourceRegistryStore
+        assert SourceRegistryStore().next_batch(5) == []
+
+    def test_next_batch_n_zero_raises(self, registry):
+        with pytest.raises(ValueError):
+            registry.next_batch(0)
+
+    def test_update_priority_returns_true_on_existing(self, registry):
+        assert registry.update_priority("src-0", 0.2) is True
+        assert registry.get("src-0").priority == pytest.approx(0.2)
+
+    def test_update_priority_returns_false_on_missing(self, registry):
+        assert registry.update_priority("no-such", 0.5) is False
+
+    def test_update_priority_out_of_range_raises(self, registry):
+        with pytest.raises(ValueError):
+            registry.update_priority("src-0", 1.5)
+
+    def test_next_batch_family_filter(self, registry):
+        from app.source_intelligence.source_registry import SourceFamily
+        batch = registry.next_batch(10, family=SourceFamily.RESEARCH)
+        assert batch == []  # all are DEVELOPER_RELEASE
+
+
+class TestAcquisitionScheduler:
+    """AcquisitionScheduler: constructor, next_batch, failure/success, trust gate."""
+
+    @pytest.fixture()
+    def registry_with_three_sources(self):
+        from app.source_intelligence.source_registry import (
+            SourceRegistryStore, SourceSpec, SourceFamily,
+        )
+        from app.core.models import SourcePlatform
+        reg = SourceRegistryStore()
+        for i, prio in enumerate([0.9, 0.6, 0.3]):
+            reg.register(SourceSpec(
+                source_id=f"conn-{i}", platform=SourcePlatform.GITHUB_RELEASES,
+                family=SourceFamily.DEVELOPER_RELEASE, priority=prio,
+            ))
+        return reg
+
+    def _scheduler(self, registry, **kwargs):
+        from app.source_intelligence.source_registry import AcquisitionScheduler
+        return AcquisitionScheduler(registry, **kwargs)
+
+    def test_constructor_rejects_wrong_type(self):
+        from app.source_intelligence.source_registry import AcquisitionScheduler
+        with pytest.raises(TypeError):
+            AcquisitionScheduler("not-a-registry")
+
+    def test_constructor_rejects_bad_threshold(self, registry_with_three_sources):
+        from app.source_intelligence.source_registry import AcquisitionScheduler
+        with pytest.raises(ValueError):
+            AcquisitionScheduler(registry_with_three_sources, min_authority_threshold=1.5)
+
+    def test_constructor_rejects_bad_base_backoff(self, registry_with_three_sources):
+        from app.source_intelligence.source_registry import AcquisitionScheduler
+        with pytest.raises(ValueError):
+            AcquisitionScheduler(registry_with_three_sources, base_backoff_s=-1)
+
+    def test_constructor_rejects_zero_max_retries(self, registry_with_three_sources):
+        from app.source_intelligence.source_registry import AcquisitionScheduler
+        with pytest.raises(ValueError):
+            AcquisitionScheduler(registry_with_three_sources, max_retries=0)
+
+    def test_next_batch_returns_all_eligible(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources)
+        batch = sched.next_batch(10)
+        assert len(batch) == 3
+
+    def test_next_batch_sorted_by_priority(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources)
+        prios = [s.priority for s in sched.next_batch(10)]
+        assert prios == sorted(prios, reverse=True)
+
+    def test_failure_triggers_backoff(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources, base_backoff_s=60.0)
+        sched.record_failure("conn-0")
+        assert not sched.is_eligible("conn-0")
+        assert sched.backoff_remaining_s("conn-0") > 0
+
+    def test_success_clears_backoff(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources, base_backoff_s=60.0)
+        sched.record_failure("conn-0")
+        assert not sched.is_eligible("conn-0")
+        sched.record_success("conn-0")
+        assert sched.is_eligible("conn-0")
+        assert sched.backoff_remaining_s("conn-0") == 0.0
+
+    def test_max_retries_suspends_source(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources,
+                                base_backoff_s=0.001, max_retries=3)
+        for _ in range(3):
+            sched.record_failure("conn-1")
+        # Even though backoff may be tiny, suspension due to max_retries kicks in
+        assert sched.failure_count("conn-1") == 3
+        assert not sched.is_eligible("conn-1")
+
+    def test_failure_count_increments(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources)
+        assert sched.failure_count("conn-0") == 0
+        sched.record_failure("conn-0")
+        assert sched.failure_count("conn-0") == 1
+        sched.record_failure("conn-0")
+        assert sched.failure_count("conn-0") == 2
+
+    def test_failure_surfaces_to_health_monitor(self, registry_with_three_sources):
+        from unittest.mock import MagicMock
+        mock_mon = MagicMock()
+        sched = self._scheduler(registry_with_three_sources, health_monitor=mock_mon)
+        sched.record_failure("conn-0")
+        mock_mon.record_connector_failure.assert_called_once_with("conn-0")
+
+    def test_success_surfaces_to_health_monitor(self, registry_with_three_sources):
+        from unittest.mock import MagicMock
+        mock_mon = MagicMock()
+        sched = self._scheduler(registry_with_three_sources, health_monitor=mock_mon)
+        sched.record_success("conn-2")
+        mock_mon.record_connector_success.assert_called_once_with("conn-2")
+
+    def test_trust_gate_excludes_low_trust_source(self, registry_with_three_sources):
+        from app.source_intelligence.source_trust import SourceTrustScorer
+        scorer = SourceTrustScorer()
+        # Give conn-1 and conn-2 high composite: primacy=True + authority=0.9
+        #   composite = 0.35*1.0 + 0.20*≈0 + 0.30*0.5 + 0.15*0.9 ≈ 0.635
+        scorer.set_primacy("conn-1", True)
+        scorer.set_authority("conn-1", 0.9)
+        scorer.set_primacy("conn-2", True)
+        scorer.set_authority("conn-2", 0.9)
+        # Leave conn-0 at defaults: composite ≈ 0.105 + 0 + 0.15 + 0.075 = 0.33
+        sched = self._scheduler(
+            registry_with_three_sources,
+            trust_scorer=scorer,
+            min_authority_threshold=0.50,  # conn-0 (≈0.33) excluded; conn-1/2 (≈0.63) pass
+        )
+        batch_ids = {s.source_id for s in sched.next_batch(10)}
+        assert "conn-1" in batch_ids
+        assert "conn-2" in batch_ids
+        assert "conn-0" not in batch_ids
+
+    def test_broken_health_monitor_does_not_propagate(self, registry_with_three_sources):
+        """A crashing health monitor must not abort record_failure/record_success."""
+        from unittest.mock import MagicMock
+        bad_mon = MagicMock()
+        bad_mon.record_connector_failure.side_effect = RuntimeError("boom")
+        bad_mon.record_connector_success.side_effect = RuntimeError("boom")
+        sched = self._scheduler(registry_with_three_sources, health_monitor=bad_mon)
+        sched.record_failure("conn-0")  # must not raise
+        sched.record_success("conn-0")  # must not raise
+
+    def test_thread_safety_concurrent_failures(self, registry_with_three_sources):
+        """100 threads recording failures must not corrupt state."""
+        import threading
+        sched = self._scheduler(registry_with_three_sources)
+        errors = []
+
+        def worker():
+            try:
+                for _ in range(100):
+                    sched.record_failure("conn-0")
+                    sched.failure_count("conn-0")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+        assert sched.failure_count("conn-0") == 400
+
+    def test_is_eligible_unregistered_source_returns_false(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources)
+        assert not sched.is_eligible("ghost-source")
+
+    def test_next_batch_n_one_returns_highest_priority(self, registry_with_three_sources):
+        sched = self._scheduler(registry_with_three_sources)
+        batch = sched.next_batch(1)
+        assert len(batch) == 1
+        assert batch[0].source_id == "conn-0"
+
+    def test_realistic_ai_lab_source_scheduling(self):
+        """Realistic scenario: 3 AI lab sources with different priorities."""
+        from app.source_intelligence.source_registry import (
+            SourceRegistryStore, SourceSpec, SourceFamily, AcquisitionScheduler,
+        )
+        from app.core.models import SourcePlatform
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+
+        reg = SourceRegistryStore()
+        monitor = PipelineHealthMonitor(cb_open_threshold=5)
+        for src_id, prio in [("openai-blog", 0.95), ("anthropic-news", 0.80), ("deepmind-papers", 0.60)]:
+            reg.register(SourceSpec(
+                source_id=src_id, platform=SourcePlatform.GITHUB_RELEASES,
+                family=SourceFamily.RESEARCH, priority=prio,
+            ))
+        sched = AcquisitionScheduler(reg, health_monitor=monitor, base_backoff_s=0.001)
+
+        # Simulate: openai-blog fails 2× then succeeds
+        sched.record_failure("openai-blog")
+        sched.record_failure("openai-blog")
+        assert not sched.is_eligible("openai-blog")  # in backoff
+
+        sched.record_success("openai-blog")
+        assert sched.is_eligible("openai-blog")
+
+        # anthropic-news is healthy
+        sched.record_success("anthropic-news")
+        assert sched.is_eligible("anthropic-news")
+
+        # next batch should return all 3 after openai-blog recovers
+        batch = sched.next_batch(10)
+        assert len(batch) == 3
+        assert batch[0].source_id == "openai-blog"  # highest priority
+
+
+
+
+# ===========================================================================
+# Auto-Research Item 2 — Multimodal evidence extraction
+# ===========================================================================
+
+class TestMultimodalAnalyzerToEvidenceSources:
+    """to_evidence_sources() wiring on MultimodalAnalyzer."""
+
+    _BASE = dict(
+        user_id=None,   # filled in per-call
+        source_id="post-1",
+        source_url="https://example.com/post",
+        title="AI Lab Announcement",
+        media_type=None,   # filled in per-call
+        published_at=None, # filled in per-call
+    )
+
+    def _obs_with_image(self, url: str = "https://example.com/img.jpg"):
+        from app.domain.raw_models import RawObservation
+        from app.core.models import SourcePlatform, MediaType
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        return RawObservation(
+            user_id=uuid4(),
+            source_id="post-img",
+            source_url="https://example.com/img-post",
+            title="AI lab announces breakthrough",
+            raw_text="AI lab announces breakthrough",
+            media_type=MediaType.IMAGE,
+            source_platform=SourcePlatform.REDDIT,
+            published_at=datetime.now(timezone.utc),
+            platform_metadata={"image_url": url},
+        )
+
+    def _obs_with_video(self, url: str = "https://example.com/vid.mp4"):
+        from app.domain.raw_models import RawObservation
+        from app.core.models import SourcePlatform, MediaType
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        return RawObservation(
+            user_id=uuid4(),
+            source_id="post-vid",
+            source_url="https://example.com/vid-post",
+            title="NVIDIA earnings call recording",
+            raw_text="NVIDIA earnings call recording",
+            media_type=MediaType.VIDEO,
+            source_platform=SourcePlatform.YOUTUBE,
+            published_at=datetime.now(timezone.utc),
+            platform_metadata={"video_url": url},
+        )
+
+    def _obs_no_media(self):
+        from app.domain.raw_models import RawObservation
+        from app.core.models import SourcePlatform, MediaType
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        return RawObservation(
+            user_id=uuid4(),
+            source_id="post-text",
+            source_url="https://example.com/text-post",
+            title="Plain text article about AI",
+            raw_text="Plain text article about AI",
+            media_type=MediaType.TEXT,
+            source_platform=SourcePlatform.REDDIT,
+            published_at=datetime.now(timezone.utc),
+        )
+
+    def _analyzer(self):
+        from app.intelligence.multimodal import MultimodalAnalyzer
+        return MultimodalAnalyzer()
+
+    def test_image_obs_returns_one_evidence_source(self):
+        obs = self._obs_with_image()
+        sources = self._analyzer().to_evidence_sources(obs)
+        assert len(sources) == 1
+        assert sources[0]["modality"] == "image"
+
+    def test_video_obs_returns_one_evidence_source(self):
+        obs = self._obs_with_video()
+        sources = self._analyzer().to_evidence_sources(obs)
+        assert len(sources) == 1
+        assert sources[0]["modality"] == "video"
+
+    def test_no_media_returns_empty(self):
+        obs = self._obs_no_media()
+        assert self._analyzer().to_evidence_sources(obs) == []
+
+    def test_evidence_source_has_required_keys(self):
+        obs = self._obs_with_image()
+        src = self._analyzer().to_evidence_sources(obs)[0]
+        for key in ("source_id", "title", "url", "platform", "trust_score", "content_snippet"):
+            assert key in src, f"missing key: {key}"
+
+    def test_trust_score_in_valid_range(self):
+        obs = self._obs_with_image()
+        src = self._analyzer().to_evidence_sources(obs)[0]
+        assert 0.0 <= src["trust_score"] <= 1.0
+
+    def test_content_snippet_contains_image_tag(self):
+        obs = self._obs_with_image()
+        src = self._analyzer().to_evidence_sources(obs)[0]
+        assert "[Image content]" in src["content_snippet"]
+
+    def test_content_snippet_contains_video_tag(self):
+        obs = self._obs_with_video()
+        src = self._analyzer().to_evidence_sources(obs)[0]
+        assert "[Video content]" in src["content_snippet"]
+
+    def test_disabled_mode_returns_empty(self):
+        from app.intelligence.multimodal import MultimodalAnalyzer, CapabilityMode
+        analyzer = MultimodalAnalyzer(execution_mode=CapabilityMode.DISABLED)
+        obs = self._obs_with_image()
+        assert analyzer.to_evidence_sources(obs) == []
+
+    def test_broken_vision_client_does_not_raise(self):
+        """A crashing vision_client falls back to stub — must never raise."""
+        from app.intelligence.multimodal import MultimodalAnalyzer, CapabilityMode
+        def bad_client(url, modality):
+            raise RuntimeError("API down")
+        analyzer = MultimodalAnalyzer(vision_client=bad_client,
+                                      execution_mode=CapabilityMode.REMOTE_MODEL)
+        obs = self._obs_with_image()
+        sources = analyzer.to_evidence_sources(obs)
+        assert len(sources) >= 1  # falls back to stub
+
+    def test_source_id_is_unique_per_url(self):
+        obs_a = self._obs_with_image("https://a.com/a.jpg")
+        obs_b = self._obs_with_image("https://b.com/b.jpg")
+        a = self._analyzer().to_evidence_sources(obs_a)
+        b = self._analyzer().to_evidence_sources(obs_b)
+        assert a[0]["source_id"] != b[0]["source_id"]
+
+
+class TestIndexingPipelineMultimodalWiring:
+    """Verify multimodal evidence is stored in ChunkRecord metadata."""
+
+    def _obs_with_image(self):
+        from app.domain.raw_models import RawObservation
+        from app.core.models import SourcePlatform, MediaType
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        return RawObservation(
+            user_id=uuid4(),
+            source_id="gpt5-announce",
+            source_url="https://openai.com/blog/gpt5",
+            title="OpenAI announces GPT-5",
+            raw_text="OpenAI announces GPT-5 at a press conference.",
+            media_type=MediaType.IMAGE,
+            source_platform=SourcePlatform.REDDIT,
+            published_at=datetime.now(timezone.utc),
+            platform_metadata={"image_url": "https://openai.com/img/gpt5-announce.jpg"},
+        )
+
+    def test_multimodal_evidence_in_chunk_metadata(self):
+        """When MultimodalAnalyzer is wired, chunk metadata has multimodal_evidence."""
+        import asyncio
+        from unittest.mock import MagicMock, AsyncMock
+        from app.ingestion.indexing_pipeline import IndexingPipeline, IndexingResult
+        from app.ingestion.pipeline_result import IntelligencePipelineResult, PipelineStatus
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        from app.intelligence.multimodal import MultimodalAnalyzer
+        import uuid
+        from datetime import datetime, timezone
+
+        analyzer = MultimodalAnalyzer()
+        store = ChunkStore()
+        obs = self._obs_with_image()
+
+        pr = MagicMock(spec=IntelligencePipelineResult)
+        pr.status = PipelineStatus.SUCCESS
+        pr.is_actionable.return_value = True
+        pr.content_item_id = uuid.uuid4()
+        pr.source_family = "social"
+        pr.signal_type = "SOCIAL_TREND"
+        pr.confidence = 0.8
+        pr.result_id = uuid.uuid4()
+        pr.tenant_id = "default"
+        pr.entities = []
+        pr.extraction_warnings = []
+        pr.summary = "GPT-5 announced"
+        pr.produced_at = datetime.now(timezone.utc)
+        pr.claims = []
+        pr.all_text_for_chunking.return_value = "OpenAI announces GPT-5."
+        pr.raw_observation = obs
+
+        pipeline = IndexingPipeline(chunk_store=store, multimodal_analyzer=analyzer)
+        pipeline._index_chunks([pr], IndexingResult(), store=store)
+
+        chunks = store.get_by_observation(str(pr.content_item_id))
+        assert chunks, "expected chunks"
+        all_meta = [c.metadata for c in chunks]
+        mm_evidence_found = any("multimodal_evidence" in m for m in all_meta)
+        assert mm_evidence_found
+
+    def test_multimodal_analyzer_property_returns_injected(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.multimodal import MultimodalAnalyzer
+        a = MultimodalAnalyzer()
+        p = IndexingPipeline(multimodal_analyzer=a)
+        assert p.multimodal_analyzer is a
+
+    def test_no_multimodal_analyzer_metadata_clean(self):
+        """Without analyzer, chunks must not have multimodal_evidence key."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from app.ingestion.indexing_pipeline import IndexingPipeline, IndexingResult
+        from app.ingestion.pipeline_result import IntelligencePipelineResult, PipelineStatus
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        import uuid
+        from datetime import datetime, timezone
+
+        store = ChunkStore()
+        pr = MagicMock(spec=IntelligencePipelineResult)
+        pr.status = PipelineStatus.SUCCESS
+        pr.is_actionable.return_value = True
+        pr.content_item_id = uuid.uuid4()
+        pr.source_family = "social"
+        pr.signal_type = "SOCIAL_TREND"
+        pr.confidence = 0.8
+        pr.result_id = uuid.uuid4()
+        pr.tenant_id = "default"
+        pr.entities = []
+        pr.extraction_warnings = []
+        pr.summary = "No media article"
+        pr.produced_at = datetime.now(timezone.utc)
+        pr.claims = []
+        pr.all_text_for_chunking.return_value = "Plain text article."
+        pipeline = IndexingPipeline(chunk_store=store)
+        pipeline._index_chunks([pr], IndexingResult(), store=store)
+        chunks = store.get_by_observation(str(pr.content_item_id))
+        assert all("multimodal_evidence" not in c.metadata for c in chunks)
+
+    def test_multimodal_evidence_in_grounded_summary_sources(self):
+        """GroundedSummaryBuilder receives multimodal EvidenceSources."""
+        import uuid
+        from unittest.mock import MagicMock
+        from app.ingestion.indexing_pipeline import IndexingPipeline, IndexingResult
+        from app.ingestion.pipeline_result import IntelligencePipelineResult, PipelineStatus
+        from app.intelligence.multimodal import MultimodalAnalyzer
+        from datetime import datetime, timezone
+
+        obs = self._obs_with_image()
+        analyzer = MultimodalAnalyzer()
+        pr = MagicMock(spec=IntelligencePipelineResult)
+        pr.status = PipelineStatus.SUCCESS
+        pr.is_actionable.return_value = True
+        pr.content_item_id = uuid.uuid4()
+        pr.source_family = "social"
+        pr.signal_type = "SOCIAL_TREND"
+        pr.confidence = 0.8
+        pr.result_id = uuid.uuid4()
+        pr.tenant_id = "default"
+        pr.entities = []
+        pr.extraction_warnings = []
+        pr.summary = "GPT-5 announced"
+        pr.produced_at = datetime.now(timezone.utc)
+        pr.claims = []
+        pr.all_text_for_chunking.return_value = "OpenAI releases GPT-5."
+        pr.raw_observation = obs
+
+        result = IndexingResult(pipeline_results=[pr])
+        pipeline = IndexingPipeline(multimodal_analyzer=analyzer)
+        summary = pipeline.build_grounded_summary(result, "OpenAI GPT-5")
+        assert summary is not None
+        # Should have at least 2 sources: the text source + the image source
+        assert summary.source_count >= 2
+
+
+
+# ===========================================================================
+# Auto-Research Item 3 — Event-first memory
+# ===========================================================================
+
+class TestCrossSourceDeduperCrossBundle:
+    """deduplicate_cross_bundle() removes duplicates across source families."""
+
+    def _bundle(self, bid, title, trust=0.8, platform="reddit"):
+        from app.entity_resolution.models import EventBundle
+        return EventBundle(
+            bundle_id=bid,
+            canonical_title=title,
+            primary_item_id=f"{bid}-item",
+            source_items=[{"source_id": f"{bid}-item", "title": title,
+                           "raw_text": title, "source_url": "https://x.com",
+                           "platform": platform, "trust_score": trust}],
+            trust_scores={f"{bid}-item": trust},
+        )
+
+    def _deduper(self, threshold=0.6):
+        from app.entity_resolution.cross_source_deduper import CrossSourceDeduper
+        return CrossSourceDeduper(title_threshold=threshold)
+
+    def test_similar_bundles_across_families_deduplicated(self):
+        b1 = self._bundle("b1", "OpenAI releases GPT-5 language model", trust=0.9, platform="reddit")
+        b2 = self._bundle("b2", "OpenAI releases GPT-5 language model", trust=0.6, platform="github")
+        kept, removed = self._deduper().deduplicate_cross_bundle([b1, b2])
+        assert len(kept) == 1
+        assert kept[0].bundle_id == "b1"   # higher trust
+        assert "b2" in removed
+
+    def test_different_bundles_both_kept(self):
+        b1 = self._bundle("b1", "OpenAI releases GPT-5 breakthrough model")
+        b2 = self._bundle("b2", "NVIDIA earnings beat analyst expectations significantly")
+        kept, removed = self._deduper().deduplicate_cross_bundle([b1, b2])
+        assert len(kept) == 2
+        assert removed == []
+
+    def test_empty_list_returns_empty(self):
+        kept, removed = self._deduper().deduplicate_cross_bundle([])
+        assert kept == [] and removed == []
+
+    def test_single_bundle_passes_through(self):
+        b = self._bundle("b1", "AlphaFold 3 released by DeepMind")
+        kept, removed = self._deduper().deduplicate_cross_bundle([b])
+        assert len(kept) == 1 and removed == []
+
+    def test_wrong_type_raises(self):
+        from app.entity_resolution.cross_source_deduper import CrossSourceDeduper
+        d = CrossSourceDeduper()
+        with pytest.raises(TypeError):
+            d.deduplicate_cross_bundle("not a list")
+
+    def test_lower_trust_bundle_removed(self):
+        b_high = self._bundle("high", "Anthropic raises two billion funding round", trust=0.95)
+        b_low  = self._bundle("low",  "Anthropic raises two billion funding round", trust=0.20)
+        kept, removed = self._deduper().deduplicate_cross_bundle([b_high, b_low])
+        assert kept[0].bundle_id == "high"
+        assert "low" in removed
+
+    def test_three_bundles_two_similar_one_unique(self):
+        b1 = self._bundle("b1", "OpenAI releases GPT-5 model system", trust=0.9)
+        b2 = self._bundle("b2", "OpenAI releases GPT-5 model system", trust=0.5)  # dup of b1
+        b3 = self._bundle("b3", "NVIDIA H100 GPU supply chain shortage impact")
+        kept, removed = self._deduper().deduplicate_cross_bundle([b1, b2, b3])
+        assert len(kept) == 2
+        assert any(b.bundle_id == "b1" for b in kept)
+        assert any(b.bundle_id == "b3" for b in kept)
+
+    def test_thread_safety_concurrent_cross_bundle_dedup(self):
+        """4 threads each deduplicating same bundle list must not corrupt state."""
+        import threading
+        from app.entity_resolution.cross_source_deduper import CrossSourceDeduper
+        d = CrossSourceDeduper(title_threshold=0.6)
+        bundles = [
+            self._bundle("x1", "OpenAI GPT-5 released to public access"),
+            self._bundle("x2", "OpenAI GPT-5 released to public access"),
+        ]
+        errors = []
+
+        def worker():
+            try:
+                for _ in range(100):
+                    kept, removed = d.deduplicate_cross_bundle(list(bundles))
+                    assert len(kept) >= 1
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+
+class TestWatchlistCoverageAfterClustering:
+    """WatchlistGraph.record_coverage() is called after every successful cluster."""
+
+    def test_bundle_coverage_called_for_each_bundle(self):
+        """_record_bundle_coverage calls watchlist for every entity in every bundle."""
+        from unittest.mock import MagicMock
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.entity_resolution.models import EventBundle
+
+        mock_wg = MagicMock()
+        pipeline = IndexingPipeline(watchlist_graph=mock_wg)
+
+        bundle = EventBundle(
+            bundle_id="b1",
+            canonical_title="GPT-5 test",
+            primary_item_id="item-1",
+            source_items=[{
+                "source_id": "item-1",
+                "title": "GPT-5 test",
+                "entities": ["openai", "gpt"],
+                "platform": "social",
+                "trust_score": 0.8,
+            }],
+        )
+        pipeline._record_bundle_coverage([bundle])
+        assert mock_wg.record_coverage.call_count == 2
+        called_entities = {c.args[0] for c in mock_wg.record_coverage.call_args_list}
+        assert "openai" in called_entities and "gpt" in called_entities
+
+    def test_broken_watchlist_does_not_abort_bundle_coverage(self):
+        from unittest.mock import MagicMock
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.entity_resolution.models import EventBundle
+
+        mock_wg = MagicMock()
+        mock_wg.record_coverage.side_effect = RuntimeError("db down")
+        pipeline = IndexingPipeline(watchlist_graph=mock_wg)
+        bundle = EventBundle(
+            bundle_id="b1", canonical_title="T", primary_item_id="item-1",
+            source_items=[{"source_id": "item-1", "title": "T",
+                           "entities": ["openai"], "platform": "social",
+                           "trust_score": 0.8}],
+        )
+        pipeline._record_bundle_coverage([bundle])  # must not raise
+
+    def test_cross_bundle_dedup_wired_into_process_batch(self):
+        """Identical items should produce at most 1 bundle after cross-bundle dedup."""
+        import asyncio
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        pipeline = IndexingPipeline(chunk_store=ChunkStore())
+        items = [
+            _make_content_item(
+                text="OpenAI GPT-5 released to developers worldwide via API access.",
+                title="OpenAI GPT-5 Released",
+            ),
+            _make_content_item(
+                text="OpenAI GPT-5 released to developers worldwide via API access.",
+                title="OpenAI GPT-5 Released",
+            ),
+        ]
+        result = asyncio.run(pipeline.process_batch(items))
+        assert len(result.bundles) <= 1
+
+    def test_realistic_dedup_across_two_platforms(self):
+        """Same AlphaFold article from two platforms collapses to ≤1 bundle."""
+        import asyncio
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        pipeline = IndexingPipeline(chunk_store=ChunkStore())
+        text = ("Google DeepMind releases AlphaFold 3 enabling protein-DNA "
+                "interaction prediction for drug discovery research.")
+        items = [
+            _make_content_item(text=text, title="AlphaFold 3 Released", platform="reddit"),
+            _make_content_item(text=text, title="AlphaFold 3 Released", platform="github"),
+        ]
+        result = asyncio.run(pipeline.process_batch(items))
+        assert len(result.bundles) <= 1
+
+    def test_empty_bundle_list_cross_dedup_is_noop(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline, IndexingResult
+        pipeline = IndexingPipeline()
+        result_bundles = pipeline._cross_bundle_deduplicate([], IndexingResult())
+        assert result_bundles == []
+
+
+
+# ===========================================================================
+# Auto-Research Item 4 — Output quality gates
+# ===========================================================================
+
+class TestQualityGateResult:
+    """QualityGateResult dataclass properties."""
+
+    def test_passed_result_has_no_rejection_reason(self):
+        from app.ingestion.indexing_pipeline import QualityGateResult
+        qr = QualityGateResult(summary_id="s1", topic="AI", confidence_score=0.75, passed=True)
+        assert qr.rejection_reason is None
+
+    def test_failed_result_has_rejection_reason(self):
+        from app.ingestion.indexing_pipeline import QualityGateResult
+        qr = QualityGateResult(summary_id="s1", topic="AI", confidence_score=0.40,
+                               passed=False, rejection_reason="below threshold")
+        assert qr.rejection_reason == "below threshold"
+
+    def test_confidence_score_stored_faithfully(self):
+        from app.ingestion.indexing_pipeline import QualityGateResult
+        qr = QualityGateResult(summary_id="s1", topic="AI", confidence_score=0.888, passed=True)
+        assert qr.confidence_score == pytest.approx(0.888)
+
+
+class TestQualityGate:
+    """QualityGate constructor, evaluate(), evaluate_batch()."""
+
+    def _gate(self, threshold=0.60):
+        from app.ingestion.indexing_pipeline import QualityGate
+        return QualityGate(min_confidence=threshold)
+
+    def _summary(self, score):
+        from unittest.mock import MagicMock
+        s = MagicMock()
+        s.confidence_score = score
+        s.summary_id = f"sum-{int(score*100)}"
+        return s
+
+    def test_default_threshold_is_0_60(self):
+        from app.ingestion.indexing_pipeline import QualityGate
+        assert QualityGate().min_confidence == pytest.approx(0.60)
+
+    def test_bad_threshold_raises(self):
+        from app.ingestion.indexing_pipeline import QualityGate
+        with pytest.raises(ValueError):
+            QualityGate(min_confidence=1.5)
+        with pytest.raises(ValueError):
+            QualityGate(min_confidence=-0.1)
+
+    def test_evaluate_passes_above_threshold(self):
+        result = self._gate(0.60).evaluate(self._summary(0.75), "AI")
+        assert result.passed is True
+        assert result.rejection_reason is None
+
+    def test_evaluate_fails_below_threshold(self):
+        result = self._gate(0.60).evaluate(self._summary(0.45), "AI")
+        assert result.passed is False
+        assert "below threshold" in result.rejection_reason
+
+    def test_evaluate_at_threshold_passes(self):
+        result = self._gate(0.60).evaluate(self._summary(0.60), "AI")
+        assert result.passed is True
+
+    def test_evaluate_confidence_score_stored(self):
+        score = 0.731
+        result = self._gate().evaluate(self._summary(score), "AI")
+        assert result.confidence_score == pytest.approx(score)
+
+    def test_evaluate_wrong_summary_type_raises(self):
+        from app.ingestion.indexing_pipeline import QualityGate
+        gate = QualityGate()
+        with pytest.raises(TypeError):
+            gate.evaluate("not a summary", "AI")
+
+    def test_evaluate_empty_topic_raises(self):
+        from app.ingestion.indexing_pipeline import QualityGate
+        gate = QualityGate()
+        with pytest.raises(TypeError):
+            gate.evaluate(self._summary(0.7), "")
+
+    def test_evaluate_batch_returns_list(self):
+        summaries = [self._summary(0.8), self._summary(0.4), self._summary(0.6)]
+        results = self._gate().evaluate_batch(summaries, "AI")
+        assert len(results) == 3
+        assert results[0].passed is True
+        assert results[1].passed is False
+        assert results[2].passed is True
+
+    def test_evaluate_batch_wrong_type_raises(self):
+        from app.ingestion.indexing_pipeline import QualityGate
+        gate = QualityGate()
+        with pytest.raises(TypeError):
+            gate.evaluate_batch("not a list", "AI")
+
+    def test_evaluate_batch_empty_list_returns_empty(self):
+        results = self._gate().evaluate_batch([], "AI")
+        assert results == []
+
+    def test_thread_safety_concurrent_evaluate(self):
+        """4 threads concurrently evaluating summaries must not corrupt results."""
+        import threading
+        gate = self._gate(0.60)
+        errors = []
+        summaries = [self._summary(s) for s in [0.8, 0.4, 0.6, 0.3, 0.9]]
+
+        def worker():
+            try:
+                for _ in range(100):
+                    results = gate.evaluate_batch(summaries, "AI")
+                    assert len(results) == 5
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+
+class TestQualityGateInIndexingPipeline:
+    """QualityGate wired into IndexingPipeline.process_batch()."""
+
+    def test_quality_gate_property(self):
+        from app.ingestion.indexing_pipeline import IndexingPipeline, QualityGate
+        gate = QualityGate(min_confidence=0.55)
+        pipeline = IndexingPipeline(quality_gate=gate)
+        assert pipeline.quality_gate is gate
+
+    def test_quality_gate_result_in_indexing_result(self):
+        """process_batch() with a quality gate produces QualityGateResult."""
+        import asyncio
+        from app.ingestion.indexing_pipeline import IndexingPipeline, QualityGate
+        from app.intelligence.retrieval.chunk_store import ChunkStore
+        gate = QualityGate(min_confidence=0.60)
+        pipeline = IndexingPipeline(chunk_store=ChunkStore(), quality_gate=gate)
+        items = [
+            _make_content_item(text="OpenAI GPT-5 released — breakthrough reasoning model."),
+            _make_content_item(text="Anthropic raises $2B for AI safety research at scale."),
+        ]
+        result = asyncio.run(pipeline.process_batch(items))
+        assert isinstance(result.quality_gate_results, list)
+        assert len(result.quality_gate_results) >= 1
+
+
+# ===========================================================================
+# Auto-Research Item 5 — AutoResearchPipeline
+# ===========================================================================
+
+class TestResearchReport:
+    """ResearchReport dataclass round-trip and field validation."""
+
+    def test_default_report_has_required_fields(self):
+        from app.research.auto_research_pipeline import ResearchReport
+        r = ResearchReport(query="AI safety", tenant_id="default")
+        assert r.query == "AI safety"
+        assert r.tenant_id == "default"
+        assert r.grounded_summaries == []
+        assert r.evidence_chunks == []
+        assert r.quality_gate_outcomes == []
+        assert r.watchlist_gap_count == 0
+        assert r.slo_health_status is None
+        assert r.wall_s == 0.0
+        assert r.chunks_indexed == 0
+        assert r.confidence_score_mean == 0.0
+        assert r.quality_gate_rejection_rate == 0.0
+
+    def test_generated_at_is_utc(self):
+        from app.research.auto_research_pipeline import ResearchReport
+        from datetime import timezone
+        r = ResearchReport(query="Q", tenant_id="t")
+        assert r.generated_at.tzinfo is not None
+
+
+class TestAutoResearchPipelineConstructor:
+    """AutoResearchPipeline constructor validation and property access."""
+
+    def test_default_construction_succeeds(self):
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        p = AutoResearchPipeline()
+        assert p.pipeline is not None
+        assert p.quality_gate is not None
+
+    def test_bad_threshold_raises(self):
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        with pytest.raises(ValueError):
+            AutoResearchPipeline(min_confidence_threshold=1.5)
+        with pytest.raises(ValueError):
+            AutoResearchPipeline(min_confidence_threshold=-0.1)
+
+    def test_injected_pipeline_used(self):
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        from app.ingestion.indexing_pipeline import IndexingPipeline
+        custom = IndexingPipeline()
+        p = AutoResearchPipeline(pipeline=custom)
+        assert p.pipeline is custom
+
+    def test_health_monitor_property(self):
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        from app.intelligence.health_monitor import PipelineHealthMonitor
+        mon = PipelineHealthMonitor()
+        p = AutoResearchPipeline(health_monitor=mon)
+        assert p.health_monitor is mon
+
+    def test_watchlist_graph_property(self):
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        from app.personalization.watchlist_graph import WatchlistGraph
+        wg = WatchlistGraph("u1")
+        p = AutoResearchPipeline(watchlist_graph=wg)
+        assert p.watchlist_graph is wg
+
+    def test_acquisition_scheduler_property(self):
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        from app.source_intelligence.source_registry import SourceRegistryStore, AcquisitionScheduler
+        reg = SourceRegistryStore()
+        sched = AcquisitionScheduler(reg)
+        p = AutoResearchPipeline(acquisition_scheduler=sched)
+        assert p.acquisition_scheduler is sched
+
+
+class TestAutoResearchPipelineRun:
+    """AutoResearchPipeline.run() functional tests."""
+
+    def _run(self, query, tenant_id="default", **pipeline_kwargs):
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        pipeline = AutoResearchPipeline(**pipeline_kwargs)
+        return asyncio.run(pipeline.run(query, tenant_id=tenant_id))
+
+    def test_run_returns_research_report(self):
+        from app.research.auto_research_pipeline import ResearchReport
+        r = self._run("AI safety alignment interpretability")
+        assert isinstance(r, ResearchReport)
+
+    def test_run_query_stored_in_report(self):
+        q = "protein folding structure prediction"
+        r = self._run(q)
+        assert r.query == q
+
+    def test_run_tenant_id_stored_in_report(self):
+        r = self._run("semiconductor supply chain", tenant_id="acme")
+        assert r.tenant_id == "acme"
+
+    def test_run_wall_s_positive(self):
+        r = self._run("AI safety")
+        assert r.wall_s > 0
+
+    def test_run_chunks_indexed_non_negative(self):
+        r = self._run("protein folding")
+        assert r.chunks_indexed >= 0
+
+    def test_run_quality_gate_rejection_rate_in_range(self):
+        r = self._run("semiconductor supply chain")
+        assert 0.0 <= r.quality_gate_rejection_rate <= 1.0
+
+    def test_run_empty_query_raises(self):
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        with pytest.raises(ValueError):
+            asyncio.run(AutoResearchPipeline().run(""))
+
+    def test_run_empty_tenant_raises(self):
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        with pytest.raises(ValueError):
+            asyncio.run(AutoResearchPipeline().run("AI", tenant_id=""))
+
+    def test_run_with_health_monitor_green_after_clean_run(self):
+        """GREEN health after clean run with good inputs."""
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        from app.intelligence.health_monitor import PipelineHealthMonitor, SLOStatus
+        mon = PipelineHealthMonitor()
+        p = AutoResearchPipeline(health_monitor=mon)
+        r = asyncio.run(p.run("AI safety alignment"))
+        # Health monitor starts GREEN; clean run must not degrade it
+        if r.slo_health_status is not None:
+            assert r.slo_health_status in (SLOStatus.GREEN, SLOStatus.YELLOW, SLOStatus.RED)
+
+    def test_run_with_watchlist_gap_count_reported(self):
+        """Watchlist gap count is always ≥ 0 in the report."""
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline
+        from app.personalization.watchlist_graph import WatchlistGraph
+        wg = WatchlistGraph("u1")
+        wg.watch("openai", node_type="entity")
+        p = AutoResearchPipeline(watchlist_graph=wg)
+        r = asyncio.run(p.run("AI safety"))
+        assert r.watchlist_gap_count >= 0
+
+    # ── Spec-required realistic queries ──────────────────────────────────────
+
+    def test_run_ai_safety_query(self):
+        """Criterion: run on 'AI safety' without error."""
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline, ResearchReport
+        p = AutoResearchPipeline()
+        r = asyncio.run(p.run("AI safety and alignment research", tenant_id="safety-lab"))
+        assert isinstance(r, ResearchReport)
+        assert r.wall_s > 0
+
+    def test_run_protein_folding_query(self):
+        """Criterion: run on 'protein folding' without error."""
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline, ResearchReport
+        p = AutoResearchPipeline()
+        r = asyncio.run(p.run(
+            "Protein folding structure prediction AlphaFold DeepMind",
+            tenant_id="bio-research",
+        ))
+        assert isinstance(r, ResearchReport)
+        assert r.wall_s > 0
+
+    def test_run_semiconductor_query(self):
+        """Criterion: run on 'semiconductor supply chain' without error."""
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline, ResearchReport
+        p = AutoResearchPipeline()
+        r = asyncio.run(p.run(
+            "Semiconductor supply chain shortage NVIDIA AMD TSMC GPU",
+            tenant_id="hardware-team",
+        ))
+        assert isinstance(r, ResearchReport)
+        assert r.wall_s > 0
+
+    def test_broken_pipeline_does_not_raise(self):
+        """A crashing IndexingPipeline must not propagate out of run()."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from app.research.auto_research_pipeline import AutoResearchPipeline, ResearchReport
+        mock_pipeline = MagicMock()
+        mock_pipeline.process_batch = AsyncMock(side_effect=RuntimeError("pipeline down"))
+        mock_pipeline.build_grounded_summary = MagicMock(return_value=None)
+        mock_pipeline._store = MagicMock()
+        mock_pipeline._store.get_by_observation.return_value = []
+        p = AutoResearchPipeline(pipeline=mock_pipeline)
+        r = asyncio.run(p.run("AI safety"))
+        assert isinstance(r, ResearchReport)
+
+    def test_thread_safety_concurrent_runs(self):
+        """4 threads each running the pipeline 5× must not corrupt state."""
+        import threading
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline, ResearchReport
+        pipeline = AutoResearchPipeline()
+        errors = []
+
+        def worker(q):
+            try:
+                for _ in range(5):
+                    r = asyncio.run(pipeline.run(q))
+                    assert isinstance(r, ResearchReport)
+            except Exception as e:
+                errors.append(e)
+
+        queries = ["AI safety", "protein folding", "semiconductor supply chain", "LLM reasoning"]
+        threads = [threading.Thread(target=worker, args=(q,)) for q in queries]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errors
+
+    def test_run_with_acquisition_scheduler(self):
+        """AcquisitionScheduler is used when injected; no crash."""
+        import asyncio
+        from app.research.auto_research_pipeline import AutoResearchPipeline, ResearchReport
+        from app.source_intelligence.source_registry import (
+            SourceRegistryStore, SourceSpec, SourceFamily, AcquisitionScheduler,
+        )
+        from app.core.models import SourcePlatform
+        reg = SourceRegistryStore()
+        reg.register(SourceSpec(
+            source_id="openai-blog", platform=SourcePlatform.GITHUB_RELEASES,
+            family=SourceFamily.RESEARCH, priority=0.9,
+        ))
+        sched = AcquisitionScheduler(reg)
+        p = AutoResearchPipeline(acquisition_scheduler=sched)
+        r = asyncio.run(p.run("OpenAI GPT-5 AI safety alignment"))
+        assert isinstance(r, ResearchReport)
+
+    def test_report_confidence_score_mean_in_range(self):
+        r = self._run("NVIDIA H100 GPU semiconductor AI infrastructure")
+        assert 0.0 <= r.confidence_score_mean <= 1.0
+

@@ -146,6 +146,88 @@ class CrossSourceDeduper:
             raise TypeError(f"Expected list, got {type(bundles)!r}")
         return [self.deduplicate(b) for b in bundles]
 
+    def deduplicate_cross_bundle(
+        self,
+        bundles: List[EventBundle],
+    ) -> tuple[List[EventBundle], List[str]]:
+        """Remove cross-bundle duplicates across source families.
+
+        Two bundles are considered duplicates when their representative titles
+        have Jaccard similarity ≥ ``title_threshold``.  The bundle whose primary
+        item carries the higher trust score is retained; the lower-scoring bundle
+        is discarded in full.
+
+        Unlike ``deduplicate()`` (which operates *within* a single bundle),
+        this method operates *across* all bundles, enabling de-duplication when
+        the same event is captured by separate source families (e.g. a GitHub
+        release that also appears on Reddit).
+
+        Args:
+            bundles: Ordered list of ``EventBundle`` objects to filter.
+
+        Returns:
+            Tuple of:
+            - ``kept``: List of bundles not identified as cross-bundle
+              duplicates.
+            - ``removed_bundle_ids``: List of bundle_ids that were eliminated
+              as cross-family duplicates.
+
+        Raises:
+            TypeError: If *bundles* is not a list.
+        """
+        if not isinstance(bundles, list):
+            raise TypeError(f"Expected list, got {type(bundles)!r}")
+        if len(bundles) <= 1:
+            return list(bundles), []
+
+        # Build representative tokens and trust score per bundle
+        def _bundle_score(b: EventBundle) -> float:
+            if b.trust_scores:
+                return max(b.trust_scores.values())
+            return 0.0
+
+        def _bundle_title(b: EventBundle) -> str:
+            if b.canonical_title:
+                return b.canonical_title
+            primary = self._find_item(b.source_items, b.primary_item_id or "")
+            if primary:
+                return primary.get("title", b.bundle_id)
+            return b.source_items[0].get("title", b.bundle_id) if b.source_items else b.bundle_id
+
+        bundle_tokens = [(_title_tokens(_bundle_title(b)), _bundle_score(b)) for b in bundles]
+        removed_ids: List[str] = []
+        kept_mask  = [True] * len(bundles)
+
+        for i in range(len(bundles)):
+            if not kept_mask[i]:
+                continue
+            for j in range(i + 1, len(bundles)):
+                if not kept_mask[j]:
+                    continue
+                sim = _jaccard(bundle_tokens[i][0], bundle_tokens[j][0])
+                if sim >= self._title_threshold:
+                    # Drop the lower-trust bundle
+                    if bundle_tokens[i][1] >= bundle_tokens[j][1]:
+                        kept_mask[j] = False
+                        removed_ids.append(bundles[j].bundle_id)
+                        logger.debug(
+                            "CrossSourceDeduper: cross-bundle dup removed=%r "
+                            "(sim=%.2f vs retained=%r)",
+                            bundles[j].bundle_id, sim, bundles[i].bundle_id,
+                        )
+                    else:
+                        kept_mask[i] = False
+                        removed_ids.append(bundles[i].bundle_id)
+                        logger.debug(
+                            "CrossSourceDeduper: cross-bundle dup removed=%r "
+                            "(sim=%.2f vs retained=%r)",
+                            bundles[i].bundle_id, sim, bundles[j].bundle_id,
+                        )
+                        break  # i is gone; stop checking j's against it
+
+        kept = [b for b, ok in zip(bundles, kept_mask) if ok]
+        return kept, removed_ids
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

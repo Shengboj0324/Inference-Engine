@@ -46,7 +46,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from app.entity_resolution.cross_source_deduper import CrossSourceDeduper
 from app.entity_resolution.event_clusterer import EventClusterer
@@ -129,23 +129,130 @@ class IndexingStats:
 
 
 @dataclass
+class QualityGateResult:
+    """Outcome of the ``QualityGate`` evaluation for one ``GroundedSummary``.
+
+    Attributes
+    ----------
+    summary_id:       Unique identifier for the evaluated summary.
+    topic:            Topic label of the evaluated summary.
+    confidence_score: Confidence score of the summary in [0, 1].
+    passed:           ``True`` when the score meets the minimum threshold.
+    rejection_reason: Human-readable reason when ``passed`` is ``False``.
+    """
+    summary_id:       str
+    topic:            str
+    confidence_score: float
+    passed:           bool
+    rejection_reason: Optional[str] = None
+
+
+class QualityGate:
+    """Quality gate that rejects ``GroundedSummary`` objects below a confidence threshold.
+
+    Evaluates each ``GroundedSummary`` produced by ``IndexingPipeline.process_batch()``
+    and flags those whose ``confidence_score`` falls below ``min_confidence``.
+
+    Args:
+        min_confidence: Minimum acceptable confidence score in [0, 1].
+                        Default ``0.60``.
+
+    Raises:
+        ValueError: If ``min_confidence`` is outside [0, 1].
+    """
+
+    def __init__(self, min_confidence: float = 0.60) -> None:
+        if not (0.0 <= min_confidence <= 1.0):
+            raise ValueError(
+                f"'min_confidence' must be in [0, 1], got {min_confidence!r}"
+            )
+        self._min_confidence = min_confidence
+
+    @property
+    def min_confidence(self) -> float:
+        """The configured minimum confidence threshold."""
+        return self._min_confidence
+
+    def evaluate(self, summary: Any, topic: str) -> "QualityGateResult":
+        """Evaluate a ``GroundedSummary`` against the quality threshold.
+
+        Args:
+            summary: A ``GroundedSummary`` object with a ``confidence_score``
+                     attribute and an optional ``summary_id`` attribute.
+            topic:   Topic label used for reporting.
+
+        Returns:
+            ``QualityGateResult`` indicating pass/fail status.
+
+        Raises:
+            TypeError: If *summary* does not have a ``confidence_score``
+                       attribute, or *topic* is not a non-empty string.
+        """
+        if not hasattr(summary, "confidence_score"):
+            raise TypeError(
+                f"'summary' must have a 'confidence_score' attribute, "
+                f"got {type(summary)!r}"
+            )
+        if not isinstance(topic, str) or not topic.strip():
+            raise TypeError("'topic' must be a non-empty string")
+
+        score = float(summary.confidence_score)
+        summary_id = str(getattr(summary, "summary_id", id(summary)))
+        passed = score >= self._min_confidence
+        reason = None if passed else (
+            f"confidence_score={score:.3f} below threshold={self._min_confidence:.3f}"
+        )
+        return QualityGateResult(
+            summary_id=summary_id,
+            topic=topic,
+            confidence_score=score,
+            passed=passed,
+            rejection_reason=reason,
+        )
+
+    def evaluate_batch(
+        self,
+        summaries: List[Any],
+        topic: str,
+    ) -> List["QualityGateResult"]:
+        """Evaluate a list of ``GroundedSummary`` objects.
+
+        Args:
+            summaries: List of ``GroundedSummary`` objects to evaluate.
+            topic:     Topic label shared by all summaries in this batch.
+
+        Returns:
+            List of ``QualityGateResult`` in the same order as *summaries*.
+
+        Raises:
+            TypeError: If *summaries* is not a list.
+        """
+        if not isinstance(summaries, list):
+            raise TypeError(f"'summaries' must be a list, got {type(summaries)!r}")
+        return [self.evaluate(s, topic) for s in summaries]
+
+
+@dataclass
 class IndexingResult:
     """Aggregated output of one ``IndexingPipeline.process_batch()`` call.
 
     Attributes
     ----------
-    bundles:          Deduplicated ``EventBundle``s formed from this batch.
-    pipeline_results: Per-item ``IntelligencePipelineResult`` objects
-                      (one per input ``ContentItem``, including failed ones).
-    stats:            Throughput and quality counters.
-    errors:           ``{item_id: error_message}`` for items that failed.
-    produced_at:      UTC timestamp when the result was assembled.
+    bundles:             Deduplicated ``EventBundle``s formed from this batch.
+    pipeline_results:    Per-item ``IntelligencePipelineResult`` objects
+                         (one per input ``ContentItem``, including failed ones).
+    stats:               Throughput and quality counters.
+    errors:              ``{item_id: error_message}`` for items that failed.
+    quality_gate_results: List of ``QualityGateResult`` from the inline quality
+                          gate step (empty when no ``QualityGate`` is attached).
+    produced_at:         UTC timestamp when the result was assembled.
     """
-    bundles:          List[EventBundle]               = field(default_factory=list)
-    pipeline_results: List[IntelligencePipelineResult] = field(default_factory=list)
-    stats:            IndexingStats                   = field(default_factory=IndexingStats)
-    errors:           Dict[str, str]                  = field(default_factory=dict)
-    produced_at:      datetime                        = field(
+    bundles:             List[EventBundle]               = field(default_factory=list)
+    pipeline_results:    List[IntelligencePipelineResult] = field(default_factory=list)
+    stats:               IndexingStats                   = field(default_factory=IndexingStats)
+    errors:              Dict[str, str]                  = field(default_factory=dict)
+    quality_gate_results: List[QualityGateResult]        = field(default_factory=list)
+    produced_at:         datetime                        = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
@@ -174,18 +281,20 @@ class IndexingPipeline:
 
     def __init__(
         self,
-        router:           Optional[ContentPipelineRouter] = None,
-        chunk_store:      Optional[ChunkStore]            = None,
-        clusterer:        Optional[EventClusterer]        = None,
-        deduper:          Optional[CrossSourceDeduper]    = None,
-        watchlist_graph:  Optional[Any]                   = None,
-        health_monitor:   Optional[Any]                   = None,
-        trust_scorer:     Optional[Any]                   = None,
-        source_registry:  Optional[Any]                   = None,
-        chunk_size:       int   = 800,
-        chunk_overlap:    int   = 100,
-        route_timeout_s:  float = 60.0,
-        max_concurrency:  int   = 8,
+        router:              Optional[ContentPipelineRouter] = None,
+        chunk_store:         Optional[ChunkStore]            = None,
+        clusterer:           Optional[EventClusterer]        = None,
+        deduper:             Optional[CrossSourceDeduper]    = None,
+        watchlist_graph:     Optional[Any]                   = None,
+        health_monitor:      Optional[Any]                   = None,
+        trust_scorer:        Optional[Any]                   = None,
+        source_registry:     Optional[Any]                   = None,
+        multimodal_analyzer: Optional[Any]                   = None,
+        quality_gate:        Optional[QualityGate]           = None,
+        chunk_size:          int   = 800,
+        chunk_overlap:       int   = 100,
+        route_timeout_s:     float = 60.0,
+        max_concurrency:     int   = 8,
     ) -> None:
         self._router    = router    or ContentPipelineRouter()
         self._store     = chunk_store or ChunkStore()
@@ -209,6 +318,17 @@ class IndexingPipeline:
         # stamped into ChunkRecord metadata.  Duck-typed: must have ``get(id)``
         # and optionally ``list_by_family(family)`` methods.
         self._source_registry = source_registry
+        # Optional MultimodalAnalyzer — when provided, image/video analysis
+        # results are stored in ChunkRecord metadata under ``multimodal_evidence``
+        # and are available as first-class citation sources in
+        # ``build_grounded_summary()``.  Duck-typed: must have
+        # ``to_evidence_sources(observation)`` and ``has_visual_content(obs)``
+        # methods.
+        self._multimodal_analyzer = multimodal_analyzer
+        # Optional QualityGate — when provided, process_batch() builds a
+        # GroundedSummary for the batch and evaluates it against the gate;
+        # results are stored in IndexingResult.quality_gate_results.
+        self._quality_gate = quality_gate
         # Per-tenant ChunkStore registry.  The injected ``chunk_store`` (or the
         # auto-created default) becomes the "default" tenant's store.
         self._tenant_stores: Dict[str, ChunkStore] = {"default": self._store}
@@ -271,12 +391,23 @@ class IndexingPipeline:
         # ── Phase 4: cluster into EventBundles ────────────────────────
         bundles = self._cluster(cluster_inputs, result)
 
-        # ── Phase 5: deduplicate within each bundle ────────────────────
+        # ── Phase 4b: record watchlist coverage after every cluster ────
+        if self._watchlist_graph is not None:
+            self._record_bundle_coverage(bundles)
+
+        # ── Phase 5a: deduplicate within each bundle ──────────────────
         bundles = self._deduplicate(bundles, result)
+
+        # ── Phase 5b: cross-bundle de-duplication across families ──────
+        bundles = self._cross_bundle_deduplicate(bundles, result)
 
         # ── Phase 6: report watchlist gap count to health monitor ──────
         if self._watchlist_graph is not None and self._health_monitor is not None:
             self._report_watchlist_health()
+
+        # ── Phase 7: quality gate ──────────────────────────────────────
+        if self._quality_gate is not None:
+            self._apply_quality_gate(result, topic="batch")
 
         result.bundles = bundles
         result.stats.wall_s = time.perf_counter() - t0
@@ -329,6 +460,16 @@ class IndexingPipeline:
     def health_monitor(self) -> Optional[Any]:
         """The attached ``PipelineHealthMonitor`` (``None`` when not configured)."""
         return self._health_monitor
+
+    @property
+    def multimodal_analyzer(self) -> Optional[Any]:
+        """The attached ``MultimodalAnalyzer`` (``None`` when not configured)."""
+        return self._multimodal_analyzer
+
+    @property
+    def quality_gate(self) -> Optional[QualityGate]:
+        """The attached ``QualityGate`` (``None`` when not configured)."""
+        return self._quality_gate
 
     # ------------------------------------------------------------------
     # Phase 1: concurrent routing
@@ -467,6 +608,23 @@ class IndexingPipeline:
             if self._source_registry is not None:
                 registry_meta = self._lookup_registry_meta(pr)
 
+            # ── Multimodal evidence extraction ───────────────────────────
+            multimodal_evidence: List[Dict[str, Any]] = []
+            if self._multimodal_analyzer is not None:
+                try:
+                    raw_obs = getattr(pr, "raw_observation", None) or getattr(pr, "observation", None)
+                    if raw_obs is not None and self._multimodal_analyzer.has_visual_content(raw_obs):
+                        multimodal_evidence = self._multimodal_analyzer.to_evidence_sources(raw_obs)
+                        # Also append visual text to the main text so it gets chunked
+                        mm_texts = [e["content_snippet"] for e in multimodal_evidence if e.get("content_snippet")]
+                        if mm_texts:
+                            text = text + "\n\n" + "\n\n".join(mm_texts)
+                except Exception as exc:
+                    logger.warning(
+                        "IndexingPipeline: multimodal_analyzer failed for item %s: %s",
+                        pr.content_item_id, exc,
+                    )
+
             try:
                 chunk_meta: Dict[str, Any] = {
                     "signal_type": pr.signal_type,
@@ -476,6 +634,8 @@ class IndexingPipeline:
                 }
                 if trust_score is not None:
                     chunk_meta["trust_score"] = trust_score
+                if multimodal_evidence:
+                    chunk_meta["multimodal_evidence"] = multimodal_evidence
                 chunk_meta.update(registry_meta)
                 ids = target_store.chunk_text(
                     observation_id=str(pr.content_item_id),
@@ -605,6 +765,111 @@ class IndexingPipeline:
             result.stats.bundles_formed = 0
             return []
 
+    def _record_bundle_coverage(self, bundles: List[EventBundle]) -> None:
+        """Call ``watchlist_graph.record_coverage()`` for each successful cluster.
+
+        Iterates over every ``EventBundle`` and records coverage for each entity
+        and source platform present.  Errors from the WatchlistGraph are caught
+        and logged; they must not abort the main processing path.
+
+        Args:
+            bundles: List of ``EventBundle`` objects produced by ``_cluster()``.
+        """
+        for bundle in bundles:
+            try:
+                # Record coverage for each entity in the bundle's source items
+                entities: Set[str] = set()
+                for item in bundle.source_items:
+                    for ent in item.get("entities", []):
+                        entities.add(str(ent))
+                for entity_id in entities:
+                    self._watchlist_graph.record_coverage(
+                        entity_id,
+                        source_id=bundle.bundle_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "IndexingPipeline._record_bundle_coverage: "
+                    "watchlist_graph failed for bundle=%r: %s",
+                    bundle.bundle_id, exc,
+                )
+
+    def _cross_bundle_deduplicate(
+        self,
+        bundles: List[EventBundle],
+        result: IndexingResult,
+    ) -> List[EventBundle]:
+        """Remove duplicate bundles that cover the same event across source families.
+
+        Delegates to ``CrossSourceDeduper.deduplicate_cross_bundle()``.  The
+        number of bundles removed is logged; errors fall back to the unfiltered
+        list so that the main path is never aborted.
+
+        Args:
+            bundles: Deduplicated-within list from ``_deduplicate()``.
+            result:  ``IndexingResult`` to update in-place with cross-bundle stats.
+
+        Returns:
+            Filtered list of ``EventBundle`` objects.
+        """
+        if len(bundles) <= 1:
+            return bundles
+        try:
+            kept, removed_ids = self._deduper.deduplicate_cross_bundle(bundles)
+            if removed_ids:
+                logger.info(
+                    "IndexingPipeline: cross-bundle dedup removed %d bundle(s): %s",
+                    len(removed_ids), removed_ids,
+                )
+            return kept
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "IndexingPipeline: cross-bundle deduplication failed: %s", exc
+            )
+            return bundles
+
+    def _apply_quality_gate(
+        self,
+        result: IndexingResult,
+        topic: str = "batch",
+    ) -> None:
+        """Build a ``GroundedSummary`` for the batch and evaluate it via the quality gate.
+
+        For each actionable ``IntelligencePipelineResult`` in *result*, constructs a
+        ``GroundedSummary`` (using the injected ``GroundedSummaryBuilder``) and
+        evaluates it against ``self._quality_gate``.  The resulting
+        ``QualityGateResult`` objects are appended to
+        ``result.quality_gate_results``.
+
+        Errors from the builder or gate are caught and logged so that they never
+        abort the main processing path.
+
+        Args:
+            result: The ``IndexingResult`` being assembled in ``process_batch()``.
+            topic:  Topic label for the inline summary (default ``"batch"``).
+        """
+        try:
+            summary = self.build_grounded_summary(result, topic=topic)
+            if summary is None:
+                return
+            gate_result = self._quality_gate.evaluate(summary, topic=topic)
+            result.quality_gate_results.append(gate_result)
+            if not gate_result.passed:
+                logger.warning(
+                    "IndexingPipeline: quality gate FAILED for topic=%r — %s",
+                    topic, gate_result.rejection_reason,
+                )
+            else:
+                logger.info(
+                    "IndexingPipeline: quality gate PASSED for topic=%r "
+                    "confidence=%.3f",
+                    topic, gate_result.confidence_score,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "IndexingPipeline._apply_quality_gate: failed: %s", exc
+            )
+
     # ------------------------------------------------------------------
     # Grounded summary synthesis
     # ------------------------------------------------------------------
@@ -686,6 +951,28 @@ class IndexingPipeline:
                 content_snippet=snippet[:2000],
             )
             sources.append(src)
+
+            # ── Multimodal evidence as first-class citation sources ───────
+            if self._multimodal_analyzer is not None:
+                raw_obs = getattr(pr, "raw_observation", None) or getattr(pr, "observation", None)
+                if raw_obs is not None:
+                    try:
+                        for mm_dict in self._multimodal_analyzer.to_evidence_sources(raw_obs):
+                            mm_src = EvidenceSourceCls(
+                                source_id=mm_dict["source_id"],
+                                title=mm_dict["title"],
+                                url=mm_dict["url"],
+                                platform=mm_dict["platform"],
+                                trust_score=float(mm_dict.get("trust_score", 0.5)),
+                                content_snippet=mm_dict.get("content_snippet", "")[:2000],
+                            )
+                            sources.append(mm_src)
+                    except Exception as exc:
+                        logger.warning(
+                            "IndexingPipeline.build_grounded_summary: multimodal "
+                            "evidence extraction failed for item %s: %s",
+                            pr.content_item_id, exc,
+                        )
 
         if not sources:
             logger.warning(

@@ -25,11 +25,12 @@ Typical usage::
 """
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, FrozenSet, List, Optional, Set
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from app.core.models import SourcePlatform
 
@@ -89,6 +90,7 @@ class SourceSpec:
     rate_limit_rph: int = 0
     auth_token_env: Optional[str] = None
     metadata: Dict[str, object] = field(default_factory=dict)
+    priority: float = 0.5  # Acquisition scheduling priority in [0, 1]; 1 = highest
 
     def __post_init__(self) -> None:
         if not self.source_id or not self.source_id.strip():
@@ -97,6 +99,8 @@ class SourceSpec:
             raise TypeError(f"'platform' must be SourcePlatform, got {type(self.platform)!r}")
         if not isinstance(self.family, SourceFamily):
             raise TypeError(f"'family' must be SourceFamily, got {type(self.family)!r}")
+        if not (0.0 <= self.priority <= 1.0):
+            raise ValueError(f"'priority' must be in [0, 1], got {self.priority!r}")
         # Normalise capabilities to a frozenset for hashability
         if not isinstance(self.capabilities, frozenset):
             self.capabilities = frozenset(self.capabilities)
@@ -194,7 +198,313 @@ class SourceRegistryStore:
         with self._lock:
             return sorted(self._store.values(), key=lambda s: s.source_id)
 
+    def next_batch(
+        self,
+        n: int,
+        *,
+        min_priority: float = 0.0,
+        family: Optional[SourceFamily] = None,
+    ) -> List[SourceSpec]:
+        """Return up to *n* specs ordered by priority (descending).
+
+        Args:
+            n:            Maximum number of specs to return.
+            min_priority: Only return specs with ``priority >= min_priority``.
+            family:       If given, restrict to specs from this family.
+
+        Returns:
+            List of ``SourceSpec`` sorted by priority descending, length ≤ n.
+
+        Raises:
+            ValueError: If *n* is not a positive integer or *min_priority* is
+                        outside [0, 1].
+        """
+        if not isinstance(n, int) or n < 1:
+            raise ValueError(f"'n' must be a positive int, got {n!r}")
+        if not (0.0 <= min_priority <= 1.0):
+            raise ValueError(f"'min_priority' must be in [0, 1], got {min_priority!r}")
+        with self._lock:
+            candidates = list(self._store.values())
+        if family is not None:
+            candidates = [s for s in candidates if s.family == family]
+        candidates = [s for s in candidates if s.priority >= min_priority]
+        candidates.sort(key=lambda s: (-s.priority, s.source_id))
+        return candidates[:n]
+
+    def update_priority(self, source_id: str, priority: float) -> bool:
+        """Update the acquisition priority of an existing source spec.
+
+        Args:
+            source_id: Identifier of the spec to update.
+            priority:  New priority in [0, 1].
+
+        Returns:
+            ``True`` if the spec was found and updated; ``False`` if not found.
+
+        Raises:
+            ValueError: If *priority* is outside [0, 1].
+        """
+        if not (0.0 <= priority <= 1.0):
+            raise ValueError(f"'priority' must be in [0, 1], got {priority!r}")
+        with self._lock:
+            spec = self._store.get(source_id)
+            if spec is None:
+                return False
+            import dataclasses
+            self._store[source_id] = dataclasses.replace(spec, priority=priority)
+        logger.debug(
+            "SourceRegistryStore.update_priority: source_id=%r priority=%.3f",
+            source_id, priority,
+        )
+        return True
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._store)
+
+
+# ---------------------------------------------------------------------------
+# AcquisitionScheduler
+# ---------------------------------------------------------------------------
+
+class AcquisitionScheduler:
+    """Priority-weighted acquisition scheduler with exponential back-off.
+
+    Wraps a ``SourceRegistryStore`` and adds:
+
+    1. **Priority-weighted ordering** — ``next_batch()`` returns sources in
+       descending priority order, respecting any active back-off windows.
+    2. **Configurable retry/back-off** — consecutive failures trigger an
+       exponentially increasing cooldown period.  After *max_retries* failures
+       the source is suspended until ``record_success()`` is called.
+    3. **Trust gate** — When a ``SourceTrustScorer`` is injected, sources whose
+       composite trust score falls below *min_authority_threshold* are silently
+       excluded from ``next_batch()``.
+    4. **HealthMonitor integration** — ``record_failure()`` calls
+       ``health_monitor.record_connector_failure(source_id)``; ``record_success()``
+       calls ``health_monitor.record_connector_success(source_id)`` so the
+       ``PipelineHealthMonitor`` circuit-breaker state stays accurate.
+
+    All mutable state is protected by ``threading.Lock``.
+
+    Args:
+        registry:               The ``SourceRegistryStore`` to schedule from.
+        trust_scorer:           Optional ``SourceTrustScorer``; when ``None``
+                                the trust gate is disabled.
+        min_authority_threshold: Minimum composite trust score for a source to
+                                 be eligible (default ``0.0`` = no gate).
+        base_backoff_s:         Initial back-off window in seconds (default 60).
+        max_backoff_s:          Cap on back-off window (default 3 600 = 1 h).
+        max_retries:            Consecutive failures before source is suspended
+                                indefinitely (default 5).
+        health_monitor:         Optional monitor; receives failure/success calls.
+    """
+
+    def __init__(
+        self,
+        registry: "SourceRegistryStore",
+        trust_scorer: Optional[Any] = None,
+        min_authority_threshold: float = 0.0,
+        base_backoff_s: float = 60.0,
+        max_backoff_s: float = 3600.0,
+        max_retries: int = 5,
+        health_monitor: Optional[Any] = None,
+    ) -> None:
+        if not isinstance(registry, SourceRegistryStore):
+            raise TypeError(
+                f"'registry' must be SourceRegistryStore, got {type(registry)!r}"
+            )
+        if not (0.0 <= min_authority_threshold <= 1.0):
+            raise ValueError(
+                f"'min_authority_threshold' must be in [0, 1], got {min_authority_threshold!r}"
+            )
+        if base_backoff_s <= 0:
+            raise ValueError(f"'base_backoff_s' must be > 0, got {base_backoff_s!r}")
+        if max_backoff_s < base_backoff_s:
+            raise ValueError(
+                f"'max_backoff_s' must be >= base_backoff_s ({base_backoff_s}), "
+                f"got {max_backoff_s!r}"
+            )
+        if not isinstance(max_retries, int) or max_retries < 1:
+            raise ValueError(f"'max_retries' must be a positive int, got {max_retries!r}")
+
+        self._registry  = registry
+        self._scorer    = trust_scorer
+        self._min_trust = min_authority_threshold
+        self._base_s    = base_backoff_s
+        self._max_s     = max_backoff_s
+        self._max_retries = max_retries
+        self._monitor   = health_monitor
+        self._lock      = threading.Lock()
+        # failure_counts[source_id] = consecutive failure count
+        self._failure_counts: Dict[str, int] = {}
+        # backoff_until[source_id] = monotonic timestamp when back-off expires
+        self._backoff_until: Dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def next_batch(self, n: int, *, family: Optional[SourceFamily] = None) -> List[SourceSpec]:
+        """Return up to *n* eligible specs sorted by priority (descending).
+
+        Eligibility requires:
+        - Source is not in an active back-off window.
+        - Source has not exceeded ``max_retries`` (suspended).
+        - Source composite trust ≥ ``min_authority_threshold`` (when scorer set).
+
+        Args:
+            n:      Maximum number of specs to return (must be ≥ 1).
+            family: Optional family filter applied before eligibility check.
+
+        Returns:
+            List of ``SourceSpec`` objects, length ≤ n.
+
+        Raises:
+            ValueError: If *n* < 1.
+        """
+        if not isinstance(n, int) or n < 1:
+            raise ValueError(f"'n' must be a positive int, got {n!r}")
+        candidates = self._registry.next_batch(
+            len(self._registry._store) + 1,  # fetch all then filter
+            family=family,
+        )
+        eligible = [s for s in candidates if self.is_eligible(s.source_id)]
+        return eligible[:n]
+
+    def record_failure(self, source_id: str) -> None:
+        """Record one acquisition failure for *source_id*.
+
+        Applies exponential back-off: ``backoff = base * 2^(failures - 1)``
+        capped at ``max_backoff_s``.  After ``max_retries`` failures the source
+        is suspended (back-off = ``max_backoff_s``) until ``record_success`` is
+        called.
+
+        Surfaces the failure to the injected ``health_monitor`` via
+        ``record_connector_failure(source_id)``.
+
+        Args:
+            source_id: Identifier of the source that failed.
+
+        Raises:
+            ValueError: If *source_id* is empty.
+        """
+        if not source_id or not source_id.strip():
+            raise ValueError("'source_id' must be a non-empty string")
+        now = time.monotonic()
+        with self._lock:
+            count = self._failure_counts.get(source_id, 0) + 1
+            self._failure_counts[source_id] = count
+            exponent = min(count - 1, self._max_retries - 1)
+            backoff = min(self._base_s * (2 ** exponent), self._max_s)
+            self._backoff_until[source_id] = now + backoff
+
+        logger.warning(
+            "AcquisitionScheduler: source=%r failure #%d backoff=%.0fs",
+            source_id, count, backoff,
+        )
+        if self._monitor is not None:
+            try:
+                self._monitor.record_connector_failure(source_id)
+            except Exception as exc:
+                logger.warning(
+                    "AcquisitionScheduler: health_monitor.record_connector_failure failed: %s", exc
+                )
+
+    def record_success(self, source_id: str) -> None:
+        """Record a successful acquisition; resets back-off and failure count.
+
+        Surfaces the success to the injected ``health_monitor`` via
+        ``record_connector_success(source_id)``.
+
+        Args:
+            source_id: Identifier of the source that succeeded.
+
+        Raises:
+            ValueError: If *source_id* is empty.
+        """
+        if not source_id or not source_id.strip():
+            raise ValueError("'source_id' must be a non-empty string")
+        with self._lock:
+            self._failure_counts.pop(source_id, None)
+            self._backoff_until.pop(source_id, None)
+
+        logger.debug("AcquisitionScheduler: source=%r success — back-off cleared", source_id)
+        if self._monitor is not None:
+            try:
+                self._monitor.record_connector_success(source_id)
+            except Exception as exc:
+                logger.warning(
+                    "AcquisitionScheduler: health_monitor.record_connector_success failed: %s", exc
+                )
+
+    def is_eligible(self, source_id: str) -> bool:
+        """Return ``True`` when *source_id* is eligible for acquisition.
+
+        A source is eligible when:
+        1. It is registered in the registry.
+        2. Its back-off window has expired (or it has never failed).
+        3. Its failure count is below ``max_retries``.
+        4. Its composite trust score ≥ ``min_authority_threshold`` (when a
+           scorer is configured).
+
+        Args:
+            source_id: Identifier to check.
+
+        Returns:
+            ``bool``
+        """
+        if not source_id:
+            return False
+        # Registry check
+        if self._registry.get(source_id) is None:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            count  = self._failure_counts.get(source_id, 0)
+            until  = self._backoff_until.get(source_id, 0.0)
+        # Suspended?
+        if count >= self._max_retries:
+            return False
+        # In active back-off?
+        if now < until:
+            return False
+        # Trust gate
+        if self._scorer is not None:
+            try:
+                ts = self._scorer.score(source_id)
+                if ts.composite < self._min_trust:
+                    return False
+            except Exception as exc:
+                logger.warning(
+                    "AcquisitionScheduler.is_eligible: scorer failed for %r: %s",
+                    source_id, exc,
+                )
+        return True
+
+    def backoff_remaining_s(self, source_id: str) -> float:
+        """Return remaining back-off seconds for *source_id* (0.0 if eligible).
+
+        Args:
+            source_id: Source identifier.
+
+        Returns:
+            Seconds until the source is eligible again (0.0 = already eligible).
+        """
+        now = time.monotonic()
+        with self._lock:
+            until = self._backoff_until.get(source_id, 0.0)
+        return max(0.0, until - now)
+
+    def failure_count(self, source_id: str) -> int:
+        """Return the current consecutive failure count for *source_id*.
+
+        Args:
+            source_id: Source identifier.
+
+        Returns:
+            Non-negative integer.
+        """
+        with self._lock:
+            return self._failure_counts.get(source_id, 0)
 
