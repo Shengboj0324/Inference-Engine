@@ -574,13 +574,76 @@ class MultimodalAnalyzer:
 
         return "\n\n".join(p for p in parts if p)
 
-    def has_visual_content(self, observation: RawObservation) -> bool:
-        """Return ``True`` when the observation has image or video metadata."""
-        meta = observation.platform_metadata or {}
-        return any(
-            meta.get(k)
-            for k in self.IMAGE_METADATA_KEYS + self.VIDEO_METADATA_KEYS
-        )
+    # ── Private helper ────────────────────────────────────────────────────────
+
+    def _extract_media_urls(self, observation: Any) -> tuple[list[str], list[str]]:
+        """Duck-typed extraction of image/video URLs from any observation type.
+
+        Supports:
+        - ``RawObservation`` via ``platform_metadata``
+        - ``ContentItem`` via ``metadata`` dict and ``media_urls`` list
+
+        Returns:
+            Tuple of ``(image_urls, video_urls)`` — both possibly empty.
+        """
+        import re as _re
+        _IMG_EXT = frozenset((".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".tiff"))
+        _VID_EXT = frozenset((".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"))
+
+        def _ext(url: str) -> str:
+            m = _re.search(r'\.[a-zA-Z0-9]+(?:\?|$)', url)
+            return m.group(0).split("?")[0].lower() if m else ""
+
+        image_urls: list[str] = []
+        video_urls: list[str] = []
+
+        # 1. platform_metadata (RawObservation)
+        meta = getattr(observation, "platform_metadata", None) or {}
+        for key in self.IMAGE_METADATA_KEYS:
+            v = meta.get(key)
+            if v and isinstance(v, str):
+                image_urls.append(v)
+                break
+        for key in self.VIDEO_METADATA_KEYS:
+            v = meta.get(key)
+            if v and isinstance(v, str):
+                video_urls.append(v)
+                break
+
+        # 2. metadata dict (ContentItem)
+        if not image_urls and not video_urls:
+            meta2 = getattr(observation, "metadata", None) or {}
+            for key in self.IMAGE_METADATA_KEYS:
+                v = meta2.get(key)
+                if v and isinstance(v, str):
+                    image_urls.append(v)
+                    break
+            for key in self.VIDEO_METADATA_KEYS:
+                v = meta2.get(key)
+                if v and isinstance(v, str):
+                    video_urls.append(v)
+                    break
+
+        # 3. media_urls list (ContentItem)
+        if not image_urls and not video_urls:
+            for url in getattr(observation, "media_urls", None) or []:
+                if not isinstance(url, str):
+                    continue
+                e = _ext(url)
+                if e in _IMG_EXT:
+                    image_urls.append(url)
+                elif e in _VID_EXT:
+                    video_urls.append(url)
+
+        return image_urls, video_urls
+
+    def has_visual_content(self, observation: Any) -> bool:
+        """Return ``True`` when the observation has image or video metadata.
+
+        Duck-typed: supports both ``RawObservation`` and ``ContentItem``.
+        """
+        imgs, vids = self._extract_media_urls(observation)
+        return bool(imgs or vids)
 
     def to_evidence_sources(self, observation: RawObservation) -> List[Dict[str, Any]]:
         """Return multimodal analysis results as ``EvidenceSource``-compatible dicts.
@@ -616,58 +679,56 @@ class MultimodalAnalyzer:
         mode = self.execution_mode
         if mode == CapabilityMode.DISABLED:
             return []
-        meta = observation.platform_metadata or {}
+
+        platform_val: str = getattr(
+            getattr(observation, "source_platform", None), "value", "unknown"
+        )
+        image_urls, video_urls = self._extract_media_urls(observation)
         results: List[Dict[str, Any]] = []
 
-        for key in self.IMAGE_METADATA_KEYS:
-            url = meta.get(key)
-            if url and isinstance(url, str):
-                try:
-                    analysis = self.analyze_image(url)
-                    snippet = self._image_to_paragraph(analysis, observation)
-                    uid = _hl.md5(f"img:{url}".encode()).hexdigest()[:12]
-                    results.append({
-                        "source_id":       f"mm-img-{uid}",
-                        "title":           f"Image analysis: {url[:80]}",
-                        "url":             url,
-                        "platform":        observation.source_platform.value,
-                        "trust_score":     float(analysis["caption"]["confidence"]),
-                        "content_snippet": snippet,
-                        "modality":        "image",
-                        "entities":        analysis["entities"],
-                        "sentiment":       analysis["sentiment"]["value"],
-                    })
-                except Exception as exc:
-                    logger.warning(
-                        "MultimodalAnalyzer.to_evidence_sources: image failed url=%s: %s",
-                        url, exc,
-                    )
-                break  # one image per observation
+        for url in image_urls[:1]:   # at most one image per observation
+            try:
+                analysis = self.analyze_image(url)
+                snippet = self._image_to_paragraph(analysis, observation)
+                uid = _hl.md5(f"img:{url}".encode()).hexdigest()[:12]
+                results.append({
+                    "source_id":       f"mm-img-{uid}",
+                    "title":           f"Image analysis: {url[:80]}",
+                    "url":             url,
+                    "platform":        platform_val,
+                    "trust_score":     float(analysis["caption"]["confidence"]),
+                    "content_snippet": snippet,
+                    "modality":        "image",
+                    "entities":        analysis["entities"],
+                    "sentiment":       analysis["sentiment"]["value"],
+                })
+            except Exception as exc:
+                logger.warning(
+                    "MultimodalAnalyzer.to_evidence_sources: image failed url=%s: %s",
+                    url, exc,
+                )
 
-        for key in self.VIDEO_METADATA_KEYS:
-            url = meta.get(key)
-            if url and isinstance(url, str):
-                try:
-                    analysis = self.analyze_video(url)
-                    snippet = self._video_to_paragraph(analysis, observation)
-                    uid = _hl.md5(f"vid:{url}".encode()).hexdigest()[:12]
-                    results.append({
-                        "source_id":       f"mm-vid-{uid}",
-                        "title":           f"Video analysis: {url[:80]}",
-                        "url":             url,
-                        "platform":        observation.source_platform.value,
-                        "trust_score":     float(analysis["sentiment"]["confidence"]),
-                        "content_snippet": snippet,
-                        "modality":        "video",
-                        "entities":        analysis["entities"],
-                        "sentiment":       analysis["sentiment"]["value"],
-                    })
-                except Exception as exc:
-                    logger.warning(
-                        "MultimodalAnalyzer.to_evidence_sources: video failed url=%s: %s",
-                        url, exc,
-                    )
-                break  # one video per observation
+        for url in video_urls[:1]:   # at most one video per observation
+            try:
+                analysis = self.analyze_video(url)
+                snippet = self._video_to_paragraph(analysis, observation)
+                uid = _hl.md5(f"vid:{url}".encode()).hexdigest()[:12]
+                results.append({
+                    "source_id":       f"mm-vid-{uid}",
+                    "title":           f"Video analysis: {url[:80]}",
+                    "url":             url,
+                    "platform":        platform_val,
+                    "trust_score":     float(analysis["sentiment"]["confidence"]),
+                    "content_snippet": snippet,
+                    "modality":        "video",
+                    "entities":        analysis["entities"],
+                    "sentiment":       analysis["sentiment"]["value"],
+                })
+            except Exception as exc:
+                logger.warning(
+                    "MultimodalAnalyzer.to_evidence_sources: video failed url=%s: %s",
+                    url, exc,
+                )
 
         return results
 

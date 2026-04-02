@@ -375,11 +375,18 @@ class IndexingPipeline:
             return result
 
         # ── Phase 1: route all items concurrently ─────────────────────
+        # Build a mapping from content_item_id → original ContentItem so that
+        # _index_chunks() can access media_urls / metadata for multimodal extraction
+        # even when the router doesn't carry the raw observation on the result.
+        item_map: Dict[str, Any] = {
+            str(getattr(item, "id", None) or getattr(item, "source_id", "")): item
+            for item in items
+        }
         pipeline_results = await self._route_all(items, result, tenant_id=tenant_id)
         result.pipeline_results = pipeline_results
 
         # ── Phase 2: auto-index chunks into per-tenant ChunkStore ──────
-        self._index_chunks(pipeline_results, result, store=store)
+        self._index_chunks(pipeline_results, result, store=store, item_map=item_map)
 
         # ── Phase 2b: auto-update WatchlistGraph coverage ──────────────
         if self._watchlist_graph is not None:
@@ -583,6 +590,7 @@ class IndexingPipeline:
         result: IndexingResult,
         *,
         store: Optional[ChunkStore] = None,
+        item_map: Optional[Dict[str, Any]] = None,
     ) -> None:
         target_store = store or self._store
         for pr in pipeline_results:
@@ -609,10 +617,17 @@ class IndexingPipeline:
                 registry_meta = self._lookup_registry_meta(pr)
 
             # ── Multimodal evidence extraction ───────────────────────────
+            # Look up the original item (ContentItem / RawObservation) so that
+            # media_urls and platform_metadata are both accessible.
             multimodal_evidence: List[Dict[str, Any]] = []
             if self._multimodal_analyzer is not None:
                 try:
-                    raw_obs = getattr(pr, "raw_observation", None) or getattr(pr, "observation", None)
+                    # Priority: result attribute → original item from item_map
+                    raw_obs = (
+                        getattr(pr, "raw_observation", None)
+                        or getattr(pr, "observation", None)
+                        or (item_map or {}).get(str(pr.content_item_id))
+                    )
                     if raw_obs is not None and self._multimodal_analyzer.has_visual_content(raw_obs):
                         multimodal_evidence = self._multimodal_analyzer.to_evidence_sources(raw_obs)
                         # Also append visual text to the main text so it gets chunked
@@ -777,15 +792,20 @@ class IndexingPipeline:
         """
         for bundle in bundles:
             try:
-                # Record coverage for each entity in the bundle's source items
+                # Collect distinct (entity, platform) pairs from all source items
                 entities: Set[str] = set()
+                # Derive a representative source_family from the bundle's items
+                source_family: str = "unknown"
                 for item in bundle.source_items:
                     for ent in item.get("entities", []):
                         entities.add(str(ent))
+                    if item.get("platform"):
+                        source_family = str(item["platform"])
                 for entity_id in entities:
                     self._watchlist_graph.record_coverage(
                         entity_id,
                         source_id=bundle.bundle_id,
+                        source_family=source_family,
                     )
             except Exception as exc:
                 logger.warning(
@@ -883,6 +903,7 @@ class IndexingPipeline:
         min_source_trust: float = 0.0,
         max_claims: int = 10,
         who_it_affects: Optional[List[str]] = None,
+        tenant_id: str = "default",
     ) -> Optional[Any]:
         """Build a ``GroundedSummary`` from an ``IndexingResult``.
 
@@ -954,24 +975,53 @@ class IndexingPipeline:
 
             # ── Multimodal evidence as first-class citation sources ───────
             if self._multimodal_analyzer is not None:
-                raw_obs = getattr(pr, "raw_observation", None) or getattr(pr, "observation", None)
-                if raw_obs is not None:
+                # Look at result attribute first, then fall back to chunk-store
+                # metadata (set by _index_chunks) which already holds the list.
+                mm_evidence_list: List[Dict[str, Any]] = []
+                raw_obs = (
+                    getattr(pr, "raw_observation", None)
+                    or getattr(pr, "observation", None)
+                )
+                if raw_obs is not None and self._multimodal_analyzer.has_visual_content(raw_obs):
                     try:
-                        for mm_dict in self._multimodal_analyzer.to_evidence_sources(raw_obs):
-                            mm_src = EvidenceSourceCls(
-                                source_id=mm_dict["source_id"],
-                                title=mm_dict["title"],
-                                url=mm_dict["url"],
-                                platform=mm_dict["platform"],
-                                trust_score=float(mm_dict.get("trust_score", 0.5)),
-                                content_snippet=mm_dict.get("content_snippet", "")[:2000],
-                            )
-                            sources.append(mm_src)
+                        mm_evidence_list = self._multimodal_analyzer.to_evidence_sources(raw_obs)
                     except Exception as exc:
                         logger.warning(
                             "IndexingPipeline.build_grounded_summary: multimodal "
                             "evidence extraction failed for item %s: %s",
                             pr.content_item_id, exc,
+                        )
+                else:
+                    # Retrieve from already-indexed chunk metadata.
+                    # Use the per-tenant store so non-default tenant chunks are found.
+                    try:
+                        _lookup_store = self._tenant_stores.get(tenant_id) or self._store
+                        obs_chunks = _lookup_store.get_by_observation(str(pr.content_item_id))
+                        for chunk in obs_chunks:
+                            mm_evidence_list.extend(
+                                chunk.metadata.get("multimodal_evidence", [])
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "IndexingPipeline.build_grounded_summary: chunk "
+                            "metadata lookup failed for item %s: %s",
+                            pr.content_item_id, exc,
+                        )
+                for mm_dict in mm_evidence_list:
+                    try:
+                        mm_src = EvidenceSourceCls(
+                            source_id=mm_dict["source_id"],
+                            title=mm_dict["title"],
+                            url=mm_dict["url"],
+                            platform=mm_dict["platform"],
+                            trust_score=float(mm_dict.get("trust_score", 0.5)),
+                            content_snippet=mm_dict.get("content_snippet", "")[:2000],
+                        )
+                        sources.append(mm_src)
+                    except Exception as exc:
+                        logger.warning(
+                            "IndexingPipeline.build_grounded_summary: mm_src "
+                            "construction failed: %s", exc,
                         )
 
         if not sources:

@@ -111,6 +111,8 @@ class AutoResearchPipeline:
                 f"'min_confidence_threshold' must be in [0, 1], "
                 f"got {min_confidence_threshold!r}"
             )
+        # _lock guards _acquisition_scheduler, _health_monitor, _watchlist_graph
+        # attributes when AutoResearchPipeline is shared across threads.
         self._lock  = threading.Lock()
         self._min_confidence = min_confidence_threshold
 
@@ -170,7 +172,11 @@ class AutoResearchPipeline:
         report = ResearchReport(query=query, tenant_id=tenant_id)
 
         # ── Step 1: acquire content items ─────────────────────────────
-        items = self._acquire_items(query)
+        with self._lock:
+            scheduler = self._acquisition_scheduler
+            wg        = self._watchlist_graph
+            mon       = self._health_monitor
+        items = self._acquire_items(query, scheduler=scheduler)
 
         # ── Step 2: process batch ─────────────────────────────────────
         indexing_result = None
@@ -185,7 +191,7 @@ class AutoResearchPipeline:
         if indexing_result is not None:
             try:
                 summary = self._pipeline.build_grounded_summary(
-                    indexing_result, topic=query
+                    indexing_result, topic=query, tenant_id=tenant_id
                 )
                 if summary is not None:
                     report.grounded_summaries = [summary]
@@ -208,9 +214,9 @@ class AutoResearchPipeline:
             logger.warning("AutoResearchPipeline.run: chunk retrieval failed: %s", exc)
 
         # ── Step 5a: watchlist gap count ──────────────────────────────
-        if self._watchlist_graph is not None:
+        if wg is not None:
             try:
-                cov = self._watchlist_graph.coverage_report()
+                cov = wg.coverage_report()
                 report.watchlist_gap_count = cov.nodes_at_risk
             except Exception as exc:
                 logger.warning(
@@ -219,9 +225,9 @@ class AutoResearchPipeline:
                 )
 
         # ── Step 5b: SLO health status ────────────────────────────────
-        if self._health_monitor is not None:
+        if mon is not None:
             try:
-                health = self._health_monitor.health_report()
+                health = mon.health_report()
                 report.slo_health_status = health.overall_status
             except Exception as exc:
                 logger.warning(
@@ -293,7 +299,7 @@ class AutoResearchPipeline:
             quality_gate=self._quality_gate,
         )
 
-    def _acquire_items(self, query: str) -> List[Any]:
+    def _acquire_items(self, query: str, *, scheduler: Optional[Any] = None) -> List[Any]:
         """Acquire content items for *query*.
 
         When an ``AcquisitionScheduler`` is attached, retrieves the top
@@ -303,15 +309,16 @@ class AutoResearchPipeline:
         still function in standalone mode.
 
         Args:
-            query: The research query.
+            query:     The research query.
+            scheduler: Pre-resolved scheduler (avoids double lock acquisition).
 
         Returns:
             List of content items suitable for ``IndexingPipeline.process_batch()``.
         """
         items = []
         try:
-            if self._acquisition_scheduler is not None:
-                sources = self._acquisition_scheduler.next_batch(10)
+            if scheduler is not None:
+                sources = scheduler.next_batch(10)
                 for src in sources:
                     items.append(_make_synthetic_item(query, source_id=src.source_id))
             if not items:
@@ -362,8 +369,8 @@ def _make_synthetic_item(query: str, source_id: str = "auto-research") -> Any:
             published_at=datetime.now(timezone.utc),
             topics=_topics,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_make_synthetic_item: ContentItem fallback: %s", exc)
     try:
         from app.domain.raw_models import RawObservation
         from app.core.models import SourcePlatform, MediaType
@@ -379,8 +386,8 @@ def _make_synthetic_item(query: str, source_id: str = "auto-research") -> Any:
             media_type=MediaType.TEXT,
             published_at=datetime.now(timezone.utc),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_make_synthetic_item: RawObservation fallback: %s", exc)
     # Final fallback: plain dict (ContentPipelineRouter will route it as-is)
     return {"source_id": source_id, "raw_text": query, "title": query[:200]}
 

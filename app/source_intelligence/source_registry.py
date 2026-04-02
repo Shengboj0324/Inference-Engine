@@ -25,7 +25,6 @@ Typical usage::
 """
 
 import logging
-import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -365,8 +364,9 @@ class AcquisitionScheduler:
         """
         if not isinstance(n, int) or n < 1:
             raise ValueError(f"'n' must be a positive int, got {n!r}")
+        # Use len(self._registry) which is lock-protected, not _store directly
         candidates = self._registry.next_batch(
-            len(self._registry._store) + 1,  # fetch all then filter
+            max(1, len(self._registry)),
             family=family,
         )
         eligible = [s for s in candidates if self.is_eligible(s.source_id)]
