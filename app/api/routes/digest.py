@@ -1,7 +1,9 @@
 """Daily digest routes."""
 
+import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from functools import lru_cache
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -13,11 +15,38 @@ from app.core.models import DigestRequest, DigestResponse, SourcePlatform, UserP
 from app.intelligence.digest_engine import DigestEngine
 from app.output.digest_formatter import DigestFormatter
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
-# Initialize digest engine and formatter
-digest_engine = DigestEngine()
-digest_formatter = DigestFormatter()
+
+# ---------------------------------------------------------------------------
+# Dependency providers — instances created on first request, not at import.
+# This prevents OpenAIError crashes when the module is loaded without an
+# OPENAI_API_KEY set in the environment (e.g. during testing or local dev
+# without an LLM key configured).
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _get_digest_engine() -> DigestEngine:
+    """Singleton DigestEngine; constructed on first HTTP request."""
+    return DigestEngine()
+
+
+@lru_cache(maxsize=1)
+def _get_digest_formatter() -> DigestFormatter:
+    """Singleton DigestFormatter; constructed on first HTTP request."""
+    return DigestFormatter()
+
+
+def get_digest_engine() -> DigestEngine:
+    """FastAPI dependency: return the cached DigestEngine instance."""
+    return _get_digest_engine()
+
+
+def get_digest_formatter() -> DigestFormatter:
+    """FastAPI dependency: return the cached DigestFormatter instance."""
+    return _get_digest_formatter()
 
 
 @router.post("/generate", response_model=DigestResponse)
@@ -25,6 +54,7 @@ async def generate_digest(
     request: DigestRequest,
     current_user: UserProfile = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    engine: DigestEngine = Depends(get_digest_engine),
 ):
     """Generate a personalized daily digest.
 
@@ -32,13 +62,13 @@ async def generate_digest(
         request: Digest generation parameters
         current_user: Authenticated user
         db: Database session
+        engine: Injected DigestEngine instance
 
     Returns:
         Generated digest with clusters and summaries
     """
     try:
-        # Generate digest using the digest engine
-        digest = await digest_engine.generate_digest(
+        digest = await engine.generate_digest(
             user_id=current_user.id,
             request=request,
             db=db,
@@ -58,27 +88,12 @@ async def get_latest_digest(
     max_clusters: int = Query(default=20, ge=1, le=100),
     current_user: UserProfile = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    engine: DigestEngine = Depends(get_digest_engine),
 ):
-    """Get the latest digest for the user.
-
-    Args:
-        hours: Number of hours to look back
-        max_clusters: Maximum number of clusters to return
-        current_user: Authenticated user
-        db: Database session
-
-    Returns:
-        Latest digest
-    """
-    # Calculate time window
+    """Get the latest digest for the user."""
     since = datetime.utcnow() - timedelta(hours=hours)
-
-    request = DigestRequest(
-        since=since,
-        max_clusters=max_clusters,
-    )
-
-    return await generate_digest(request, current_user, db)
+    request = DigestRequest(since=since, max_clusters=max_clusters)
+    return await generate_digest(request, current_user, db, engine)
 
 
 @router.get("/latest/html", response_class=HTMLResponse)
@@ -87,25 +102,14 @@ async def get_latest_digest_html(
     max_clusters: int = Query(default=20, ge=1, le=100),
     current_user: UserProfile = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    engine: DigestEngine = Depends(get_digest_engine),
+    formatter: DigestFormatter = Depends(get_digest_formatter),
 ):
-    """Get the latest digest as beautiful HTML.
-
-    Args:
-        hours: Number of hours to look back
-        max_clusters: Maximum number of clusters to return
-        current_user: Authenticated user
-        db: Database session
-
-    Returns:
-        HTML formatted digest
-    """
-    # Generate digest
+    """Get the latest digest as HTML."""
     since = datetime.utcnow() - timedelta(hours=hours)
     request = DigestRequest(since=since, max_clusters=max_clusters)
-    digest = await generate_digest(request, current_user, db)
-
-    # Format as HTML
-    html = digest_formatter.format_html(digest)
+    digest = await generate_digest(request, current_user, db, engine)
+    html = formatter.format_html(digest)
     return HTMLResponse(content=html)
 
 
@@ -115,25 +119,14 @@ async def get_latest_digest_markdown(
     max_clusters: int = Query(default=20, ge=1, le=100),
     current_user: UserProfile = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    engine: DigestEngine = Depends(get_digest_engine),
+    formatter: DigestFormatter = Depends(get_digest_formatter),
 ):
-    """Get the latest digest as Markdown.
-
-    Args:
-        hours: Number of hours to look back
-        max_clusters: Maximum number of clusters to return
-        current_user: Authenticated user
-        db: Database session
-
-    Returns:
-        Markdown formatted digest
-    """
-    # Generate digest
+    """Get the latest digest as Markdown."""
     since = datetime.utcnow() - timedelta(hours=hours)
     request = DigestRequest(since=since, max_clusters=max_clusters)
-    digest = await generate_digest(request, current_user, db)
-
-    # Format as Markdown
-    markdown = digest_formatter.format_markdown(digest)
+    digest = await generate_digest(request, current_user, db, engine)
+    markdown = formatter.format_markdown(digest)
     return PlainTextResponse(content=markdown)
 
 

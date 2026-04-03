@@ -28,12 +28,39 @@ logger = logging.getLogger(__name__)
 
 
 class DigestEngine:
-    """Core engine for generating personalized daily digests."""
+    """Core engine for generating personalized daily digests.
 
-    def __init__(self):
-        """Initialize digest engine."""
-        self.llm_client = OpenAILLMClient()
-        self.cluster_summarizer = ClusterSummarizer(self.llm_client)
+    LLM client instantiation is deferred until the first actual inference
+    call.  This means ``DigestEngine()`` can be constructed (and the route
+    module imported) without an ``OPENAI_API_KEY`` present in the
+    environment — the key is only validated when ``generate_digest()`` is
+    first invoked.  Any user without an API key therefore receives a clear
+    HTTP 500 with the original OpenAI error message rather than an
+    unrecoverable server crash at startup.
+    """
+
+    def __init__(self) -> None:
+        """Construct the engine; defer LLM client and summarizer creation."""
+        self._llm_client: Optional[OpenAILLMClient] = None
+        self._cluster_summarizer: Optional[ClusterSummarizer] = None
+
+    # ------------------------------------------------------------------
+    # Lazy LLM accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def llm_client(self) -> OpenAILLMClient:
+        """Return the LLM client, creating it on first access."""
+        if self._llm_client is None:
+            self._llm_client = OpenAILLMClient()
+        return self._llm_client
+
+    @property
+    def cluster_summarizer(self) -> ClusterSummarizer:
+        """Return the cluster summarizer, creating it on first access."""
+        if self._cluster_summarizer is None:
+            self._cluster_summarizer = ClusterSummarizer(self.llm_client)
+        return self._cluster_summarizer
 
     async def generate_digest(
         self,
