@@ -221,6 +221,19 @@ class VideoGenerator(BaseOutputGenerator):
                 f"got {type(generation_mode).__name__!r}"
             )
         self._generation_mode = generation_mode
+
+        # ── Production safety contract ────────────────────────────────────────
+        # LOCAL_RENDER and REMOTE_RENDER require external renderers that may not
+        # be present.  In strict mode, registering these modes at init time
+        # without a real renderer is treated as a stub backend.
+        if generation_mode != VideoGenerationMode.SCRIPT_ONLY:
+            from app.core.production_guard import get_guard
+            get_guard().require_real_backend(
+                capability="video_render",
+                resolved_backend="stub",
+                allowed_stubs=frozenset({"stub"}),
+            )
+
         logger.info(
             "VideoGenerator init: generation_mode=%s", generation_mode.value
         )

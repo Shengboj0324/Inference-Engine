@@ -59,78 +59,14 @@ async def _probe_redis() -> None:
 
 
 def _validate_capabilities() -> None:
-    """Validate that every enabled capability has a real backend.
+    """Thin shim — delegates to ``app.core.startup_validation.validate_capabilities``.
 
-    Called synchronously at startup before any request is served.  In
-    production strict mode (``settings.is_strict``), a missing real backend
-    for any enabled capability is a fatal error that prevents the process
-    from starting.  In non-strict mode it emits a WARNING and continues.
-
-    Capabilities checked:
-    * multimodal_vision  — requires a non-stub ``MultimodalAnalyzer``
-    * asr                — requires faster-whisper, whisper, or OPENAI_API_KEY
-    * pdf_extraction     — requires pdfplumber or pypdf
+    Keeping the implementation in ``startup_validation`` makes it importable
+    without loading all FastAPI route modules (which have module-scope
+    side-effects such as LLM client instantiation).
     """
-    from app.core.production_guard import get_guard
-
-    guard = get_guard()
-
-    # ── Multimodal vision ────────────────────────────────────────────────
-    if settings.enable_multimodal_vision:
-        from app.intelligence.multimodal import CapabilityMode
-        # Determine effective mode: REMOTE when a key is present, else STUB.
-        mode = (
-            CapabilityMode.REMOTE_MODEL
-            if (settings.openai_api_key or settings.anthropic_api_key or settings.local_llm_url)
-            else CapabilityMode.STUB
-        )
-        guard.require_real_backend(
-            capability="multimodal_vision",
-            resolved_backend=mode.value,
-            allowed_stubs=frozenset({"stub", "disabled"}),
-        )
-        logger.info("Capability check: multimodal_vision → %s", mode.value)
-
-    # ── ASR ──────────────────────────────────────────────────────────────
-    if settings.enable_asr:
-        asr_backend = "stub"
-        try:
-            import faster_whisper  # type: ignore[import]  # noqa: F401
-            asr_backend = "faster_whisper"
-        except ImportError:
-            try:
-                import whisper  # type: ignore[import]  # noqa: F401
-                asr_backend = "whisper"
-            except ImportError:
-                if settings.openai_api_key:
-                    asr_backend = "openai"
-        guard.require_real_backend(
-            capability="asr",
-            resolved_backend=asr_backend,
-        )
-        logger.info("Capability check: asr → %s", asr_backend)
-
-    # ── PDF extraction ────────────────────────────────────────────────────
-    if settings.enable_pdf_extraction:
-        pdf_backend = "stub"
-        try:
-            import pdfplumber  # type: ignore[import]  # noqa: F401
-            pdf_backend = "pdfplumber"
-        except ImportError:
-            try:
-                import pypdf  # type: ignore[import]  # noqa: F401
-                pdf_backend = "pypdf"
-            except ImportError:
-                pass
-        guard.require_real_backend(
-            capability="pdf_extraction",
-            resolved_backend=pdf_backend,
-        )
-        logger.info("Capability check: pdf_extraction → %s", pdf_backend)
-
-    logger.info(
-        "Startup capability validation complete (strict=%s)", settings.is_strict
-    )
+    from app.core.startup_validation import validate_capabilities
+    validate_capabilities()
 
 
 @asynccontextmanager

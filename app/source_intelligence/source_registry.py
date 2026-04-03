@@ -283,6 +283,9 @@ class AcquisitionScheduler:
        ``health_monitor.record_connector_failure(source_id)``; ``record_success()``
        calls ``health_monitor.record_connector_success(source_id)`` so the
        ``PipelineHealthMonitor`` circuit-breaker state stays accurate.
+    5. **ScorecardRegistry integration** — When a ``ScorecardRegistry`` is
+       injected, sources with active SLO violations on any axis are excluded
+       from ``next_batch()`` before priority sorting.
 
     All mutable state is protected by ``threading.Lock``.
 
@@ -297,6 +300,9 @@ class AcquisitionScheduler:
         max_retries:            Consecutive failures before source is suspended
                                 indefinitely (default 5).
         health_monitor:         Optional monitor; receives failure/success calls.
+        scorecard_registry:     Optional ``ScorecardRegistry``; sources whose
+                                SLO violations are non-empty are excluded from
+                                ``next_batch()`` results.
     """
 
     def __init__(
@@ -308,6 +314,7 @@ class AcquisitionScheduler:
         max_backoff_s: float = 3600.0,
         max_retries: int = 5,
         health_monitor: Optional[Any] = None,
+        scorecard_registry: Optional[Any] = None,
     ) -> None:
         if not isinstance(registry, SourceRegistryStore):
             raise TypeError(
@@ -334,6 +341,7 @@ class AcquisitionScheduler:
         self._max_s     = max_backoff_s
         self._max_retries = max_retries
         self._monitor   = health_monitor
+        self._scorecard = scorecard_registry
         self._lock      = threading.Lock()
         # failure_counts[source_id] = consecutive failure count
         self._failure_counts: Dict[str, int] = {}
@@ -370,6 +378,27 @@ class AcquisitionScheduler:
             family=family,
         )
         eligible = [s for s in candidates if self.is_eligible(s.source_id)]
+
+        # ScorecardRegistry gate — exclude sources with active SLO violations.
+        # This gate runs after the back-off/trust gate so it never re-admits
+        # a suspended source; it only further restricts the eligible set.
+        if self._scorecard is not None:
+            try:
+                violating = set(self._scorecard.slo_violations().keys())
+                if violating:
+                    before = len(eligible)
+                    eligible = [s for s in eligible if s.source_id not in violating]
+                    logger.debug(
+                        "AcquisitionScheduler: scorecard gate excluded %d source(s) "
+                        "with SLO violations: %s",
+                        before - len(eligible),
+                        list(violating)[:5],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "AcquisitionScheduler: scorecard_registry.slo_violations() failed: %s", exc
+                )
+
         return eligible[:n]
 
     def record_failure(self, source_id: str) -> None:

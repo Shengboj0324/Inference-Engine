@@ -637,3 +637,62 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+
+
+  # ── Production safety gate ─────────────────────────────────────────────────
+  # Verifies that ProductionSafetyContract fires RuntimeError for stubs in
+  # strict mode and that zero bare print() remain in app/.
+  production-safety-gate:
+    name: Production Safety Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Stub rejection fires in strict mode
+        run: |
+          python - <<'PYEOF'
+          import sys
+          from app.core.production_guard import ProductionSafetyContract
+          guard = ProductionSafetyContract(strict=True)
+          try:
+              guard.require_real_backend("cap_test", "stub")
+              print("FAIL: RuntimeError not raised", file=sys.stderr)
+              sys.exit(1)
+          except RuntimeError:
+              print("PASS: stub correctly rejected in strict mode")
+          PYEOF
+
+      - name: No bare print() in app/
+        run: |
+          COUNT=$(grep -rn "^\s*print(" app/ --include="*.py" | grep -v "# noqa" | wc -l)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "FAIL: $COUNT bare print() call(s) found in app/"
+            grep -rn "^\s*print(" app/ --include="*.py" | grep -v "# noqa"
+            exit 1
+          fi
+          echo "PASS: zero bare print() in app/"
+
+      - name: validate_publishable blocks SYNTHETIC evidence in strict mode
+        run: |
+          python - <<'PYEOF'
+          import sys
+          from app.core.production_guard import (
+              ProductionSafetyContract, BackendProvenance, EvidenceQuality
+          )
+          guard = ProductionSafetyContract(strict=True)
+          prov = BackendProvenance("pdf", "stub", EvidenceQuality.SYNTHETIC)
+          try:
+              guard.validate_publishable(prov, context="grounded_summary")
+              print("FAIL: RuntimeError not raised for SYNTHETIC evidence", file=sys.stderr)
+              sys.exit(1)
+          except RuntimeError:
+              print("PASS: SYNTHETIC evidence blocked in strict mode")
+          PYEOF

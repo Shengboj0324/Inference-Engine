@@ -37,7 +37,7 @@ import logging
 import math
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
