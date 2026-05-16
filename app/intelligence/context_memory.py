@@ -76,6 +76,16 @@ _HISTORY_TTL_DAYS: int = 90
 _RATIONALE_TTL_DAYS: int = 180
 
 
+class MemoryLeakError(Exception):
+    """Raised when a memory read is attempted across user boundaries.
+
+    The ``ContextMemoryStore`` is partitioned per ``user_id``.  Any read that
+    supplies ``requesting_user_id`` different from the queried ``user_id`` is
+    a security boundary violation and is rejected.  The audit log captures
+    both ids and the attempted operation for downstream investigation.
+    """
+
+
 @dataclass
 class MemoryRecord:
     """A single stored inference event for a user.
@@ -196,6 +206,18 @@ class ContextMemoryStore:
         # source_id → {"embedding": List[float], "seen_at": str}
         self._source_embeddings: Dict[str, Dict[str, Any]] = {}
 
+        # ── Free-form user profile (Problem 4: detail retention) ─────────────
+        # user_id → {"display_name": str, "interests": List[str],
+        #            "preferences": Dict[str, Any], "updated_at": ISO-8601}
+        # Every textual value is PII-scrubbed via DataResidencyGuard before
+        # being written so the profile is safe to serialise and export.
+        self._user_profiles: Dict[str, Dict[str, Any]] = {}
+
+        # ── Cross-user access audit trail ────────────────────────────────────
+        # Append-only ring buffer of dicts describing every rejected read.
+        # Capped at 1024 entries to bound memory growth.
+        self._leak_audit: List[Dict[str, Any]] = []
+
     async def store(
         self,
         user_id: UUID,
@@ -214,12 +236,26 @@ class ContextMemoryStore:
             observation: Source observation whose text will be embedded.
             inference: Corresponding inference result.
         """
+        self._validate_user_id(user_id, op="store")
         if inference.top_prediction is None:
             return
 
         text: str = (observation.normalized_text or "")[:1200]
         if not text.strip():
             return
+
+        # Canonical zero-egress scrub: never persist raw PII / secrets in the
+        # user-scoped memory store, even when the upstream connector failed
+        # to redact.  Logs the count when something was redacted.
+        from app.core.data_residency import DataResidencyGuard
+        scrubbed_text, _pii_n = DataResidencyGuard.scrub_text(text)
+        if _pii_n > 0:
+            logger.info(
+                "ContextMemoryStore.store: scrubbed %d PII pattern(s) "
+                "from observation text (user=%s)",
+                _pii_n, user_id,
+            )
+        text = scrubbed_text
 
         uid: str = str(user_id)
         _t0 = time.perf_counter()
@@ -269,6 +305,7 @@ class ContextMemoryStore:
         user_id: UUID,
         query_text: str,
         top_k: int = 5,
+        requesting_user_id: Optional[UUID] = None,
     ) -> List[MemoryRecord]:
         """Return the ``top_k`` most similar past records for ``user_id``.
 
@@ -279,12 +316,34 @@ class ContextMemoryStore:
             user_id: User whose history to search.
             query_text: Text to embed and compare against stored embeddings.
             top_k: Maximum number of records to return.
+            requesting_user_id: When supplied, must equal ``user_id``.  If it
+                differs, the call is rejected with :class:`MemoryLeakError`
+                and an audit entry is appended.  This is the canonical hook
+                that callers (API layer, agents) should use to enforce
+                cross-user isolation.
 
         Returns:
             List of ``MemoryRecord`` objects sorted by ``score`` descending,
             with ``score`` populated as the cosine similarity.  Returns an
             empty list when the user has no stored records.
+
+        Raises:
+            MemoryLeakError: If ``requesting_user_id`` is set and does not
+                match ``user_id``.
         """
+        self._validate_user_id(user_id, op="retrieve")
+        if requesting_user_id is not None:
+            self._validate_user_id(requesting_user_id, op="retrieve.requesting")
+            if str(requesting_user_id) != str(user_id):
+                self._record_leak_attempt(
+                    op="retrieve",
+                    queried=user_id,
+                    requesting=requesting_user_id,
+                )
+                raise MemoryLeakError(
+                    f"cross-user memory access denied: requesting_user_id="
+                    f"{requesting_user_id} != user_id={user_id}"
+                )
         uid: str = str(user_id)
         with self._lock:
             if uid not in self._records or not self._records[uid]:
@@ -849,6 +908,165 @@ class ContextMemoryStore:
             "ContextMemoryStore.load_from_disk: loaded %s in %.1f ms",
             path, (time.perf_counter() - _t0) * 1000,
         )
+
+    # ── Cross-user isolation helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def _validate_user_id(user_id: Any, op: str) -> None:
+        """Reject any non-``UUID`` user id supplied to read / write methods.
+
+        Centralised type guard so that every public entry point fails closed
+        with a consistent, audit-friendly ``TypeError`` whenever a caller
+        passes ``None`` or a raw string id (which would otherwise silently
+        coexist with legitimate ``UUID``-keyed buckets and create wildcard
+        leakage risk).
+        """
+        if not isinstance(user_id, UUID):
+            raise TypeError(
+                f"ContextMemoryStore.{op}: user_id must be a uuid.UUID, "
+                f"got {type(user_id).__name__!r}"
+            )
+
+    def _record_leak_attempt(
+        self,
+        op: str,
+        queried: UUID,
+        requesting: UUID,
+    ) -> None:
+        """Append a structured leak-attempt entry to the audit buffer."""
+        entry = {
+            "op": op,
+            "queried_user_id": str(queried),
+            "requesting_user_id": str(requesting),
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._lock:
+            self._leak_audit.append(entry)
+            if len(self._leak_audit) > 1024:
+                self._leak_audit.pop(0)
+        logger.warning(
+            "ContextMemoryStore: cross-user access blocked (op=%s queried=%s requesting=%s)",
+            op, queried, requesting,
+        )
+
+    def get_leak_audit(self) -> List[Dict[str, Any]]:
+        """Return a snapshot copy of the cross-user access audit buffer."""
+        with self._lock:
+            return [dict(e) for e in self._leak_audit]
+
+    # ── GDPR / user-profile API (additive) ───────────────────────────────────
+
+    def clear_user_data(self, user_id: UUID) -> Dict[str, int]:
+        """Erase every byte of state associated with ``user_id``.
+
+        Implements right-to-be-forgotten: removes records, embeddings,
+        preferences, inference history, idempotency tokens, rationale
+        memory, noise threshold, competitor aliases, channel preferences,
+        and the user profile.  Idempotent and thread-safe.
+
+        Returns:
+            Counts of removed items per bucket, useful for compliance logs.
+        """
+        self._validate_user_id(user_id, op="clear_user_data")
+        uid = str(user_id)
+        with self._lock:
+            removed = {
+                "records": len(self._records.pop(uid, [])),
+                "embeddings": len(self._embeddings.pop(uid, [])),
+                "preferences": len(self._preferences.pop(uid, {})),
+                "inference_history": len(self._inference_history.pop(uid, [])),
+                "history_seen": len(self._history_seen.pop(uid, set())),
+                "rationale_memory": len(self._rationale_memory.pop(uid, [])),
+                "competitor_aliases": len(self._competitor_aliases.pop(uid, [])),
+                "channel_prefs": len(self._channel_prefs.pop(uid, {})),
+                "profile": 1 if self._user_profiles.pop(uid, None) else 0,
+            }
+            self._noise_thresholds.pop(uid, None)
+            self._total = sum(len(v) for v in self._records.values())
+        logger.info(
+            "ContextMemoryStore.clear_user_data: user=%s removed=%s",
+            user_id, removed,
+        )
+        return removed
+
+    def export_user_data(self, user_id: UUID) -> Dict[str, Any]:
+        """Return a JSON-serialisable snapshot of every byte stored for ``user_id``.
+
+        Embeddings are returned as ``List[float]`` so the result is fully
+        JSON-encodable.  Intended for GDPR data-portability requests.
+        """
+        self._validate_user_id(user_id, op="export_user_data")
+        uid = str(user_id)
+        with self._lock:
+            records = [
+                {
+                    "observation_id": str(r.observation_id),
+                    "normalized_text": r.normalized_text,
+                    "signal_type": r.signal_type.value,
+                    "confidence": r.confidence,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in self._records.get(uid, [])
+            ]
+            embeddings = [v.tolist() for v in self._embeddings.get(uid, [])]
+            return {
+                "user_id": uid,
+                "records": records,
+                "embeddings": embeddings,
+                "preferences": dict(self._preferences.get(uid, {})),
+                "inference_history": list(self._inference_history.get(uid, [])),
+                "rationale_memory": list(self._rationale_memory.get(uid, [])),
+                "noise_threshold": self._noise_thresholds.get(uid),
+                "competitor_aliases": list(self._competitor_aliases.get(uid, [])),
+                "channel_prefs": dict(self._channel_prefs.get(uid, {})),
+                "profile": dict(self._user_profiles.get(uid, {})),
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def get_user_profile(self, user_id: UUID) -> Dict[str, Any]:
+        """Return a defensive copy of the stored profile for ``user_id``."""
+        self._validate_user_id(user_id, op="get_user_profile")
+        uid = str(user_id)
+        with self._lock:
+            return dict(self._user_profiles.get(uid, {}))
+
+    def update_user_profile(
+        self,
+        user_id: UUID,
+        updates: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Merge ``updates`` into the user profile, scrubbing PII as we go.
+
+        String values and string elements of list values are passed through
+        :meth:`DataResidencyGuard.scrub_text` before being written so that
+        no raw PII survives in the profile bucket.  ``None`` values delete
+        their key.  Returns the updated profile (defensive copy).
+        """
+        self._validate_user_id(user_id, op="update_user_profile")
+        if not isinstance(updates, dict):
+            raise TypeError(
+                f"update_user_profile: updates must be a dict, "
+                f"got {type(updates).__name__!r}"
+            )
+        from app.core.data_residency import DataResidencyGuard
+        uid = str(user_id)
+        with self._lock:
+            profile = self._user_profiles.setdefault(uid, {})
+            for k, v in updates.items():
+                if v is None:
+                    profile.pop(k, None)
+                elif isinstance(v, str):
+                    profile[k], _ = DataResidencyGuard.scrub_text(v)
+                elif isinstance(v, list):
+                    profile[k] = [
+                        DataResidencyGuard.scrub_text(item)[0]
+                        if isinstance(item, str) else item
+                        for item in v
+                    ]
+                else:
+                    profile[k] = v
+            profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return dict(profile)
 
 
 # ---------------------------------------------------------------------------

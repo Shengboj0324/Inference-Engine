@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlencode, parse_qs
 
 from app.core.errors import DataResidencyViolationError
@@ -46,6 +46,90 @@ _PHONE_RE = re.compile(
 _PII_QUERY_PARAMS = frozenset(
     {"user", "username", "author", "profile", "screen_name", "handle", "email", "name"}
 )
+
+# ---------------------------------------------------------------------------
+# Extended PII / secret detection registry
+# ---------------------------------------------------------------------------
+# Every entry is (label, compiled_regex, replacement_token).
+# Patterns are ordered most-specific-first so that, e.g., AWS keys are caught
+# before generic API-key-like alphanumerics.  Anchors avoid most over-matches.
+
+_EXTENDED_PII: List[Tuple[str, re.Pattern, str]] = [
+    # — Government / financial identifiers —
+    ("ssn",
+     re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)"),
+     "<ssn_redacted>"),
+    ("credit_card",
+     re.compile(r"(?<!\d)(?:\d{4}[ \-]?){3}\d{4}(?!\d)"),
+     "<credit_card_redacted>"),
+    ("iban",
+     re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b"),
+     "<iban_redacted>"),
+    ("passport",
+     re.compile(r"(?i)\b(?:passport[\s#:]*)([A-Z]{1,2}\d{6,9})\b"),
+     "<passport_redacted>"),
+    # — Network identifiers —
+    ("ipv4",
+     re.compile(
+         r"(?<!\d)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+         r"(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?!\d)"
+     ),
+     "<ip_redacted>"),
+    ("ipv6",
+     re.compile(r"\b(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}\b"),
+     "<ip_redacted>"),
+    ("mac_address",
+     re.compile(r"\b(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b"),
+     "<mac_redacted>"),
+    # — Geo (decimal lat,lon pair with at least 4 fractional digits each) —
+    ("gps_coords",
+     re.compile(
+         r"(?<![\d.\-])"
+         r"-?(?:90(?:\.0+)?|[1-8]?\d\.\d{4,})"
+         r"\s*,\s*"
+         r"-?(?:180(?:\.0+)?|(?:1[0-7]\d|[1-9]?\d)\.\d{4,})"
+         r"(?![\d.])"
+     ),
+     "<gps_redacted>"),
+    # — Secrets / API keys (specific prefixes first) —
+    ("aws_access_key",
+     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+     "<aws_key_redacted>"),
+    ("aws_secret_key",
+     re.compile(r"(?i)aws(.{0,20})?(secret|private)?[\s:=\"']{1,5}([A-Za-z0-9/+=]{40})"),
+     "<aws_secret_redacted>"),
+    ("github_token",
+     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}\b"),
+     "<github_token_redacted>"),
+    ("anthropic_key",
+     re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
+     "<anthropic_key_redacted>"),
+    ("openai_key",
+     re.compile(r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_\-]{20,}\b"),
+     "<openai_key_redacted>"),
+    ("google_api_key",
+     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
+     "<google_key_redacted>"),
+    ("slack_token",
+     re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}\b"),
+     "<slack_token_redacted>"),
+    ("stripe_key",
+     re.compile(r"\b(?:sk|pk|rk)_(?:test|live)_[A-Za-z0-9]{20,}\b"),
+     "<stripe_key_redacted>"),
+    ("jwt",
+     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+     "<jwt_redacted>"),
+    ("bearer_token",
+     re.compile(r"(?i)bearer\s+[A-Za-z0-9_\-\.=]{20,}"),
+     "Bearer <token_redacted>"),
+    ("private_key_block",
+     re.compile(
+         r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+         r"[\s\S]+?"
+         r"-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+     ),
+     "<private_key_redacted>"),
+]
 
 
 class RedactionMethod(str, Enum):
@@ -283,7 +367,17 @@ class DataResidencyGuard:
 
     @staticmethod
     def _scrub_text(text: str):
-        """Replace email addresses and phone numbers in free text with tokens.
+        """Replace every detectable PII / secret pattern in free text with tokens.
+
+        Order of operations (most-specific patterns first so that, e.g.,
+        digit runs inside a JWT or API key are not mis-classified as a phone
+        number):
+        1. Every entry in :data:`_EXTENDED_PII` (SSN, credit card, IBAN,
+           passport, IPv4/IPv6, MAC address, GPS coords, AWS/GitHub/OpenAI/
+           Anthropic/Google/Slack/Stripe keys, JWTs, bearer tokens, PEM
+           private-key blocks).
+        2. Email addresses
+        3. Phone numbers (NANP-shaped)
 
         Args:
             text: Raw free text.
@@ -291,9 +385,84 @@ class DataResidencyGuard:
         Returns:
             Tuple of (scrubbed text, number of replacements made).
         """
-        result, n = _EMAIL_RE.subn("<email_redacted>", text)
+        result = text
+        total = 0
+        for _label, pat, token in _EXTENDED_PII:
+            result, k = pat.subn(token, result)
+            total += k
+        result, n = _EMAIL_RE.subn("<email_redacted>", result)
         result, m = _PHONE_RE.subn("<phone_redacted>", result)
-        return result, n + m
+        return result, total + n + m
+
+    # ------------------------------------------------------------------
+    # Canonical class-method PII engine — usable without an instance
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def scrub_text(cls, text: str) -> Tuple[str, int]:
+        """Scrub every PII / secret pattern from arbitrary free text.
+
+        This is the **canonical** entry point that downstream modules
+        (LLM response post-processing, memory store ingestion, log
+        formatters, etc.) should call to enforce a single source-of-truth
+        redaction policy.  It does not require constructing a
+        :class:`DataResidencyGuard` instance and never raises.
+
+        Args:
+            text: Arbitrary free text.  ``None`` and non-string values are
+                coerced to an empty string.
+
+        Returns:
+            Tuple ``(scrubbed_text, num_replacements)``.  ``num_replacements``
+            is ``0`` exactly when ``scrubbed_text == text``.
+        """
+        if not isinstance(text, str) or not text:
+            return ("" if text is None else str(text), 0)
+        return cls._scrub_text(text)
+
+    @classmethod
+    def find_pii(cls, text: str) -> List[Tuple[str, str]]:
+        """Return every PII / secret hit detected in *text* without modifying it.
+
+        Useful for assertions, audit logging, and unit tests that need to
+        verify what categories of PII would be redacted by :meth:`scrub_text`
+        without actually mutating the input.
+
+        Args:
+            text: Arbitrary free text.
+
+        Returns:
+            List of ``(label, matched_substring)`` tuples.  The list is
+            empty when no PII is detected.  Matched substrings are
+            truncated to 120 characters for log safety.
+        """
+        if not isinstance(text, str) or not text:
+            return []
+        # Walk the most-specific patterns first and mask any spans they
+        # consume so that subsequent (less specific) patterns do not
+        # double-report the same characters as something else.
+        hits: List[Tuple[str, str]] = []
+        masked = list(text)
+        for label, pat, _token in _EXTENDED_PII:
+            joined = "".join(masked)
+            for m in pat.finditer(joined):
+                hits.append((label, m.group(0)[:120]))
+                for i in range(m.start(), m.end()):
+                    masked[i] = "\x00"
+        joined = "".join(masked)
+        for m in _EMAIL_RE.finditer(joined):
+            hits.append(("email", m.group(0)[:120]))
+            for i in range(m.start(), m.end()):
+                masked[i] = "\x00"
+        joined = "".join(masked)
+        for m in _PHONE_RE.finditer(joined):
+            hits.append(("phone", m.group(0)[:120]))
+        return hits
+
+    @classmethod
+    def contains_pii(cls, text: str) -> bool:
+        """Return ``True`` when at least one PII / secret pattern matches."""
+        return bool(cls.find_pii(text))
 
     @staticmethod
     def _scrub_dict(d: Dict[str, Any]):

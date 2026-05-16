@@ -372,6 +372,41 @@ class LLMRouter:
             latency_tier=selected.latency_tier,
         )
 
+    def _scrub_response(
+        self, response: LLMResponse, scrub_output: bool
+    ) -> LLMResponse:
+        """Apply the canonical PII engine to an outbound ``LLMResponse``.
+
+        The router enforces zero-egress on the **return** path: provider
+        responses can contain PII either because the upstream model
+        regurgitated training data or because of prompt-injection.  Every
+        response therefore passes through :meth:`DataResidencyGuard.scrub_text`
+        before being handed back to a caller, unless ``scrub_output=False``
+        is set explicitly (only safe for internal use cases that subsequently
+        re-scrub or never expose the output to users / external systems).
+
+        Args:
+            response:     Provider response to inspect.
+            scrub_output: When ``False``, the response is returned unchanged.
+
+        Returns:
+            Either ``response`` itself (no PII detected or scrubbing disabled)
+            or a new ``LLMResponse`` with the ``content`` field replaced by
+            the redacted version.  All other fields are preserved.
+        """
+        if not scrub_output or not response.content:
+            return response
+        from app.core.data_residency import DataResidencyGuard
+        scrubbed, n = DataResidencyGuard.scrub_text(response.content)
+        if n > 0:
+            logger.warning(
+                "LLMRouter: scrubbed %d PII/secret pattern(s) from LLM output "
+                "(model=%s, provider=%s)",
+                n, response.model, response.provider.value,
+            )
+            return response.model_copy(update={"content": scrubbed})
+        return response
+
     async def generate(
         self,
         messages: List[LLMMessage],
@@ -380,6 +415,7 @@ class LLMRouter:
         max_tokens: Optional[int] = None,
         enable_fallback: bool = True,
         user_tier: Optional["UserTier"] = None,
+        scrub_output: bool = True,
         **kwargs,
     ) -> LLMResponse:
         """Generate completion with intelligent routing.
@@ -393,6 +429,11 @@ class LLMRouter:
             user_tier: Per-request tier override.  When ``None`` the active
                 process-wide tier (set via ``set_active_tier`` or the
                 ``USER_TIER`` env var) is used if tier mode is enabled.
+            scrub_output: When ``True`` (default), the returned
+                ``LLMResponse.content`` is passed through the canonical
+                :class:`DataResidencyGuard` PII engine before being returned
+                to the caller.  Set to ``False`` only for trusted internal
+                paths that handle redaction themselves.
             **kwargs: Additional parameters
 
         Returns:
@@ -439,7 +480,7 @@ class LLMRouter:
             )
             self._total_cost += response.usage.total_cost
 
-            return response
+            return self._scrub_response(response, scrub_output)
 
         except (LLMError, LLMCircuitBreakerError) as e:
             logger.warning(
@@ -479,7 +520,7 @@ class LLMRouter:
                     self._total_cost += response.usage.total_cost
 
                     logger.info(f"Fallback successful: {fallback_model}")
-                    return response
+                    return self._scrub_response(response, scrub_output)
 
                 except (LLMError, LLMCircuitBreakerError) as fallback_error:
                     logger.warning(f"Fallback model {fallback_model} failed: {str(fallback_error)}")
@@ -499,6 +540,7 @@ class LLMRouter:
         strategy: RoutingStrategy = RoutingStrategy.BALANCED,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        scrub_output: bool = True,
         **kwargs,
     ) -> str:
         """Simple generation with routing.
@@ -509,6 +551,8 @@ class LLMRouter:
             strategy: Routing strategy
             temperature: Sampling temperature
             max_tokens: Maximum tokens
+            scrub_output: Forwarded to :meth:`generate`; see that method for
+                a description of the canonical PII scrubbing contract.
             **kwargs: Additional parameters
 
         Returns:
@@ -524,6 +568,7 @@ class LLMRouter:
             strategy=strategy,
             temperature=temperature,
             max_tokens=max_tokens,
+            scrub_output=scrub_output,
             **kwargs,
         )
 
@@ -666,6 +711,7 @@ class LLMRouter:
         messages: List[LLMMessage],
         temperature: float = 0.3,
         max_tokens: Optional[int] = None,
+        scrub_output: bool = True,
         **kwargs,
     ) -> str:
         """Generate text using the model tier appropriate for ``signal_type``.
@@ -707,13 +753,24 @@ class LLMRouter:
             model_name,
         )
         client = self._get_client(model_name)
-        return await client.generate_simple(
+        raw = await client.generate_simple(
             prompt=messages[-1].content if messages else "",
             messages=messages[:-1] if len(messages) > 1 else None,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs,
         )
+        if scrub_output and isinstance(raw, str) and raw:
+            from app.core.data_residency import DataResidencyGuard
+            scrubbed, n = DataResidencyGuard.scrub_text(raw)
+            if n > 0:
+                logger.warning(
+                    "LLMRouter.generate_for_signal: scrubbed %d PII/secret "
+                    "pattern(s) from output (model=%s, signal_type=%s)",
+                    n, model_name, signal_type,
+                )
+                return scrubbed
+        return raw
 
 
 # Global router instance

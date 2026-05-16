@@ -50,6 +50,7 @@ from typing import Any, Dict, List, Optional
 
 from app.summarization.models import (
     AttributedClaim,
+    ClaimType,
     EvidenceSource,
     GroundedSummary,
     SynthesisRequest,
@@ -72,6 +73,12 @@ _STOP = frozenset(
     "it its and or but if in on at to for of from with by about".split()
 )
 _DEFAULT_TOP_N_SENTENCES = 3
+
+#: Multiplier applied to the confidence of single-source factual or
+#: announcement claims so users are not misled by uncorroborated assertions.
+#: A value of 0.6 keeps the claim visible but visibly less trusted than a
+#: claim corroborated by ≥ 2 independent sources.
+_SINGLE_SOURCE_PENALTY: float = 0.6
 
 
 class GroundedSummaryBuilder:
@@ -150,6 +157,7 @@ class GroundedSummaryBuilder:
         claims: List[AttributedClaim] = []
         if claim_texts:
             claims = self._verifier.verify_batch(claim_texts, sources)
+            claims = self._apply_corroboration_penalty(claims)
 
         # 5. Detect contradictions
         contradictions = []
@@ -246,4 +254,43 @@ class GroundedSummaryBuilder:
             return 0.0
         mean_trust = sum(s.trust_score for s in sources) / len(sources)
         return min(1.0, max(0.0, mean_trust * (1.0 - uncertainty_score * 0.5)))
+
+    def _apply_corroboration_penalty(
+        self, claims: List[AttributedClaim]
+    ) -> List[AttributedClaim]:
+        """Downgrade single-source factual / announcement claims.
+
+        A claim attributed to a single source is structurally weaker than
+        one corroborated by ≥ 2 independent sources, regardless of the
+        individual source's trust score.  This guards the user against
+        confidently presented but uncorroborated assertions — a common
+        failure mode of multi-source synthesis.
+
+        Only ``FACTUAL`` and ``ANNOUNCEMENT`` claim types are penalised;
+        opinion, speculation, comparative, and benchmark claims keep their
+        original confidence because they are inherently single-source by
+        nature.
+
+        The original ``AttributedClaim`` is replaced with a new frozen
+        instance whose ``confidence`` is scaled by
+        :data:`_SINGLE_SOURCE_PENALTY`.
+        """
+        if not claims:
+            return claims
+        adjusted: List[AttributedClaim] = []
+        for c in claims:
+            if (
+                len(c.source_ids) <= 1
+                and c.claim_type in (ClaimType.FACTUAL, ClaimType.ANNOUNCEMENT)
+            ):
+                new_conf = round(c.confidence * _SINGLE_SOURCE_PENALTY, 5)
+                adjusted.append(c.model_copy(update={"confidence": new_conf}))
+                logger.debug(
+                    "GroundedSummaryBuilder: single-source penalty applied "
+                    "(claim_id=%s, %.3f -> %.3f)",
+                    c.claim_id, c.confidence, new_conf,
+                )
+            else:
+                adjusted.append(c)
+        return adjusted
 

@@ -489,6 +489,15 @@ class MultimodalAnalyzer:
         otherwise returns a deterministic stub suitable for test environments.
         Never raises — on client failure the stub result is returned.
         Logs the active ``execution_mode`` on every call.
+
+        Every returned dict carries two media-accuracy guard keys (stamped
+        by :meth:`_stamp_accuracy`):
+
+        * ``factuality_score`` (float, ``[0.0, 1.0]``) — combined caption,
+          sentiment, and entity confidence.
+        * ``require_human_review`` (bool) — ``True`` whenever the result was
+          synthesised by the deterministic stub (no model provenance) or
+          ``factuality_score`` is below 0.5.
         """
         if not isinstance(url, str):
             raise TypeError(f"url must be str, got {type(url).__name__!r}")
@@ -497,16 +506,16 @@ class MultimodalAnalyzer:
         mode = self.execution_mode
         logger.debug("MultimodalAnalyzer.analyze_image: url=%s mode=%s", url, mode.value)
         if mode == CapabilityMode.DISABLED:
-            return self._stub_image_result(url)
+            return self._stamp_accuracy(self._stub_image_result(url), is_stub=True)
         if self._vision_client is not None:
             try:
                 raw = self._vision_client(url, "image")
-                return self._parse_image_result(raw, url)
+                return self._stamp_accuracy(self._parse_image_result(raw, url), is_stub=False)
             except Exception as exc:
                 logger.warning(
                     "MultimodalAnalyzer: image analysis failed (mode=%s): %s", mode.value, exc
                 )
-        return self._stub_image_result(url)
+        return self._stamp_accuracy(self._stub_image_result(url), is_stub=True)
 
     def analyze_video(self, url: str) -> VideoAnalysisResult:
         """Return structured analysis of the video at *url*.
@@ -514,6 +523,9 @@ class MultimodalAnalyzer:
         Calls ``vision_client(url, 'video')`` when a client is injected;
         otherwise returns a deterministic stub.  Logs the active
         ``execution_mode`` on every call.  Never raises.
+
+        The returned dict is stamped with ``factuality_score`` and
+        ``require_human_review`` — see :meth:`analyze_image` for semantics.
         """
         if not isinstance(url, str):
             raise TypeError(f"url must be str, got {type(url).__name__!r}")
@@ -522,16 +534,16 @@ class MultimodalAnalyzer:
         mode = self.execution_mode
         logger.debug("MultimodalAnalyzer.analyze_video: url=%s mode=%s", url, mode.value)
         if mode == CapabilityMode.DISABLED:
-            return self._stub_video_result(url)
+            return self._stamp_accuracy(self._stub_video_result(url), is_stub=True)
         if self._vision_client is not None:
             try:
                 raw = self._vision_client(url, "video")
-                return self._parse_video_result(raw, url)
+                return self._stamp_accuracy(self._parse_video_result(raw, url), is_stub=False)
             except Exception as exc:
                 logger.warning(
                     "MultimodalAnalyzer: video analysis failed (mode=%s): %s", mode.value, exc
                 )
-        return self._stub_video_result(url)
+        return self._stamp_accuracy(self._stub_video_result(url), is_stub=True)
 
     def visual_to_text(self, observation: RawObservation) -> str:
         """Produce a RAG-ready paragraph from an observation's visual metadata.
@@ -702,16 +714,21 @@ class MultimodalAnalyzer:
                 analysis = self.analyze_image(url)
                 snippet = self._image_to_paragraph(analysis, observation)
                 uid = _hl.md5(f"img:{url}".encode()).hexdigest()[:12]
+                trust = float(analysis["caption"]["confidence"])
+                if analysis.get("require_human_review"):
+                    trust = min(trust, 0.4)
                 results.append({
-                    "source_id":       f"mm-img-{uid}",
-                    "title":           f"Image analysis: {url[:80]}",
-                    "url":             url,
-                    "platform":        platform_val,
-                    "trust_score":     float(analysis["caption"]["confidence"]),
-                    "content_snippet": snippet,
-                    "modality":        "image",
-                    "entities":        analysis["entities"],
-                    "sentiment":       analysis["sentiment"]["value"],
+                    "source_id":              f"mm-img-{uid}",
+                    "title":                  f"Image analysis: {url[:80]}",
+                    "url":                    url,
+                    "platform":               platform_val,
+                    "trust_score":            trust,
+                    "content_snippet":        snippet,
+                    "modality":               "image",
+                    "entities":               analysis["entities"],
+                    "sentiment":              analysis["sentiment"]["value"],
+                    "factuality_score":       analysis.get("factuality_score", 0.5),
+                    "require_human_review":   bool(analysis.get("require_human_review")),
                 })
             except Exception as exc:
                 logger.warning(
@@ -724,16 +741,21 @@ class MultimodalAnalyzer:
                 analysis = self.analyze_video(url)
                 snippet = self._video_to_paragraph(analysis, observation)
                 uid = _hl.md5(f"vid:{url}".encode()).hexdigest()[:12]
+                trust = float(analysis["sentiment"]["confidence"])
+                if analysis.get("require_human_review"):
+                    trust = min(trust, 0.4)
                 results.append({
-                    "source_id":       f"mm-vid-{uid}",
-                    "title":           f"Video analysis: {url[:80]}",
-                    "url":             url,
-                    "platform":        platform_val,
-                    "trust_score":     float(analysis["sentiment"]["confidence"]),
-                    "content_snippet": snippet,
-                    "modality":        "video",
-                    "entities":        analysis["entities"],
-                    "sentiment":       analysis["sentiment"]["value"],
+                    "source_id":              f"mm-vid-{uid}",
+                    "title":                  f"Video analysis: {url[:80]}",
+                    "url":                    url,
+                    "platform":               platform_val,
+                    "trust_score":            trust,
+                    "content_snippet":        snippet,
+                    "modality":               "video",
+                    "entities":               analysis["entities"],
+                    "sentiment":              analysis["sentiment"]["value"],
+                    "factuality_score":       analysis.get("factuality_score", 0.5),
+                    "require_human_review":   bool(analysis.get("require_human_review")),
                 })
             except Exception as exc:
                 logger.warning(
@@ -744,6 +766,84 @@ class MultimodalAnalyzer:
         return results
 
     # ── Private stub factories ────────────────────────────────────────────────
+
+    # ── Media-accuracy guard (Problem 1) ─────────────────────────────────────
+
+    #: Default factuality floor below which a result is flagged for review.
+    FACTUALITY_REVIEW_THRESHOLD: float = 0.5
+
+    @staticmethod
+    def factuality_score(result: Dict[str, Any]) -> float:
+        """Compute a factuality score in ``[0.0, 1.0]`` for a media result.
+
+        The score is the product of:
+
+        * caption / sentiment confidence (whichever field is present);
+        * mean confidence of detected entities (defaulting to 0.5 when
+          no per-entity confidence is provided);
+        * a 0.6 multiplier when the result was produced by the deterministic
+          stub (``model == "stub"`` or ``require_human_review`` already set),
+          encoding that stub output has no real-model provenance.
+
+        The implementation tolerates missing keys so it can be called on
+        both ``ImageAnalysisResult`` and ``VideoAnalysisResult`` dicts.
+        """
+        if not isinstance(result, dict):
+            raise TypeError(
+                f"factuality_score: result must be a dict, got {type(result).__name__!r}"
+            )
+        caption = result.get("caption") or {}
+        sentiment = result.get("sentiment") or {}
+        cap_conf = float(caption.get("confidence", 0.5)) if isinstance(caption, dict) else 0.5
+        sen_conf = float(sentiment.get("confidence", 0.5)) if isinstance(sentiment, dict) else 0.5
+        entities = result.get("entities") or []
+        if entities:
+            confs = [
+                float(e.get("confidence", 0.5))
+                for e in entities if isinstance(e, dict)
+            ]
+            ent_conf = sum(confs) / len(confs) if confs else 0.5
+        else:
+            ent_conf = 0.5
+        score = cap_conf * sen_conf * ent_conf
+        if result.get("model") == "stub":
+            score *= 0.6
+        return max(0.0, min(1.0, score))
+
+    @classmethod
+    def is_low_confidence(
+        cls,
+        result: Dict[str, Any],
+        threshold: Optional[float] = None,
+    ) -> bool:
+        """Return ``True`` when the result's factuality is below *threshold*."""
+        t = cls.FACTUALITY_REVIEW_THRESHOLD if threshold is None else float(threshold)
+        return cls.factuality_score(result) < t
+
+    @classmethod
+    def _stamp_accuracy(
+        cls,
+        result: Dict[str, Any],
+        is_stub: bool,
+    ) -> Dict[str, Any]:
+        """Stamp ``factuality_score`` and ``require_human_review`` into *result*.
+
+        Stub-derived results are always flagged for human review because
+        their content is not bound to any real model output.  Real-model
+        results are flagged when :meth:`is_low_confidence` returns ``True``.
+        """
+        score = cls.factuality_score(result)
+        result["factuality_score"] = round(score, 4)
+        result["require_human_review"] = bool(
+            is_stub or score < cls.FACTUALITY_REVIEW_THRESHOLD
+        )
+        if result["require_human_review"]:
+            logger.info(
+                "MultimodalAnalyzer: media result flagged for human review "
+                "(model=%s, stub=%s, factuality=%.3f)",
+                result.get("model"), is_stub, score,
+            )
+        return result
 
     def _stub_image_result(self, url: str) -> ImageAnalysisResult:
         """Return a URL-hash–selected stub that meets the production quality bar.
