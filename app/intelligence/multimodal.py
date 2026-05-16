@@ -792,20 +792,28 @@ class MultimodalAnalyzer:
             raise TypeError(
                 f"factuality_score: result must be a dict, got {type(result).__name__!r}"
             )
-        caption = result.get("caption") or {}
-        sentiment = result.get("sentiment") or {}
-        cap_conf = float(caption.get("confidence", 0.5)) if isinstance(caption, dict) else 0.5
-        sen_conf = float(sentiment.get("confidence", 0.5)) if isinstance(sentiment, dict) else 0.5
+        signals: List[float] = []
+        caption = result.get("caption")
+        if isinstance(caption, dict) and "confidence" in caption:
+            signals.append(float(caption["confidence"]))
+        sentiment = result.get("sentiment")
+        if isinstance(sentiment, dict) and "confidence" in sentiment:
+            signals.append(float(sentiment["confidence"]))
         entities = result.get("entities") or []
         if entities:
             confs = [
                 float(e.get("confidence", 0.5))
                 for e in entities if isinstance(e, dict)
             ]
-            ent_conf = sum(confs) / len(confs) if confs else 0.5
+            if confs:
+                signals.append(sum(confs) / len(confs))
+        if not signals:
+            score = 0.0
         else:
-            ent_conf = 0.5
-        score = cap_conf * sen_conf * ent_conf
+            prod = 1.0
+            for s in signals:
+                prod *= max(0.0, min(1.0, s))
+            score = prod ** (1.0 / len(signals))
         if result.get("model") == "stub":
             score *= 0.6
         return max(0.0, min(1.0, score))

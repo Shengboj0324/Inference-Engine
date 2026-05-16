@@ -64,7 +64,21 @@ class CircuitBreaker:
         self._failure_count = 0
         self._success_count = 0
         self._last_failure_time: Optional[float] = None
-        self._lock = asyncio.Lock()
+        self._lock_obj: Optional[asyncio.Lock] = None
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """Lazily construct the asyncio lock so ``__init__`` is loop-agnostic.
+
+        Constructing ``asyncio.Lock()`` at import / wiring time captures the
+        current event loop on Python ≤ 3.9, which breaks when the caller is
+        not inside a running loop (or a previous ``asyncio.run`` has cleared
+        the global loop).  Deferring construction to first async use removes
+        that coupling without changing any locking semantics.
+        """
+        if self._lock_obj is None:
+            self._lock_obj = asyncio.Lock()
+        return self._lock_obj
 
     @property
     def state(self) -> CircuitState:

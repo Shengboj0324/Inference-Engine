@@ -1629,12 +1629,26 @@ class TestConnectorRegistryOAuthScopes:
 
         yield
 
-        # Restore everything
+        # Restore stubbed optional deps (feedparser / praw) to their originals
         for name, orig in originals.items():
             if orig is None:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = orig
+
+        # Drop every app.connectors.* currently in sys.modules — this includes
+        # both the modules we evicted *and* anything new that was transitively
+        # imported by ``import app.connectors.registry`` during the test
+        # (e.g. wechat / tiktok / facebook / instagram).  Without this purge,
+        # the newly-imported connector modules leak past the test and reference
+        # a *different* ``ConnectorAuthError`` class object than callers that
+        # imported ``ConnectorAuthError`` before the fixture ran — breaking
+        # ``pytest.raises(ConnectorAuthError)`` in any subsequent test that
+        # touches a connector.
+        for k in [m for m in sys.modules if "app.connectors" in m]:
+            sys.modules.pop(k, None)
+        # Then put back the original snapshot so later tests see the same
+        # class identities they already imported at module load time.
         sys.modules.update(evicted)
 
     def _get_registry_symbols(self):
@@ -1884,6 +1898,11 @@ class TestApplyAcquisitionFilterEdgeCases:
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = orig
+        # Purge any app.connectors.* that leaked in during the test (see the
+        # detailed comment on TestConnectorRegistryOAuthScopes for why this
+        # is required to preserve ConnectorAuthError class identity).
+        for k in [m for m in sys.modules if "app.connectors" in m]:
+            sys.modules.pop(k, None)
         sys.modules.update(evicted)
 
     def _make_fetch_result(self, n_items: int = 0):
@@ -1958,6 +1977,8 @@ class TestConnectedPlatformsEndpointShape:
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = orig
+        for k in [m for m in sys.modules if "app.connectors" in m]:
+            sys.modules.pop(k, None)
         sys.modules.update(evicted)
 
     @pytest.mark.asyncio
