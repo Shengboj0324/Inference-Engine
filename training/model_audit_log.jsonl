@@ -270,3 +270,43 @@
 {"event": "rollback", "artifact_id": "6aaefb28-f6b2-4400-8f6b-7033c5c23ff3", "timestamp": "2026-05-16T22:24:12.779925+00:00", "notes": "", "previous_production_id": "9b6af4ee-f2b0-40a5-b639-6a91ed42f8e4"}
 {"event": "promote", "artifact_id": "cf64da01-8b4d-4174-aa53-dbcd4788c1d8", "timestamp": "2026-05-16T22:24:12.780932+00:00", "notes": ""}
 {"event": "promote", "artifact_id": "cce7fdd9-19af-442b-83cd-72ddf7f34f15", "timestamp": "2026-05-16T22:24:12.787060+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "6edcbc06-e41b-423f-b7e3-2b7bae8c5946", "timestamp": "2026-05-16T22:41:32.047564+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "dab89d88-a576-4e49-8926-f43c3c79c883", "timestamp": "2026-05-16T22:41:32.049159+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "d47c5d1b-4771-4b90-94bf-f673deb53a25", "timestamp": "2026-05-16T22:41:32.049387+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "d7568041-1717-4a28-ba3a-d2328052ae3e", "timestamp": "2026-05-16T22:41:32.051440+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "5ed97a40-4c0e-47b8-8d85-774acc28d376", "timestamp": "2026-05-16T22:41:32.051641+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "d7568041-1717-4a28-ba3a-d2328052ae3e", "timestamp": "2026-05-16T22:41:32.051837+00:00", "notes": "", "previous_production_id": "5ed97a40-4c0e-47b8-8d85-774acc28d376"}
+{"event": "promote", "artifact_id": "ad4fd2b7-982c-44a9-a3d1-82fb95090f0e", "timestamp": "2026-05-16T22:41:32.052837+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "ee24d40f-df3c-4a71-9e95-ea84749976b6", "timestamp": "2026-05-16T22:41:32.059207+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "1eec2f88-ea82-4d7e-af75-3decfd82943e", "timestamp": "2026-05-16T22:46:23.055446+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "fa29e76b-b9d4-431a-bae9-e9830dd9d933", "timestamp": "2026-05-16T22:46:23.057937+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "e9dd2ac4-0331-4a02-b913-5b4d30b31c34", "timestamp": "2026-05-16T22:46:23.058159+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "2e881e23-dd5f-4030-8bbb-7aa2e6d0fce0", "timestamp": "2026-05-16T22:46:23.060431+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "680716da-54d1-48c3-bc7c-ecc598c41c2f", "timestamp": "2026-05-16T22:46:23.060793+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "2e881e23-dd5f-4030-8bbb-7aa2e6d0fce0", "timestamp": "2026-05-16T22:46:23.061071+00:00", "notes": "", "previous_production_id": "680716da-54d1-48c3-bc7c-ecc598c41c2f"}
+{"event": "promote", "artifact_id": "9511ca54-a6d0-476b-bd6f-79fde4791735", "timestamp": "2026-05-16T22:46:23.062304+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "6d50c485-26f7-49a6-b2aa-03f1837b7fdc", "timestamp": "2026-05-16T22:46:23.068319+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "9d90d352-02c7-4a7e-9bd1-d857085bd600", "timestamp": "2026-05-16T22:48:25.886100+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "41f93c3b-652a-4906-a6e5-3d0349fa06cf", "timestamp": "2026-05-16T22:48:25.887601+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "843a035e-a880-41f0-85d7-fac6967e3afb", "timestamp": "2026-05-16T22:48:25.887819+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "e4aca155-bb6e-40d3-8af5-7601765e3bdd", "timestamp": "2026-05-16T22:48:25.889854+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "bc3f5465-a02c-47ff-a561-b224dce9298b", "timestamp": "2026-05-16T22:48:25.890083+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "e4aca155-bb6e-40d3-8af5-7601765e3bdd", "timestamp": "2026-05-16T22:48:25.890285+00:00", "notes": "", "previous_production_id": "bc3f5465-a02c-47ff-a561-b224dce9298b"}
+{"event": "promote", "artifact_id": "48b6d849-a2e3-4964-99b6-8269ca999f63", "timestamp": "2026-05-16T22:48:25.891306+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "1a321a59-e581-4b7e-91fa-4317518143b9", "timestamp": "2026-05-16T22:48:25.897648+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "849910db-e014-4ac6-942c-473d3e1a8732", "timestamp": "2026-05-16T22:50:22.086968+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "2837e279-69a5-4a9e-bc76-ccce75414491", "timestamp": "2026-05-16T22:50:22.088450+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "01396c3e-91c5-4c82-892e-1b7c8474fc29", "timestamp": "2026-05-16T22:50:22.088658+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "5e3d4de4-6264-4234-a4ad-83eaf5163105", "timestamp": "2026-05-16T22:50:22.090630+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "59f5e929-3062-4d9f-b623-272929b71626", "timestamp": "2026-05-16T22:50:22.090847+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "5e3d4de4-6264-4234-a4ad-83eaf5163105", "timestamp": "2026-05-16T22:50:22.091044+00:00", "notes": "", "previous_production_id": "59f5e929-3062-4d9f-b623-272929b71626"}
+{"event": "promote", "artifact_id": "9bdcf360-df5d-4be4-87ce-f8b74b3f7910", "timestamp": "2026-05-16T22:50:22.092009+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "644225a4-baa1-4a3a-ad0f-a54b9f06b95e", "timestamp": "2026-05-16T22:50:22.098344+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "20dfae20-e8b1-4acc-9d41-b465235074d4", "timestamp": "2026-05-16T22:52:18.776691+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "e4862839-a7cf-49d3-b036-4feea5886ee9", "timestamp": "2026-05-16T22:52:18.778542+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "e41f93c9-8669-4afe-9b48-6dbc2a1cbcb4", "timestamp": "2026-05-16T22:52:18.778799+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "02d9609f-6293-4901-98ed-acb86d48cdb6", "timestamp": "2026-05-16T22:52:18.781036+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "ee476e20-89c3-4bbd-a3a2-78632fd4edcb", "timestamp": "2026-05-16T22:52:18.781273+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "02d9609f-6293-4901-98ed-acb86d48cdb6", "timestamp": "2026-05-16T22:52:18.781539+00:00", "notes": "", "previous_production_id": "ee476e20-89c3-4bbd-a3a2-78632fd4edcb"}
+{"event": "promote", "artifact_id": "f1bfff0d-3fd9-48b4-970a-5620be62c7ed", "timestamp": "2026-05-16T22:52:18.782635+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "07e7d914-ba92-4f7a-a918-04eba55fb3d4", "timestamp": "2026-05-16T22:52:18.789151+00:00", "notes": ""}

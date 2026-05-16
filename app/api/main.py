@@ -85,8 +85,13 @@ async def lifespan(app: FastAPI):
 
     # 2. Redis connectivity probe — raises RuntimeError and aborts startup if
     #    Redis is unreachable, preventing orchestrators from routing traffic to
-    #    an API instance that cannot honour its backlist contract.
-    await _probe_redis()
+    #    an API instance that cannot honour its backlist contract.  Skipped in
+    #    desktop deployment mode where the sidecar uses an in-process pub/sub
+    #    backend and no external Redis service exists by design.
+    if not settings.is_desktop:
+        await _probe_redis()
+    else:
+        logger.info("Desktop deployment mode — skipping external Redis probe.")
 
     yield
 

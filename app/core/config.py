@@ -46,6 +46,20 @@ class Settings(BaseSettings):
     # Environment
     environment: str = Field(default="development")
 
+    # Deployment mode — additive flag introduced for the desktop transition.
+    # "server" preserves the existing Docker/Compose behaviour (Postgres, Redis,
+    # MinIO, Celery).  "desktop" instructs subsystems to prefer local-first
+    # backends (SQLite, local filesystem, in-process queue) and to skip
+    # external-service startup probes.  Default is "server" so no existing
+    # deployment changes behaviour until it is explicitly opted-in.
+    deployment_mode: str = Field(
+        default="server",
+        description=(
+            "Deployment topology: 'server' (multi-process w/ Postgres/Redis/"
+            "MinIO/Celery) or 'desktop' (single-process local-first sidecar)."
+        ),
+    )
+
     # Database
     database_url: str = Field(
         default="postgresql+asyncpg://radar:radar_password@localhost:5432/social_radar"
@@ -232,6 +246,24 @@ class Settings(BaseSettings):
             raise ValueError(f"Environment must be one of {allowed}")
         return v
 
+    @field_validator("deployment_mode", mode="before")
+    @classmethod
+    def validate_deployment_mode(cls, v: Any) -> str:
+        """Normalise and validate ``deployment_mode``.
+
+        Accepts ``server`` or ``desktop`` in any case.  An empty string falls
+        back to ``server`` to match the historical Docker/Compose default.
+        """
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return "server"
+        if not isinstance(v, str):
+            raise ValueError("deployment_mode must be a string")
+        v = v.strip().lower()
+        allowed = {"server", "desktop"}
+        if v not in allowed:
+            raise ValueError(f"deployment_mode must be one of {sorted(allowed)}")
+        return v
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -410,6 +442,16 @@ class Settings(BaseSettings):
     def is_strict(self) -> bool:
         """True when fail-closed production safety is active."""
         return self.production_strict_mode
+
+    @property
+    def is_desktop(self) -> bool:
+        """True when running as a local-first desktop sidecar."""
+        return self.deployment_mode == "desktop"
+
+    @property
+    def is_server(self) -> bool:
+        """True when running in the canonical multi-process server topology."""
+        return self.deployment_mode == "server"
 
 
 # Global settings instance (singleton — constructed once at import time)
