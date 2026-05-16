@@ -52,3 +52,11 @@ except ImportError as e:
     logger.warning(f"Ollama provider not available: {e}")
     OllamaProvider = None
 
+# OpenRouter provider — powers the Lite/Medium/Turbo user-tier feature
+try:
+    from app.llm.providers.openrouter_provider import OpenRouterLLMClient
+    __all__.append("OpenRouterLLMClient")
+except ImportError as e:
+    logger.warning(f"OpenRouter provider not available: {e}")
+    OpenRouterLLMClient = None
+

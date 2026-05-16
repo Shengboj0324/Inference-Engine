@@ -40,6 +40,12 @@ except ImportError as e:
     VLLMClient = None  # type: ignore[assignment,misc]
     OllamaProvider = None  # type: ignore[assignment,misc]
 
+try:
+    from app.llm.providers.openrouter_provider import OpenRouterLLMClient
+except ImportError as e:
+    logger.warning(f"OpenRouter provider not available: {e}")
+    OpenRouterLLMClient = None  # type: ignore[assignment,misc]
+
 
 class RoutingStrategy(str, Enum):
     """Routing strategies for LLM selection."""
@@ -182,6 +188,13 @@ class LLMRouter:
                 model_name=model_name,
                 service_config=self.service_config,
             )
+        elif model_config.provider == LLMProvider.OPENROUTER:
+            if OpenRouterLLMClient is None:
+                raise ValueError("OpenRouterLLMClient is not available (import error)")
+            client = OpenRouterLLMClient(
+                model_name=model_name,
+                service_config=self.service_config,
+            )
         else:
             raise ValueError(f"Unsupported provider: {model_config.provider}")
 
@@ -224,6 +237,7 @@ class LLMRouter:
         quality_requirement: Optional[int] = None,
         cost_limit: Optional[float] = None,
         latency_limit: Optional[int] = None,
+        user_tier: Optional["UserTier"] = None,
     ) -> RoutingDecision:
         """Select optimal model based on strategy and constraints.
 
@@ -234,10 +248,38 @@ class LLMRouter:
             quality_requirement: Minimum quality tier (1-5, lower is better)
             cost_limit: Maximum cost in USD
             latency_limit: Maximum latency in ms
+            user_tier: Explicit per-request tier override.  When omitted the
+                active process-wide tier (if any) is consulted via
+                ``get_active_tier``.  Tier mode short-circuits all other
+                selection logic and unconditionally returns the OpenRouter
+                model bound to the resolved tier.
 
         Returns:
             Routing decision
         """
+        # ── User-tier override (highest precedence after explicit per-call) ──
+        from app.llm.user_tiers import (  # local import to avoid circulars
+            UserTier as _UserTier,
+            get_active_tier,
+            is_tier_mode_enabled,
+            resolve_tier_model,
+        )
+
+        effective_tier: Optional[_UserTier] = user_tier or (
+            get_active_tier() if is_tier_mode_enabled() else None
+        )
+        if effective_tier is not None:
+            tier_model_name = resolve_tier_model(effective_tier)
+            tier_model_cfg = MODEL_REGISTRY[tier_model_name]
+            return RoutingDecision(
+                model_name=tier_model_name,
+                provider=tier_model_cfg.provider,
+                reason=f"User tier: {effective_tier.value}",
+                estimated_cost=self._estimate_cost(tier_model_cfg, messages, max_tokens),
+                quality_tier=tier_model_cfg.quality_tier,
+                latency_tier=tier_model_cfg.latency_tier,
+            )
+
         # A/B testing override
         if strategy == RoutingStrategy.A_B_TEST and self.ab_test_config and self.ab_test_config.enabled:
             if random.random() < self.ab_test_config.traffic_split:
@@ -337,6 +379,7 @@ class LLMRouter:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         enable_fallback: bool = True,
+        user_tier: Optional["UserTier"] = None,
         **kwargs,
     ) -> LLMResponse:
         """Generate completion with intelligent routing.
@@ -347,6 +390,9 @@ class LLMRouter:
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
             enable_fallback: Enable automatic fallback on failure
+            user_tier: Per-request tier override.  When ``None`` the active
+                process-wide tier (set via ``set_active_tier`` or the
+                ``USER_TIER`` env var) is used if tier mode is enabled.
             **kwargs: Additional parameters
 
         Returns:
@@ -362,6 +408,7 @@ class LLMRouter:
             messages=messages,
             strategy=strategy,
             max_tokens=max_tokens,
+            user_tier=user_tier,
         )
 
         logger.info(

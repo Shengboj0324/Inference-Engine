@@ -206,7 +206,102 @@ MODEL_REGISTRY: Dict[str, ModelConfig] = {
         quality_tier=3,
         latency_tier=2,
     ),
+    # ---------------------------------------------------------------------------
+    # OpenRouter tier models — exposed to end-users via the Lite/Medium/Turbo
+    # tier selector.  Identifiers MUST match OpenRouter's canonical model slugs
+    # (https://openrouter.ai/models).  Pricing values are conservative upper
+    # bounds used for cost estimation only; the real per-call cost is computed
+    # by the provider from the upstream response's usage block.
+    # ---------------------------------------------------------------------------
+    "meta-llama/llama-3.2-3b-instruct": ModelConfig(
+        name="meta-llama/llama-3.2-3b-instruct",
+        provider=LLMProvider.OPENROUTER,
+        pricing=ModelPricing(
+            input_cost_per_1m=0.03,
+            output_cost_per_1m=0.05,
+            context_window=131_072,
+            supports_json_mode=False,
+        ),
+        quality_tier=4,
+        latency_tier=1,
+    ),
+    "openai/gpt-4o-mini": ModelConfig(
+        name="openai/gpt-4o-mini",
+        provider=LLMProvider.OPENROUTER,
+        pricing=ModelPricing(
+            input_cost_per_1m=0.15,
+            output_cost_per_1m=0.60,
+            context_window=128_000,
+            supports_function_calling=True,
+            supports_json_mode=True,
+        ),
+        quality_tier=2,
+        latency_tier=1,
+    ),
+    "anthropic/claude-3.5-sonnet": ModelConfig(
+        name="anthropic/claude-3.5-sonnet",
+        provider=LLMProvider.OPENROUTER,
+        pricing=ModelPricing(
+            input_cost_per_1m=3.0,
+            output_cost_per_1m=15.0,
+            context_window=200_000,
+            supports_vision=True,
+        ),
+        quality_tier=1,
+        latency_tier=2,
+    ),
 }
+
+
+# Heuristic quality/latency tiers assigned to OpenRouter models that are not
+# explicitly registered above (e.g. when an operator overrides one of the
+# ``user_tier_*_model`` settings with a different OpenRouter slug).
+_DEFAULT_OPENROUTER_PRICING = ModelPricing(
+    input_cost_per_1m=1.0,
+    output_cost_per_1m=3.0,
+    context_window=128_000,
+)
+
+
+def ensure_openrouter_model_registered(
+    model_id: str,
+    *,
+    quality_tier: int = 2,
+    latency_tier: int = 2,
+    pricing: Optional[ModelPricing] = None,
+) -> ModelConfig:
+    """Idempotently register an OpenRouter model in ``MODEL_REGISTRY``.
+
+    Lets operators point a tier at any OpenRouter model slug via the
+    ``USER_TIER_*_MODEL`` env vars without having to edit this file.  When
+    ``model_id`` is already registered the existing entry is returned
+    unchanged so explicit configurations always win over defaults.
+
+    Args:
+        model_id: OpenRouter model slug, e.g. ``"openai/gpt-4o"``.
+        quality_tier: Fallback quality tier (1=best … 5=basic).
+        latency_tier: Fallback latency tier (1=fastest … 5=slowest).
+        pricing: Optional explicit pricing override.
+
+    Returns:
+        The resolved ``ModelConfig`` (either pre-existing or freshly created).
+
+    Raises:
+        ValueError: If ``model_id`` is not a non-empty string.
+    """
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("model_id must be a non-empty string")
+    if model_id in MODEL_REGISTRY:
+        return MODEL_REGISTRY[model_id]
+    cfg = ModelConfig(
+        name=model_id,
+        provider=LLMProvider.OPENROUTER,
+        pricing=pricing or _DEFAULT_OPENROUTER_PRICING,
+        quality_tier=quality_tier,
+        latency_tier=latency_tier,
+    )
+    MODEL_REGISTRY[model_id] = cfg
+    return cfg
 
 
 @dataclass

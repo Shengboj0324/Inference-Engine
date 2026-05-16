@@ -18,6 +18,13 @@ from pydantic import BaseModel, Field
 from app.llm.exceptions import LLMError
 from app.llm.models import LLMMessage, MessageRole
 from app.llm.router import get_router, RoutingStrategy
+from app.llm.user_tiers import (
+    UserTier,
+    get_active_tier,
+    is_tier_mode_enabled,
+    list_tiers,
+    set_active_tier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +44,10 @@ class GenerateRequest(BaseModel):
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     strategy: Optional[str] = Field("balanced", description="Routing strategy")
     enable_fallback: bool = Field(True, description="Enable automatic fallback")
+    tier: Optional[str] = Field(
+        None,
+        description="Per-request user tier override: 'lite' | 'medium' | 'turbo'.",
+    )
 
 
 class ChatMessage(BaseModel):
@@ -54,6 +65,30 @@ class ChatRequest(BaseModel):
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     strategy: Optional[str] = Field("balanced", description="Routing strategy")
     enable_fallback: bool = Field(True, description="Enable automatic fallback")
+    tier: Optional[str] = Field(
+        None,
+        description="Per-request user tier override: 'lite' | 'medium' | 'turbo'.",
+    )
+
+
+class TierUpdateRequest(BaseModel):
+    """Request body for POST /tier — activate or clear the user tier."""
+
+    tier: Optional[str] = Field(
+        None,
+        description="Tier id ('lite' | 'medium' | 'turbo') or null to clear.",
+    )
+
+
+def _parse_tier_or_400(value: Optional[str]) -> Optional[UserTier]:
+    """Parse a tier string, raising HTTP 400 on invalid input."""
+    try:
+        return UserTier.parse(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
 
 
 class GenerateResponse(BaseModel):
@@ -107,6 +142,7 @@ async def generate(request: GenerateRequest):
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             enable_fallback=request.enable_fallback,
+            user_tier=_parse_tier_or_400(request.tier),
         )
 
         return GenerateResponse(
@@ -172,6 +208,7 @@ async def chat(request: ChatRequest):
             temperature=request.temperature,
             strategy=strategy,
             enable_fallback=request.enable_fallback,
+            user_tier=_parse_tier_or_400(request.tier),
         )
 
         return GenerateResponse(
@@ -238,3 +275,51 @@ async def stats():
             detail=f"Failed to get statistics: {str(e)}",
         )
 
+
+
+# ============================================================================
+# USER-TIER ENDPOINTS (Lite / Medium / Turbo) — OpenRouter-backed
+# ============================================================================
+
+
+@router.get("/tiers")
+async def list_available_tiers():
+    """List every selectable user tier with UI-friendly metadata.
+
+    Returns a JSON document containing the tier id, human label, summary
+    text suitable for rendering in a tier-picker, and the OpenRouter model
+    id that the tier is currently bound to.  Also reports the currently
+    active tier (if any) and whether OpenRouter is configured.
+    """
+    active = get_active_tier()
+    return {
+        "tiers": list_tiers(),
+        "active_tier": active.value if active else None,
+        "tier_mode_enabled": is_tier_mode_enabled(),
+    }
+
+
+@router.get("/tier")
+async def get_current_tier():
+    """Return the currently active user tier (or ``null`` if disabled)."""
+    active = get_active_tier()
+    return {
+        "active_tier": active.value if active else None,
+        "tier_mode_enabled": is_tier_mode_enabled(),
+    }
+
+
+@router.post("/tier")
+async def update_current_tier(request: TierUpdateRequest):
+    """Switch the active user tier (or clear it with ``tier: null``).
+
+    Validates the tier string and, when non-null, applies it as the
+    process-wide override so subsequent ``/generate`` and ``/chat`` calls
+    route through the OpenRouter model bound to that tier.
+    """
+    tier = _parse_tier_or_400(request.tier)
+    set_active_tier(tier)
+    return {
+        "active_tier": tier.value if tier else None,
+        "tier_mode_enabled": is_tier_mode_enabled(),
+    }

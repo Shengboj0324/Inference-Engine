@@ -107,6 +107,50 @@ class Settings(BaseSettings):
         ),
     )
 
+    # OpenRouter (user-tier mode) — Lite / Medium / Turbo selection
+    openrouter_api_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "OpenRouter API key.  When set together with a non-empty user_tier, "
+            "LLMRouter routes requests through OpenRouter using the model bound "
+            "to the active tier."
+        ),
+    )
+    openrouter_base_url: str = Field(
+        default="https://openrouter.ai/api/v1",
+        description="OpenRouter REST endpoint (OpenAI-compatible).",
+    )
+    openrouter_app_url: Optional[str] = Field(
+        default=None,
+        description="Optional HTTP-Referer header value advertised to OpenRouter.",
+    )
+    openrouter_app_title: Optional[str] = Field(
+        default="Social Media Radar",
+        description="Optional X-Title header advertised to OpenRouter.",
+    )
+
+    # Default tier the API exposes to end-users.  None disables user-tier mode
+    # entirely and preserves the legacy routing behaviour for existing tests.
+    user_tier: Optional[str] = Field(
+        default=None,
+        description=(
+            "Active user tier: 'lite' | 'medium' | 'turbo'.  None disables "
+            "tier mode and falls back to the legacy MODEL_REGISTRY routing."
+        ),
+    )
+    user_tier_lite_model: str = Field(
+        default="meta-llama/llama-3.2-3b-instruct",
+        description="OpenRouter model ID used for the Lite tier (cheap, fast).",
+    )
+    user_tier_medium_model: str = Field(
+        default="openai/gpt-4o-mini",
+        description="OpenRouter model ID used for the Medium tier (balanced).",
+    )
+    user_tier_turbo_model: str = Field(
+        default="anthropic/claude-3.5-sonnet",
+        description="OpenRouter model ID used for the Turbo tier (top quality).",
+    )
+
     # Security
     secret_key: str = Field(default="change-this-in-production")
     encryption_key: str = Field(default="change-this-32-byte-key-base64==")
@@ -263,6 +307,28 @@ class Settings(BaseSettings):
         """Validate LLM temperature."""
         if not 0.0 <= v <= 2.0:
             raise ValueError("Temperature must be between 0.0 and 2.0")
+        return v
+
+    @field_validator("user_tier", mode="before")
+    @classmethod
+    def validate_user_tier(cls, v: Optional[str]) -> Optional[str]:
+        """Normalise and validate the user-tier selector.
+
+        Accepts ``None`` (tier mode disabled), empty string (treated as
+        ``None``), or one of ``lite`` / ``medium`` / ``turbo`` in any case.
+        Any other non-empty value raises ``ValueError`` so configuration
+        mistakes surface at process start rather than at request time.
+        """
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("user_tier must be a string or None")
+        v = v.strip().lower()
+        if not v:
+            return None
+        allowed = {"lite", "medium", "turbo"}
+        if v not in allowed:
+            raise ValueError(f"user_tier must be one of {sorted(allowed)} or None")
         return v
 
     @field_validator("cluster_min_similarity")

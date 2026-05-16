@@ -125,6 +125,12 @@ class EnhancedBaseLLMClient(ABC):
                 burst_size=80.0,
                 max_requests_per_minute=2000,
             )
+        elif self.provider == LLMProvider.OPENROUTER:
+            return RateLimiter(
+                requests_per_second=20.0,
+                burst_size=40.0,
+                max_requests_per_minute=1200,
+            )
         else:
             # Default for local/other providers
             return RateLimiter(

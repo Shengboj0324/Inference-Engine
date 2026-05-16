@@ -66,15 +66,6 @@ class BloomFilter:
         self.elements_added += 1
 
     def contains(self, item: str) -> bool:
-        """Check if item might be in the set.
-
-        Args:
-            item: Item to check
-
-        Returns:
-            True if item might be in set (possible false positive)
-            False if item is definitely not in set (no false negatives)
-        """
         for i in range(self.num_hashes):
             index = self._hash(item, i) % self.size
             if not self.bit_array[index]:
@@ -146,18 +137,6 @@ class BloomFilter:
 
 
 class CountMinSketch:
-    """Probabilistic frequency counter for streaming data.
-
-    Features:
-    - O(1) update and query
-    - Sublinear space complexity
-    - Overestimates frequency (never underestimates)
-
-    Use cases:
-    - Hashtag frequency tracking
-    - Topic trending detection
-    - Word frequency in streams
-    """
 
     def __init__(
         self,

@@ -43,6 +43,7 @@ class LLMProvider(str, Enum):
     OLLAMA = "ollama"  # Local models via Ollama
     TOGETHER = "together"  # Together AI
     REPLICATE = "replicate"  # Replicate
+    OPENROUTER = "openrouter"  # OpenRouter aggregator (user-tier mode)
 
 
 class LLMMessage(BaseModel):
