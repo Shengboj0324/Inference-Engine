@@ -270,13 +270,13 @@ class CrisisReportBuilder:
             _items_matching(items, "generic") + \
             _items_matching(items, "local")
         e4 = self._evidence.score("ai-search-generic", ai_support[:8])
-        if any(m.issue.issue_id == "ai-search-generic"
+        if any(m.issue.issue_id == "ai-search-generic-answers"
                for m in signals.known_issue_matches) and e4.value < 0.7:
             e4 = _ESC.from_value(
                 max(e4.value, 0.72),
                 rationale=(
                     e4.rationale +
-                    " [boosted: matches company-tracked ai-search-generic]"
+                    " [boosted: matches company-tracked ai-search-generic-answers]"
                 ),
                 corroborators=e4.corroborators,
                 platforms=e4.platforms,
