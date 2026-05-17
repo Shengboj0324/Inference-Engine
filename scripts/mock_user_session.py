@@ -2,15 +2,17 @@
 
 Exercises the Phase 5/6 contracts the way a real operator would:
 
-  1. seed a tiny content store with three items
-  2. probe the RAG status route (current model, stale count)
-  3. issue a search; verify base_score / personalization_bonus are surfaced
-  4. record explicit feedback on one snippet
-  5. issue the same search; verify the feedback target is now promoted
-  6. swap the embedder's ``model`` to a fresh version and confirm the
+  1. probe the RAG status route (current model, stale count)
+  2. issue a search; verify base_score / personalization_bonus are surfaced
+  3. record explicit feedback on one snippet
+  4. issue the same search; verify the feedback target is now promoted
+  5. swap the embedder's ``model`` to a fresh version and confirm the
      stale-embedding counter surfaces every prior row
-  7. start a background reindex job and poll until done
-  8. reset personalization signals and confirm the count returns to zero
+  6. start a background reindex job and poll until done
+  7. reset personalization signals and confirm the count returns to zero
+  8. read ``GET /rag/telemetry``; confirm counters reflect the two
+     searches above (one personalized, one promoted-to-top); then
+     ``DELETE /rag/telemetry`` and confirm the counters zero out
 
 Exits ``0`` on success, ``1`` on any assertion failure.  Intended for
 the pre-release checklist in ``docs/deployment.md`` and as a fast smoke
@@ -167,6 +169,37 @@ def run() -> int:
     d = c.delete("/api/v1/rag/signals")
     _check("clear 200", d.status_code == 200)
     _check("count drops to 0", c.get("/api/v1/rag/signals").json()["count"] == 0)
+
+    # Steps 2 + 4 each ran one search; step 4 received signals recorded in
+    # step 3 and flipped the top result.  Clearing signals in step 7 wipes
+    # the signals store but leaves the per-process telemetry counters
+    # intact \u2014 they are what the UX panel reads for the "personalization
+    # affected N% of your recent searches" tile.
+    print("step 8: GET /rag/telemetry")
+    t = c.get("/api/v1/rag/telemetry")
+    _check("telemetry 200", t.status_code == 200)
+    tb = t.json()
+    _check("queries_total covers both searches", tb["queries_total"] >= 2,
+           f"queries_total={tb['queries_total']}")
+    _check("queries_personalized >= 1", tb["queries_personalized"] >= 1,
+           f"queries_personalized={tb['queries_personalized']}")
+    _check("queries_reordered >= 1", tb["queries_reordered"] >= 1,
+           f"queries_reordered={tb['queries_reordered']}")
+    _check("queries_promoted_to_top >= 1", tb["queries_promoted_to_top"] >= 1,
+           f"queries_promoted_to_top={tb['queries_promoted_to_top']}")
+    _check("no signal-store faults", tb["signal_lookups_failed"] == 0,
+           f"signal_lookups_failed={tb['signal_lookups_failed']}")
+
+    dt = c.delete("/api/v1/rag/telemetry")
+    _check("telemetry reset 200", dt.status_code == 200)
+    _check("reset flag true", dt.json()["reset"] is True)
+    tb2 = c.get("/api/v1/rag/telemetry").json()
+    _check("counters zeroed after reset",
+           tb2["queries_total"] == 0
+           and tb2["queries_personalized"] == 0
+           and tb2["queries_reordered"] == 0
+           and tb2["queries_promoted_to_top"] == 0,
+           repr(tb2))
 
     print("\n-> all checks passed; desktop sidecar contracts hold end-to-end")
     return 0
