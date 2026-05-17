@@ -63,6 +63,34 @@ _BONUS_HALFLIFE_SECONDS = 30 * 24 * 3600.0
 _BONUS_DECAY_FLOOR = 0.01
 
 
+def _apply_source_balance(
+    snippets: List["RetrievedSnippet"],
+    k: int,
+    max_per_platform: Optional[int],
+) -> List["RetrievedSnippet"]:
+    """Limit how many snippets a single platform may contribute.
+
+    Preserves the input order (which is already score-sorted) and keeps
+    at most ``max_per_platform`` items per ``source_platform``.  When
+    ``max_per_platform`` is ``None`` the cap is disabled and the
+    existing top-``k`` slice is returned unchanged so callers that do
+    not opt in see identical behaviour to before.
+    """
+    if max_per_platform is None or max_per_platform <= 0:
+        return list(snippets[:k])
+    counts: dict = {}
+    out: List["RetrievedSnippet"] = []
+    for s in snippets:
+        plat = s.source_platform
+        if counts.get(plat, 0) >= max_per_platform:
+            continue
+        out.append(s)
+        counts[plat] = counts.get(plat, 0) + 1
+        if len(out) >= k:
+            break
+    return out
+
+
 @dataclass(frozen=True)
 class RetrievedSnippet:
     """A single PII-scrubbed result from the local vector search."""
@@ -154,6 +182,7 @@ class LocalRAGRetriever:
         platforms: Optional[Iterable[SourcePlatform]] = None,
         min_score: float = 0.0,
         personalize: Optional[bool] = None,
+        max_per_platform: Optional[int] = None,
     ) -> List[RetrievedSnippet]:
         """Embed ``query``, run ANN search, re-rank by personalization signals.
 
@@ -195,7 +224,8 @@ class LocalRAGRetriever:
             return []
         if not do_personalize:
             self._bump_telemetry(queries_total=1)
-            return [self._snippet_for(item, score, bonus=0.0) for item, score in hits]
+            snippets = [self._snippet_for(item, score, bonus=0.0) for item, score in hits]
+            return _apply_source_balance(snippets, k, max_per_platform)
         signals = {}
         signal_lookup_failed = False
         try:
@@ -227,10 +257,11 @@ class LocalRAGRetriever:
             queries_promoted_to_top=int(promoted),
             signal_lookups_failed=int(signal_lookup_failed),
         )
-        return [
+        rescored_snippets = [
             self._snippet_for(item, base_score, bonus=bonus)
-            for item, base_score, bonus in rescored[:k]
+            for item, base_score, bonus in rescored
         ]
+        return _apply_source_balance(rescored_snippets, k, max_per_platform)
 
     # ------------------------------------------------------------------
     # Internals
