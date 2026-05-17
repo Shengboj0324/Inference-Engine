@@ -38,6 +38,7 @@ from app.local.content_store import ContentStore
 from app.local.dedup_store import DedupStore
 from app.local.local_queue import LocalTaskQueue, QueuedJob
 from app.local.local_scheduler import LocalScheduler
+from app.local.multimodal_analyzer import LocalMultimodalAnalyzer
 from app.local.permissions import Permission, PermissionManager
 from app.local.sources_store import SourceConfig, SourcesStore
 
@@ -71,6 +72,9 @@ class IngestStats:
     cleanup_runs: int = 0
     items_purged: int = 0
     permission_denied: int = 0
+    multimodal_analyzed: int = 0
+    multimodal_low_confidence: int = 0
+    multimodal_unavailable: int = 0
     last_run_at: Optional[float] = None
     per_platform: dict = field(default_factory=dict)
 
@@ -84,6 +88,9 @@ class IngestStats:
             "cleanup_runs": self.cleanup_runs,
             "items_purged": self.items_purged,
             "permission_denied": self.permission_denied,
+            "multimodal_analyzed": self.multimodal_analyzed,
+            "multimodal_low_confidence": self.multimodal_low_confidence,
+            "multimodal_unavailable": self.multimodal_unavailable,
             "last_run_at": self.last_run_at,
             "per_platform": dict(self.per_platform),
         }
@@ -101,6 +108,7 @@ class IngestRuntime:
         scheduler: LocalScheduler,
         permissions: Optional[PermissionManager] = None,
         dedup: Optional[DedupStore] = None,
+        analyzer: Optional[LocalMultimodalAnalyzer] = None,
         connector_factory: Optional[ConnectorFactory] = None,
         fetch_interval_minutes: int = _DEFAULT_FETCH_INTERVAL_MIN,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
@@ -115,6 +123,7 @@ class IngestRuntime:
         self._scheduler = scheduler
         self._permissions = permissions
         self._dedup = dedup
+        self._analyzer = analyzer
         self._factory = connector_factory or _default_connector_factory
         self._fetch_interval = max(1, int(fetch_interval_minutes))
         self._retention_days = max(1, int(retention_days))
@@ -282,6 +291,11 @@ class IngestRuntime:
                 ):
                     dup_count += 1
                     continue
+                # Multimodal analysis must run *before* upsert so the
+                # generated caption / transcript and metadata blob are
+                # persisted in the same SQL round-trip.  Failures here
+                # are non-fatal — they only suppress enrichment.
+                await self._apply_multimodal(item)
                 if self._content.upsert(item):
                     new_count += 1
                     if self._dedup is not None:
@@ -311,10 +325,43 @@ class IngestRuntime:
     def snapshot_stats(self) -> dict:
         return self.stats.snapshot()
 
+    @property
+    def analyzer(self) -> Optional[LocalMultimodalAnalyzer]:
+        """Expose the multimodal analyzer for the control API (read-only)."""
+        return self._analyzer
+
     def _network_allowed(self) -> bool:
         if self._permissions is None:
             return True
         return self._permissions.is_allowed(Permission.NETWORK_FETCH)
+
+    async def _apply_multimodal(self, item) -> None:
+        """Run multimodal analysis on ``item`` in-place; never raises."""
+        if self._analyzer is None or not self._analyzer.is_available():
+            return
+        try:
+            result = await self._analyzer.analyze(item)
+        except Exception:  # noqa: BLE001 - enrichment must never break ingest
+            logger.exception("multimodal analyze failed for item %s", item.source_id)
+            self.stats.multimodal_unavailable += 1
+            return
+        if result.status == "unavailable":
+            self.stats.multimodal_unavailable += 1
+        if result.status == "ok":
+            self.stats.multimodal_analyzed += 1
+        if result.low_confidence:
+            self.stats.multimodal_low_confidence += 1
+        # Persist the structured result in metadata so the UI / RAG layer
+        # can render a warning badge and surface the original transcript.
+        new_meta = dict(item.metadata)
+        new_meta["multimodal"] = result.to_metadata()
+        item.metadata = new_meta
+        # Fold caption / transcript into raw_text so the existing text
+        # embedding picks them up without a separate index.
+        addition = result.caption or result.transcript
+        if addition:
+            base = (item.raw_text or "").rstrip()
+            item.raw_text = f"{base}\n\n{addition}" if base else addition
 
     def _build_connector(self, platform: SourcePlatform, cfg: SourceConfig):
         config = ConnectorConfig(
@@ -364,6 +411,7 @@ def get_ingest_runtime() -> IngestRuntime:
                 scheduler=LocalScheduler(),
                 permissions=get_permission_manager(),
                 dedup=DedupStore(),
+                analyzer=LocalMultimodalAnalyzer(),
             )
         return _global_runtime
 

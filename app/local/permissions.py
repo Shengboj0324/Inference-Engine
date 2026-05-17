@@ -44,6 +44,7 @@ class Permission(str, Enum):
     WRITE_FILES = "write_files"
     NETWORK_FETCH = "network_fetch"
     EXECUTE_SHELL = "execute_shell"
+    USE_LOCAL_MODELS = "use_local_models"
 
 
 class Decision(str, Enum):

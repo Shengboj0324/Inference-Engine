@@ -16,6 +16,7 @@ from app.api.routes import (
     ingest,
     keys,
     llm,
+    multimodal,
     permissions,
     search,
     signals,
@@ -137,6 +138,7 @@ app.include_router(keys.router, prefix="/api/v1/keys", tags=["Keys"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
 app.include_router(permissions.router, prefix="/api/v1/permissions", tags=["Permissions"])
 app.include_router(ingest.router, prefix="/api/v1/ingest", tags=["Ingest"])
+app.include_router(multimodal.router, prefix="/api/v1/multimodal", tags=["Multimodal"])
 
 
 @app.get("/")
