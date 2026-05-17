@@ -9,7 +9,17 @@ from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 import time
 
-from app.api.routes import auth, digest, llm, search, signals, sources
+from app.api.routes import (
+    auth,
+    chat,
+    digest,
+    keys,
+    llm,
+    permissions,
+    search,
+    signals,
+    sources,
+)
 from app.core.config import settings
 from app.core.errors import BaseAppException
 from app.core.health import HealthChecker
@@ -122,6 +132,9 @@ app.include_router(sources.router, prefix="/api/v1/sources", tags=["Sources"])
 app.include_router(digest.router, prefix="/api/v1/digest", tags=["Digest"])
 app.include_router(search.router, prefix="/api/v1/search", tags=["Search"])
 app.include_router(llm.router, prefix="/api/llm", tags=["LLM"])
+app.include_router(keys.router, prefix="/api/v1/keys", tags=["Keys"])
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
+app.include_router(permissions.router, prefix="/api/v1/permissions", tags=["Permissions"])
 
 
 @app.get("/")

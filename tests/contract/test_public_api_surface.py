@@ -21,7 +21,7 @@ import pytest
 from app.api.main import app
 
 
-CONTRACT_VERSION = "phase0.0"
+CONTRACT_VERSION = "phase2.0"
 
 
 # Methods that are framework-generated for every GET route — excluded from the
@@ -47,7 +47,7 @@ def _collect_surface() -> FrozenSet[Tuple[str, str, Tuple[str, ...]]]:
 
 
 # ----------------------------------------------------------------------------
-# FROZEN SURFACE — phase0.0
+# FROZEN SURFACE — phase2.0
 # ----------------------------------------------------------------------------
 # Each entry is (route_class, path, sorted-methods-tuple).
 FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
@@ -97,6 +97,25 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     ("APIRoute", "/health/ready", ("GET",)),
     ("APIRoute", "/health/live", ("GET",)),
     ("APIRoute", "/api/v1/health", ("GET",)),
+    # Phase 2 — Local key vault (desktop mode only; 404 in server mode)
+    ("APIRoute", "/api/v1/keys", ("GET",)),
+    ("APIRoute", "/api/v1/keys/{provider}", ("PUT",)),
+    ("APIRoute", "/api/v1/keys/{provider}", ("DELETE",)),
+    ("APIRoute", "/api/v1/keys/{provider}/test", ("POST",)),
+    # Phase 2 — Chat sessions + SSE streaming (desktop mode only)
+    ("APIRoute", "/api/v1/chat/sessions", ("GET",)),
+    ("APIRoute", "/api/v1/chat/sessions", ("POST",)),
+    ("APIRoute", "/api/v1/chat/sessions/{session_id}", ("GET",)),
+    ("APIRoute", "/api/v1/chat/sessions/{session_id}", ("PATCH",)),
+    ("APIRoute", "/api/v1/chat/sessions/{session_id}", ("DELETE",)),
+    ("APIRoute", "/api/v1/chat/sessions/{session_id}/messages", ("POST",)),
+    ("APIRoute", "/api/v1/chat/sessions/{session_id}/stream", ("POST",)),
+    # Phase 2 — Local permissions (desktop mode only)
+    ("APIRoute", "/api/v1/permissions", ("GET",)),
+    ("APIRoute", "/api/v1/permissions/{name}", ("GET",)),
+    ("APIRoute", "/api/v1/permissions/{name}/grant", ("POST",)),
+    ("APIRoute", "/api/v1/permissions/{name}/revoke", ("POST",)),
+    ("APIRoute", "/api/v1/permissions/{name}/deny", ("POST",)),
 })
 
 
