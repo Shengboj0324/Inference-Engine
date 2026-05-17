@@ -24,6 +24,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import require_desktop_mode
+from app.local.content_store import ContentStore, get_content_store
+from app.local.embedding_provider import (
+    EmbeddingUnavailable,
+    LocalEmbeddingProvider,
+)
 from app.local.rag_retriever import (
     LocalRAGRetriever,
     RetrievedSnippet,
@@ -75,6 +80,25 @@ class RAGSearchResponse(BaseModel):
     snippets: List[RAGSnippet]
 
 
+class RAGReindexRequest(BaseModel):
+    max_items: int = Field(
+        500, ge=1, le=5_000,
+        description="Upper bound on the number of items embedded in this call. "
+                    "Caller polls again to drain the remainder.",
+    )
+    batch_size: int = Field(
+        16, ge=1, le=128,
+        description="Number of texts sent per embedding API call.",
+    )
+
+
+class RAGReindexResponse(BaseModel):
+    scanned: int = Field(..., description="Items pulled from the store for this run.")
+    embedded: int = Field(..., description="Items whose embedding was successfully persisted.")
+    errors: int = Field(..., description="Items that failed embedding or persistence.")
+    remaining: int = Field(..., description="Items still missing an embedding after this run.")
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -82,6 +106,21 @@ class RAGSearchResponse(BaseModel):
 
 def _retriever() -> LocalRAGRetriever:
     return get_rag_retriever()
+
+
+def _embedder() -> LocalEmbeddingProvider:
+    """Resolve the embedder used by the backfill route.
+
+    Delegates to the same provider the retriever already holds so the
+    backfill respects the same BYOK / permission / scrubbing contract as
+    the chat-time path.  Exposed as a module-level seam so tests can
+    inject a fake without monkey-patching :class:`LocalRAGRetriever`.
+    """
+    return _retriever()._embedder  # type: ignore[attr-defined]
+
+
+def _store() -> ContentStore:
+    return get_content_store()
 
 
 @router.get("/status", response_model=RAGStatusResponse)
@@ -113,4 +152,68 @@ async def search(request: RAGSearchRequest) -> RAGSearchResponse:
     return RAGSearchResponse(
         query=request.query,
         snippets=[RAGSnippet(**s.to_dict()) for s in snippets],
+    )
+
+
+@router.post("/reindex", response_model=RAGReindexResponse)
+async def reindex(request: RAGReindexRequest) -> RAGReindexResponse:
+    """Embed up to ``max_items`` rows that currently lack an embedding.
+
+    Returns 409 when the RAG layer is not currently available — operator
+    actions must fail loudly so the UI can surface a "configure key /
+    grant permission" CTA instead of silently doing nothing.
+    """
+    retriever = _retriever()
+    if not retriever.is_available():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="RAG layer unavailable: configure an embedding key and "
+                   "grant USE_LLM_KEY before running reindex.",
+        )
+    store = _store()
+    embedder = _embedder()
+    pending = store.list_missing_embeddings(limit=request.max_items)
+    scanned = len(pending)
+    embedded = 0
+    errors = 0
+    for offset in range(0, scanned, request.batch_size):
+        chunk = pending[offset: offset + request.batch_size]
+        # Filter out rows with no usable text — they cannot be embedded.
+        usable = [(cid, ((title or "") + "\n" + (raw or "")).strip())
+                  for cid, title, raw in chunk]
+        usable = [(cid, text) for cid, text in usable if text]
+        if not usable:
+            continue
+        try:
+            vectors = await embedder.embed_batch([t for _, t in usable])
+        except EmbeddingUnavailable as exc:
+            # Permission revoked mid-run: abort cleanly with what we got.
+            logger.warning("reindex aborted: %s", exc)
+            errors += len(usable)
+            break
+        except Exception:  # noqa: BLE001 - per-batch isolation
+            logger.exception("reindex batch failed (offset=%d)", offset)
+            errors += len(usable)
+            continue
+        if len(vectors) != len(usable):
+            logger.warning(
+                "reindex batch returned %d vectors for %d inputs; skipping",
+                len(vectors), len(usable),
+            )
+            errors += len(usable)
+            continue
+        for (cid, _text), vec in zip(usable, vectors):
+            try:
+                if store.set_embedding(cid, vec):
+                    embedded += 1
+                else:
+                    errors += 1
+            except Exception:  # noqa: BLE001 - per-item isolation
+                logger.exception("reindex persist failed for %s", cid)
+                errors += 1
+    return RAGReindexResponse(
+        scanned=scanned,
+        embedded=embedded,
+        errors=errors,
+        remaining=store.count_missing_embedding(),
     )

@@ -143,6 +143,49 @@ class ContentStore:
             ).fetchone()
         return int(row["n"])
 
+    def count_missing_embedding(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM content_items WHERE embedding IS NULL"
+            ).fetchone()
+        return int(row["n"])
+
+    def list_missing_embeddings(
+        self, *, limit: int = 500,
+    ) -> List[Tuple[str, str, str]]:
+        """Return ``(id, title, raw_text)`` triples for rows lacking an embedding.
+
+        Lightweight projection — full row hydration would be wasteful
+        when the caller only needs the input text for re-embedding.
+        Ordered by ``published_at DESC`` so recent items embed first
+        when a backfill run is bounded by ``limit``.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, title, raw_text FROM content_items "
+                "WHERE embedding IS NULL "
+                "ORDER BY published_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [(r["id"], r["title"] or "", r["raw_text"] or "") for r in rows]
+
+    def set_embedding(self, content_id: str, vector: Sequence[float]) -> bool:
+        """Persist ``vector`` on the row keyed by ``content_id``.
+
+        Returns ``True`` when a row was updated, ``False`` when the id is
+        unknown or ``vector`` is empty (no-op).  Used by the RAG backfill
+        path so historical items become searchable without re-ingestion.
+        """
+        if not vector:
+            return False
+        blob = encode_vector(vector)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE content_items SET embedding = ? WHERE id = ?",
+                (blob, str(content_id)),
+            )
+            return cur.rowcount > 0
+
     def search_similar(
         self,
         query_embedding: Sequence[float],

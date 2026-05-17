@@ -132,6 +132,7 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     # Phase 5 — Local RAG control routes (desktop mode only)
     ("APIRoute", "/api/v1/rag/status", ("GET",)),
     ("APIRoute", "/api/v1/rag/search", ("POST",)),
+    ("APIRoute", "/api/v1/rag/reindex", ("POST",)),
 })
 
 
