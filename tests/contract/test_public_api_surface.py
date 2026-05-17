@@ -21,7 +21,7 @@ import pytest
 from app.api.main import app
 
 
-CONTRACT_VERSION = "phase4.0"
+from app.api.main import API_CONTRACT_VERSION as CONTRACT_VERSION  # noqa: E402
 
 
 # Methods that are framework-generated for every GET route — excluded from the
@@ -126,6 +126,9 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     # Phase 4 — Local multimodal analysis (desktop mode only)
     ("APIRoute", "/api/v1/multimodal/status", ("GET",)),
     ("APIRoute", "/api/v1/multimodal/probe", ("POST",)),
+    # Phase 4.1 — Tauri shell handshake (desktop mode only)
+    ("APIRoute", "/api/v1/desktop/manifest", ("GET",)),
+    ("APIRoute", "/api/v1/desktop/ready", ("GET",)),
 })
 
 

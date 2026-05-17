@@ -12,6 +12,7 @@ import time
 from app.api.routes import (
     auth,
     chat,
+    desktop,
     digest,
     ingest,
     keys,
@@ -29,6 +30,14 @@ from app.core.monitoring import MetricsCollector
 from app.monitoring.health import HealthMonitor
 
 logger = logging.getLogger(__name__)
+
+
+#: Public API contract version.  Bumped whenever a route is added,
+#: removed, or changes method/path.  The contract test
+#: (``tests/contract/test_public_api_surface.py``) imports this constant
+#: and the desktop shell reads it from ``/api/v1/desktop/manifest`` so
+#: the UI can refuse to load against an incompatible sidecar.
+API_CONTRACT_VERSION = "phase4.1"
 
 
 async def _probe_redis() -> None:
@@ -105,9 +114,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Desktop deployment mode — skipping external Redis probe.")
 
+    # 3. Flip the desktop readiness flag once all startup checks have
+    #    passed.  ``/api/v1/desktop/ready`` returns 503 until this point
+    #    so the Tauri shell can poll cleanly during boot.
+    desktop.mark_ready()
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────────
+    desktop.mark_not_ready()
     logger.info("Shutting down Social Media Radar API...")
 
 
@@ -139,6 +154,7 @@ app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
 app.include_router(permissions.router, prefix="/api/v1/permissions", tags=["Permissions"])
 app.include_router(ingest.router, prefix="/api/v1/ingest", tags=["Ingest"])
 app.include_router(multimodal.router, prefix="/api/v1/multimodal", tags=["Multimodal"])
+app.include_router(desktop.router, prefix="/api/v1/desktop", tags=["Desktop"])
 
 
 @app.get("/")
@@ -212,6 +228,52 @@ async def app_exception_handler(request: Request, exc: BaseAppException):
         status_code=500 if exc.severity.value == "critical" else 400,
         content=exc.to_dict(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Loopback token middleware (Tauri shell handshake)
+# ---------------------------------------------------------------------------
+#
+# Opt-in: only enforced when ``SMR_SIDECAR_TOKEN`` is exported by the
+# launcher *and* deployment_mode='desktop'.  Tests never set the env
+# var, so they bypass enforcement completely.  The shell reads the
+# token from ``sidecar.json`` (mode 0600 in the user-data dir) and
+# sends it as ``X-Sidecar-Token`` on every API call.
+
+import os as _os  # local alias — avoids shadowing the module-level import
+
+#: Paths exempt from the token requirement.  The shell must be able to
+#: hit these before it has a token (bootstrap) and operator probes
+#: should keep working without the env var.
+_TOKEN_EXEMPT_PATHS = frozenset({
+    "/",
+    "/health",
+    "/health/ready",
+    "/health/live",
+    "/api/v1/health",
+    "/api/v1/desktop/manifest",
+    "/api/v1/desktop/ready",
+})
+
+
+@app.middleware("http")
+async def enforce_loopback_token(request: Request, call_next):
+    """Require ``X-Sidecar-Token`` when running under the launcher.
+
+    Returns 401 JSON when the env-var token is set, the request is not
+    on an exempt path, and the header is missing or wrong.  Header
+    comparison is constant-time to neutralise timing oracles.
+    """
+    expected = _os.environ.get("SMR_SIDECAR_TOKEN", "")
+    if expected and settings.is_desktop and request.url.path not in _TOKEN_EXEMPT_PATHS:
+        provided = request.headers.get("x-sidecar-token", "")
+        import hmac
+        if not hmac.compare_digest(expected, provided):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "missing or invalid X-Sidecar-Token header"},
+            )
+    return await call_next(request)
 
 
 # Middleware for request tracking
