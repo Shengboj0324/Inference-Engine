@@ -19,6 +19,7 @@ from app.api.routes import (
     llm,
     multimodal,
     permissions,
+    rag,
     search,
     signals,
     sources,
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 #: (``tests/contract/test_public_api_surface.py``) imports this constant
 #: and the desktop shell reads it from ``/api/v1/desktop/manifest`` so
 #: the UI can refuse to load against an incompatible sidecar.
-API_CONTRACT_VERSION = "phase4.1"
+API_CONTRACT_VERSION = "phase5.0"
 
 
 async def _probe_redis() -> None:
@@ -154,6 +155,7 @@ app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
 app.include_router(permissions.router, prefix="/api/v1/permissions", tags=["Permissions"])
 app.include_router(ingest.router, prefix="/api/v1/ingest", tags=["Ingest"])
 app.include_router(multimodal.router, prefix="/api/v1/multimodal", tags=["Multimodal"])
+app.include_router(rag.router, prefix="/api/v1/rag", tags=["RAG"])
 app.include_router(desktop.router, prefix="/api/v1/desktop", tags=["Desktop"])
 
 

@@ -56,8 +56,8 @@ def _detect_capabilities() -> Dict[str, bool]:
         "chat": _module_importable("app.local.chat_store"),
         "ingestion": _module_importable("app.local.ingest_runtime"),
         "multimodal": _module_importable("app.local.multimodal_analyzer"),
-        # Phase 5 — flipped to True once the local RAG layer lands.
-        "rag": False,
+        # Phase 5 — local RAG layer is wired into ContentStore + chat.
+        "rag": _module_importable("app.local.rag_retriever"),
     }
 
 

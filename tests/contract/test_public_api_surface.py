@@ -129,6 +129,9 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     # Phase 4.1 — Tauri shell handshake (desktop mode only)
     ("APIRoute", "/api/v1/desktop/manifest", ("GET",)),
     ("APIRoute", "/api/v1/desktop/ready", ("GET",)),
+    # Phase 5 — Local RAG control routes (desktop mode only)
+    ("APIRoute", "/api/v1/rag/status", ("GET",)),
+    ("APIRoute", "/api/v1/rag/search", ("POST",)),
 })
 
 

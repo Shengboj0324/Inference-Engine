@@ -22,6 +22,11 @@ from pydantic import BaseModel, Field
 from app.api.deps import require_desktop_mode
 from app.local import chat_streamer
 from app.local.chat_store import ChatMessage, ChatSession, get_chat_store
+from app.local.rag_retriever import (
+    LocalRAGRetriever,
+    RetrievedSnippet,
+    get_rag_retriever,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +86,31 @@ class MessageCreateRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=100_000)
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(None, ge=1, le=32_000)
+    use_rag: bool = Field(
+        False,
+        description=(
+            "When true, the sidecar retrieves the top-k most similar items "
+            "from the local ContentStore and prepends them as context to the "
+            "LLM call.  Defaults to false so existing clients are unaffected."
+        ),
+    )
+    rag_k: int = Field(6, ge=1, le=20)
+
+
+class RetrievedSnippetSummary(BaseModel):
+    content_id: str
+    title: str
+    source_url: str
+    source_platform: str
+    published_at: float
+    score: float
 
 
 class ReplyResponse(BaseModel):
     user_message: MessageResponse
     assistant_message: MessageResponse
     source: str
+    retrieved: List[RetrievedSnippetSummary] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +173,51 @@ def _stream_messages_for(session_id: str) -> List[chat_streamer.StreamMessage]:
             for m in history]
 
 
+def _format_rag_context(snippets: List[RetrievedSnippet]) -> str:
+    """Render retrieved snippets as a compact, citation-tagged prompt block."""
+    lines = [
+        "Context from the user's local feed (use only when relevant; cite as [#n]):",
+    ]
+    for idx, s in enumerate(snippets, start=1):
+        lines.append(f"[#{idx}] ({s.source_platform}) {s.title} — {s.source_url}")
+        if s.text:
+            lines.append(s.text)
+    return "\n".join(lines)
+
+
+async def _augment_with_rag(
+    request: MessageCreateRequest,
+    base_messages: List[chat_streamer.StreamMessage],
+    retriever: Optional[LocalRAGRetriever] = None,
+) -> tuple[List[chat_streamer.StreamMessage], List[RetrievedSnippet]]:
+    """Return (possibly-augmented messages, snippets used).  Soft-fails to ``base_messages``, ``[]``."""
+    if not request.use_rag:
+        return base_messages, []
+    r = retriever or get_rag_retriever()
+    try:
+        snippets = await r.retrieve(request.content, k=request.rag_k)
+    except Exception:  # noqa: BLE001 - retrieval must never break chat
+        logger.exception("rag retrieval failed; falling back to plain chat")
+        return base_messages, []
+    if not snippets:
+        return base_messages, []
+    context = _format_rag_context(snippets)
+    augmented = [chat_streamer.StreamMessage(role="system", content=context),
+                 *base_messages]
+    return augmented, snippets
+
+
+def _snippet_summaries(snippets: List[RetrievedSnippet]) -> List[RetrievedSnippetSummary]:
+    return [
+        RetrievedSnippetSummary(
+            content_id=s.content_id, title=s.title, source_url=s.source_url,
+            source_platform=s.source_platform, published_at=s.published_at,
+            score=s.score,
+        )
+        for s in snippets
+    ]
+
+
 @router.post("/sessions/{session_id}/messages", response_model=ReplyResponse,
              status_code=201)
 async def post_message(session_id: str, request: MessageCreateRequest) -> ReplyResponse:
@@ -158,9 +227,11 @@ async def post_message(session_id: str, request: MessageCreateRequest) -> ReplyR
                             detail="session not found")
     user_msg = store.append_message(session_id, role="user", content=request.content)
     source = chat_streamer.pick_default_source()
+    base = _stream_messages_for(session_id)
+    messages, snippets = await _augment_with_rag(request, base)
     parts: List[str] = []
     async for chunk in source.stream(
-        _stream_messages_for(session_id),
+        messages,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
     ):
@@ -173,6 +244,7 @@ async def post_message(session_id: str, request: MessageCreateRequest) -> ReplyR
         user_message=MessageResponse.from_orm_like(user_msg),
         assistant_message=MessageResponse.from_orm_like(assistant_msg),
         source=source.name,
+        retrieved=_snippet_summaries(snippets),
     )
 
 
@@ -194,13 +266,18 @@ async def stream_message(session_id: str, request: MessageCreateRequest) -> Stre
                             detail="session not found")
     user_msg = store.append_message(session_id, role="user", content=request.content)
     source = chat_streamer.pick_default_source()
+    base = _stream_messages_for(session_id)
+    messages, snippets = await _augment_with_rag(request, base)
 
     async def event_stream():
         yield _sse("user_message", MessageResponse.from_orm_like(user_msg).model_dump())
+        if snippets:
+            yield _sse("retrieved",
+                       {"snippets": [s.model_dump() for s in _snippet_summaries(snippets)]})
         assembled: List[str] = []
         try:
             async for chunk in source.stream(
-                _stream_messages_for(session_id),
+                messages,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
             ):

@@ -36,6 +36,7 @@ from app.connectors.base import ConnectorConfig
 from app.core.models import SourcePlatform
 from app.local.content_store import ContentStore
 from app.local.dedup_store import DedupStore
+from app.local.embedding_provider import EmbeddingUnavailable, LocalEmbeddingProvider
 from app.local.local_queue import LocalTaskQueue, QueuedJob
 from app.local.local_scheduler import LocalScheduler
 from app.local.multimodal_analyzer import LocalMultimodalAnalyzer
@@ -75,6 +76,9 @@ class IngestStats:
     multimodal_analyzed: int = 0
     multimodal_low_confidence: int = 0
     multimodal_unavailable: int = 0
+    items_embedded: int = 0
+    embedding_errors: int = 0
+    embedding_unavailable: int = 0
     last_run_at: Optional[float] = None
     per_platform: dict = field(default_factory=dict)
 
@@ -91,6 +95,9 @@ class IngestStats:
             "multimodal_analyzed": self.multimodal_analyzed,
             "multimodal_low_confidence": self.multimodal_low_confidence,
             "multimodal_unavailable": self.multimodal_unavailable,
+            "items_embedded": self.items_embedded,
+            "embedding_errors": self.embedding_errors,
+            "embedding_unavailable": self.embedding_unavailable,
             "last_run_at": self.last_run_at,
             "per_platform": dict(self.per_platform),
         }
@@ -109,6 +116,7 @@ class IngestRuntime:
         permissions: Optional[PermissionManager] = None,
         dedup: Optional[DedupStore] = None,
         analyzer: Optional[LocalMultimodalAnalyzer] = None,
+        embedder: Optional[LocalEmbeddingProvider] = None,
         connector_factory: Optional[ConnectorFactory] = None,
         fetch_interval_minutes: int = _DEFAULT_FETCH_INTERVAL_MIN,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
@@ -124,6 +132,7 @@ class IngestRuntime:
         self._permissions = permissions
         self._dedup = dedup
         self._analyzer = analyzer
+        self._embedder = embedder
         self._factory = connector_factory or _default_connector_factory
         self._fetch_interval = max(1, int(fetch_interval_minutes))
         self._retention_days = max(1, int(retention_days))
@@ -296,6 +305,11 @@ class IngestRuntime:
                 # persisted in the same SQL round-trip.  Failures here
                 # are non-fatal — they only suppress enrichment.
                 await self._apply_multimodal(item)
+                # Embedding runs after multimodal so the caption /
+                # transcript folded into raw_text is included in the
+                # vector; soft-fails to a null embedding on missing
+                # key / denied permission / provider failure.
+                await self._apply_embedding(item)
                 if self._content.upsert(item):
                     new_count += 1
                     if self._dedup is not None:
@@ -334,6 +348,26 @@ class IngestRuntime:
         if self._permissions is None:
             return True
         return self._permissions.is_allowed(Permission.NETWORK_FETCH)
+
+    async def _apply_embedding(self, item) -> None:
+        """Compute the text embedding for ``item`` in-place; never raises."""
+        if self._embedder is None or item.embedding:
+            return
+        source_text = ((item.title or "") + "\n" + (item.raw_text or "")).strip()
+        if not source_text:
+            return
+        try:
+            vector = await self._embedder.embed_text(source_text)
+        except EmbeddingUnavailable:
+            self.stats.embedding_unavailable += 1
+            return
+        except Exception:  # noqa: BLE001 - embedding must never break ingest
+            logger.exception("embedding failed for item %s", item.source_id)
+            self.stats.embedding_errors += 1
+            return
+        if vector:
+            item.embedding = list(vector)
+            self.stats.items_embedded += 1
 
     async def _apply_multimodal(self, item) -> None:
         """Run multimodal analysis on ``item`` in-place; never raises."""
@@ -404,14 +438,16 @@ def get_ingest_runtime() -> IngestRuntime:
             from app.local.content_store import get_content_store  # noqa: PLC0415
             from app.local.permissions import get_permission_manager  # noqa: PLC0415
             from app.local.sources_store import get_sources_store  # noqa: PLC0415
+            perms = get_permission_manager()
             _global_runtime = IngestRuntime(
                 sources=get_sources_store(),
                 content=get_content_store(),
                 queue=LocalTaskQueue(),
                 scheduler=LocalScheduler(),
-                permissions=get_permission_manager(),
+                permissions=perms,
                 dedup=DedupStore(),
                 analyzer=LocalMultimodalAnalyzer(),
+                embedder=LocalEmbeddingProvider(permissions=perms),
             )
         return _global_runtime
 

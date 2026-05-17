@@ -19,11 +19,11 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional, Sequence, Tuple
 from uuid import UUID
 
 from app.core.models import ContentItem, MediaType, SourcePlatform
-from app.local.sqlite_store import decode_vector, encode_vector
+from app.local.sqlite_store import cosine_top_k, decode_vector, encode_vector, load_sqlite_vec
 from app.local.user_data_dir import get_user_data_dir
 
 
@@ -83,6 +83,11 @@ class ContentStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.row_factory = sqlite3.Row
+        # Best-effort load of sqlite-vec; pure-Python cosine is used either
+        # way today, but loading keeps the door open for a future ANN swap
+        # without a data migration (the embedding column is already the
+        # packed-float32 BLOB layout sqlite-vec expects).
+        self._vec_available = load_sqlite_vec(self._conn)
         self.ensure_schema()
 
     def ensure_schema(self) -> None:
@@ -130,6 +135,71 @@ class ContentStore:
                 "SELECT COUNT(*) AS n FROM content_items"
             ).fetchone()
         return int(row["n"])
+
+    def count_with_embedding(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM content_items WHERE embedding IS NOT NULL"
+            ).fetchone()
+        return int(row["n"])
+
+    def search_similar(
+        self,
+        query_embedding: Sequence[float],
+        *,
+        k: int = 8,
+        since: Optional[datetime] = None,
+        platforms: Optional[Iterable[SourcePlatform]] = None,
+        min_score: float = 0.0,
+    ) -> List[Tuple[ContentItem, float]]:
+        """Return up to ``k`` items most similar to ``query_embedding``.
+
+        Pure-Python cosine over rows whose ``embedding`` is non-null.
+        Rows with mismatched embedding dimensions are silently skipped so
+        a model swap mid-life does not poison the search path.
+        """
+        if not query_embedding:
+            return []
+        sql = "SELECT * FROM content_items WHERE embedding IS NOT NULL"
+        params: list = []
+        if since is not None:
+            sql += " AND published_at >= ?"
+            params.append(_to_epoch(since))
+        platform_values = (
+            [p.value for p in platforms] if platforms is not None else None
+        )
+        if platform_values:
+            placeholders = ",".join("?" * len(platform_values))
+            sql += f" AND source_platform IN ({placeholders})"
+            params.extend(platform_values)
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        if not rows:
+            return []
+        query_len = len(query_embedding)
+        candidates: List[Tuple[str, List[float]]] = []
+        row_by_id: dict = {}
+        for row in rows:
+            try:
+                vec = decode_vector(row["embedding"])
+            except Exception:
+                continue
+            if len(vec) != query_len:
+                continue
+            candidates.append((row["id"], vec))
+            row_by_id[row["id"]] = row
+        if not candidates:
+            return []
+        ranked = cosine_top_k(list(query_embedding), candidates, k=max(1, int(k)))
+        results: List[Tuple[ContentItem, float]] = []
+        for cand_id, score in ranked:
+            if score < min_score:
+                continue
+            row = row_by_id.get(cand_id)
+            if row is None:
+                continue
+            results.append((self._row_to_item(row), float(score)))
+        return results
 
     def delete_older_than(self, cutoff: datetime) -> int:
         with self._lock:
