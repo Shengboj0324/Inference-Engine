@@ -131,8 +131,13 @@ class TestContractIncludesPhase2:
             CONTRACT_VERSION,
         )
 
-        assert CONTRACT_VERSION == "phase2.0"
-        # Spot-check one route from each new router.
+        # Phase 2 contract stays pinned, even after later contract bumps:
+        # the version stamp must advance forward (phase2.0, phase3.0, ...)
+        # and every Phase 2 route must still be present in FROZEN_ROUTES.
+        assert CONTRACT_VERSION.startswith("phase")
+        major = int(CONTRACT_VERSION.removeprefix("phase").split(".")[0])
+        assert major >= 2, f"contract regressed below phase2: {CONTRACT_VERSION!r}"
+        # Spot-check one route from each Phase 2 router.
         assert ("APIRoute", "/api/v1/keys", ("GET",)) in FROZEN_ROUTES
         assert (
             "APIRoute",

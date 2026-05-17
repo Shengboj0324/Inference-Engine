@@ -382,3 +382,27 @@
 {"event": "rollback", "artifact_id": "7c3951e0-14ef-4d44-a206-f203b3d5503b", "timestamp": "2026-05-17T03:48:11.992945+00:00", "notes": "", "previous_production_id": "2387142c-40bc-4da4-a059-3174b3d14d57"}
 {"event": "promote", "artifact_id": "49ef8ae4-b5fd-4471-8790-74854231b8f6", "timestamp": "2026-05-17T03:48:11.994031+00:00", "notes": ""}
 {"event": "promote", "artifact_id": "626d0390-f2b4-456e-ab8d-c4a6019a7c33", "timestamp": "2026-05-17T03:48:12.001242+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "25c8e1cf-1019-49d7-b1e3-a5f780e9c2e2", "timestamp": "2026-05-17T04:01:13.133742+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "5eeb0c3d-59e6-42a6-bf9f-8a2d41a704f8", "timestamp": "2026-05-17T04:01:13.135164+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "05b1df2e-87f4-441e-995c-77b814348324", "timestamp": "2026-05-17T04:01:13.135372+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "cb5cd528-d683-470a-98ed-2d29fb0874c3", "timestamp": "2026-05-17T04:01:13.138470+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "d308d40a-7cf4-43f4-a3fd-b73a6fd56829", "timestamp": "2026-05-17T04:01:13.138685+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "cb5cd528-d683-470a-98ed-2d29fb0874c3", "timestamp": "2026-05-17T04:01:13.138897+00:00", "notes": "", "previous_production_id": "d308d40a-7cf4-43f4-a3fd-b73a6fd56829"}
+{"event": "promote", "artifact_id": "5a7b4a5a-4d63-4d6d-8c15-f8413d7034bb", "timestamp": "2026-05-17T04:01:13.140004+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "5372e749-7885-4c77-b472-c736c29502b3", "timestamp": "2026-05-17T04:01:13.147310+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "f37fe38b-9ba3-4e6f-b550-e34f04c4ab0d", "timestamp": "2026-05-17T04:15:43.688270+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "aba975a2-6ca6-4a7f-9ea3-c32b78d97a64", "timestamp": "2026-05-17T04:15:43.690612+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "b10a6b03-68df-427a-b71e-e9945bbbdba9", "timestamp": "2026-05-17T04:15:43.691013+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "6ffc7bea-787b-46cd-8cbf-50b914e1862d", "timestamp": "2026-05-17T04:15:43.693460+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "576e206d-095a-49c4-83c1-a8e1ab77085e", "timestamp": "2026-05-17T04:15:43.693669+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "6ffc7bea-787b-46cd-8cbf-50b914e1862d", "timestamp": "2026-05-17T04:15:43.693883+00:00", "notes": "", "previous_production_id": "576e206d-095a-49c4-83c1-a8e1ab77085e"}
+{"event": "promote", "artifact_id": "646cc0c9-cff6-4b99-af91-c4c252b5dbfb", "timestamp": "2026-05-17T04:15:43.695030+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "2dd935f1-b2ce-488f-811d-7f2aa8230cea", "timestamp": "2026-05-17T04:15:43.702168+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "94bfe1a5-39e3-4208-a438-be48205c8b0f", "timestamp": "2026-05-17T04:18:10.336757+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "3b00d6fe-7e77-4580-8eec-dbe1ef2ad71a", "timestamp": "2026-05-17T04:18:10.338295+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "b314d719-20e2-4387-bce1-935641c8a2c1", "timestamp": "2026-05-17T04:18:10.338507+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "21b2b7b5-e79d-4412-a455-52fb2f39fbdc", "timestamp": "2026-05-17T04:18:10.340717+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "34af7c63-184b-488c-a7ae-c61a1f15f67c", "timestamp": "2026-05-17T04:18:10.340921+00:00", "notes": ""}
+{"event": "rollback", "artifact_id": "21b2b7b5-e79d-4412-a455-52fb2f39fbdc", "timestamp": "2026-05-17T04:18:10.341130+00:00", "notes": "", "previous_production_id": "34af7c63-184b-488c-a7ae-c61a1f15f67c"}
+{"event": "promote", "artifact_id": "85deeb29-4cb2-4738-8e87-401bf7e795b9", "timestamp": "2026-05-17T04:18:10.342244+00:00", "notes": ""}
+{"event": "promote", "artifact_id": "c544b5ed-3f18-4fca-aae5-fd05bfc4eeb8", "timestamp": "2026-05-17T04:18:10.349110+00:00", "notes": ""}

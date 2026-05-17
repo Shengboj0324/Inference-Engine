@@ -21,7 +21,7 @@ import pytest
 from app.api.main import app
 
 
-CONTRACT_VERSION = "phase2.0"
+CONTRACT_VERSION = "phase3.0"
 
 
 # Methods that are framework-generated for every GET route — excluded from the
@@ -116,6 +116,13 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     ("APIRoute", "/api/v1/permissions/{name}/grant", ("POST",)),
     ("APIRoute", "/api/v1/permissions/{name}/revoke", ("POST",)),
     ("APIRoute", "/api/v1/permissions/{name}/deny", ("POST",)),
+    # Phase 3 — Local ingestion control (desktop mode only)
+    ("APIRoute", "/api/v1/ingest/status", ("GET",)),
+    ("APIRoute", "/api/v1/ingest/fetch", ("POST",)),
+    ("APIRoute", "/api/v1/ingest/cleanup", ("POST",)),
+    ("APIRoute", "/api/v1/ingest/sources", ("GET",)),
+    ("APIRoute", "/api/v1/ingest/sources/{platform}", ("PUT",)),
+    ("APIRoute", "/api/v1/ingest/sources/{platform}", ("DELETE",)),
 })
 
 
