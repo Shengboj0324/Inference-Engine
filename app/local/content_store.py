@@ -271,24 +271,95 @@ class ContentStore:
     ) -> List[Tuple[ContentItem, float]]:
         """Return up to ``k`` items most similar to ``query_embedding``.
 
-        Pure-Python cosine over rows whose ``embedding`` is non-null.
-        Rows with mismatched embedding dimensions are silently skipped so
-        a model swap mid-life does not poison the search path.
+        When the ``sqlite_vec`` extension is loaded, ranking is delegated
+        to ``vec_distance_cosine`` and pre-filters are applied in SQL so
+        only the top-``k`` rows are hydrated.  Without the extension the
+        method falls back to a pure-Python brute-force cosine over every
+        candidate \u2014 correct but O(N) per query.
+
+        Rows whose stored embedding has a dimension other than
+        ``query_embedding`` are silently skipped in both paths so a
+        mid-life model swap does not poison the search.
         """
         if not query_embedding:
             return []
-        sql = "SELECT * FROM content_items WHERE embedding IS NOT NULL"
         params: list = []
+        where = ["embedding IS NOT NULL"]
         if since is not None:
-            sql += " AND published_at >= ?"
+            where.append("published_at >= ?")
             params.append(_to_epoch(since))
         platform_values = (
             [p.value for p in platforms] if platforms is not None else None
         )
         if platform_values:
             placeholders = ",".join("?" * len(platform_values))
-            sql += f" AND source_platform IN ({placeholders})"
+            where.append(f"source_platform IN ({placeholders})")
             params.extend(platform_values)
+        where_sql = " AND ".join(where)
+        topk = max(1, int(k))
+        if self._vec_available:
+            return self._search_similar_vec(
+                query_embedding, where_sql, params, topk, min_score,
+            )
+        return self._search_similar_python(
+            query_embedding, where_sql, params, topk, min_score,
+        )
+
+    def _search_similar_vec(
+        self,
+        query_embedding: Sequence[float],
+        where_sql: str,
+        params: list,
+        k: int,
+        min_score: float,
+    ) -> List[Tuple[ContentItem, float]]:
+        """ANN path using ``sqlite_vec.vec_distance_cosine`` for ranking.
+
+        ``vec_distance_cosine`` returns a *distance* in ``[0, 2]`` (0 =
+        identical direction); similarity is ``1 - distance`` so callers
+        keep the prior cosine-similarity contract.  Dimension-mismatched
+        rows raise inside the extension, so we cast in a sub-select and
+        catch via SQLite's ``ORDER BY`` only over the survivors.
+        """
+        query_blob = encode_vector(query_embedding)
+        # Pre-filter dimension at the SQL level: ``length(blob)`` is the
+        # byte count, and our packed-float32 layout makes that exactly
+        # ``4 * dim``.  Avoids the extension throwing on stale rows
+        # produced by an older / different model.
+        expected_bytes = 4 * len(query_embedding)
+        sql = (
+            "SELECT *, vec_distance_cosine(embedding, ?) AS _vec_dist "
+            f"FROM content_items WHERE {where_sql} "
+            "AND length(embedding) = ? "
+            "ORDER BY _vec_dist ASC LIMIT ?"
+        )
+        full_params = (query_blob, *params, expected_bytes, k)
+        with self._lock:
+            try:
+                rows = self._conn.execute(sql, full_params).fetchall()
+            except Exception:  # noqa: BLE001 - extension surface is OS-specific
+                # Fall back to pure-Python on any extension fault so a
+                # single transient error never breaks the query path.
+                return self._search_similar_python(
+                    query_embedding, where_sql, params, k, min_score,
+                )
+        results: List[Tuple[ContentItem, float]] = []
+        for row in rows:
+            score = 1.0 - float(row["_vec_dist"])
+            if score < min_score:
+                continue
+            results.append((self._row_to_item(row), score))
+        return results
+
+    def _search_similar_python(
+        self,
+        query_embedding: Sequence[float],
+        where_sql: str,
+        params: list,
+        k: int,
+        min_score: float,
+    ) -> List[Tuple[ContentItem, float]]:
+        sql = f"SELECT * FROM content_items WHERE {where_sql}"
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         if not rows:
@@ -307,7 +378,7 @@ class ContentStore:
             row_by_id[row["id"]] = row
         if not candidates:
             return []
-        ranked = cosine_top_k(list(query_embedding), candidates, k=max(1, int(k)))
+        ranked = cosine_top_k(list(query_embedding), candidates, k=k)
         results: List[Tuple[ContentItem, float]] = []
         for cand_id, score in ranked:
             if score < min_score:

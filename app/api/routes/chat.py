@@ -104,6 +104,10 @@ class RetrievedSnippetSummary(BaseModel):
     source_platform: str
     published_at: float
     score: float
+    # Exposed so the UI can render a "boosted because you've engaged with
+    # similar items" badge.  Both default to 0 for clients that ignore them.
+    base_score: float = 0.0
+    personalization_bonus: float = 0.0
 
 
 class ReplyResponse(BaseModel):
@@ -212,10 +216,25 @@ def _snippet_summaries(snippets: List[RetrievedSnippet]) -> List[RetrievedSnippe
         RetrievedSnippetSummary(
             content_id=s.content_id, title=s.title, source_url=s.source_url,
             source_platform=s.source_platform, published_at=s.published_at,
-            score=s.score,
+            score=s.score, base_score=s.base_score,
+            personalization_bonus=s.personalization_bonus,
         )
         for s in snippets
     ]
+
+
+def _record_citations(snippets: List[RetrievedSnippet]) -> None:
+    """Hook personalization signals after a RAG-augmented reply.
+
+    Failures are swallowed inside :meth:`LocalRAGRetriever.record_citations`,
+    so this never propagates and never alters the chat response.
+    """
+    if not snippets:
+        return
+    try:
+        get_rag_retriever().record_citations(snippets)
+    except Exception:  # noqa: BLE001 - signals must never block chat
+        logger.exception("personalization citation hook failed")
 
 
 @router.post("/sessions/{session_id}/messages", response_model=ReplyResponse,
@@ -240,6 +259,7 @@ async def post_message(session_id: str, request: MessageCreateRequest) -> ReplyR
     assistant_msg = store.append_message(
         session_id, role="assistant", content=assistant_text
     )
+    _record_citations(snippets)
     return ReplyResponse(
         user_message=MessageResponse.from_orm_like(user_msg),
         assistant_message=MessageResponse.from_orm_like(assistant_msg),
@@ -298,6 +318,7 @@ async def stream_message(session_id: str, request: MessageCreateRequest) -> Stre
         )
         yield _sse("assistant_message",
                    MessageResponse.from_orm_like(assistant_msg).model_dump())
+        _record_citations(snippets)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

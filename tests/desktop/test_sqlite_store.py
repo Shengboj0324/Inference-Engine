@@ -91,12 +91,15 @@ class TestVectorHelpers:
         with pytest.raises(ValueError):
             ss.cosine_top_k([1.0, 0.0], [("bad", [1.0])], k=1)
 
-    def test_load_sqlite_vec_returns_false_when_extension_absent(self) -> None:
-        # The Phase 1 environment intentionally does not ship sqlite_vec —
-        # confirm the loader degrades gracefully instead of raising.
+    def test_load_sqlite_vec_returns_bool_and_never_raises(self) -> None:
+        # The loader must degrade gracefully whether or not ``sqlite_vec``
+        # is installed in the current environment.  Phase 6 ships the
+        # extension as an optional dependency, so we only assert the
+        # contract (bool return, no raise) rather than a specific value.
         import sqlite3
         conn = sqlite3.connect(":memory:")
         try:
-            assert ss.load_sqlite_vec(conn) is False
+            result = ss.load_sqlite_vec(conn)
+            assert isinstance(result, bool)
         finally:
             conn.close()

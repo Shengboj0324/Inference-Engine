@@ -133,6 +133,14 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     ("APIRoute", "/api/v1/rag/status", ("GET",)),
     ("APIRoute", "/api/v1/rag/search", ("POST",)),
     ("APIRoute", "/api/v1/rag/reindex", ("POST",)),
+    # Phase 6 — Personalization + background reindex (desktop mode only)
+    ("APIRoute", "/api/v1/rag/feedback", ("POST",)),
+    ("APIRoute", "/api/v1/rag/signals", ("GET",)),
+    ("APIRoute", "/api/v1/rag/signals", ("DELETE",)),
+    ("APIRoute", "/api/v1/rag/reindex/jobs", ("POST",)),
+    ("APIRoute", "/api/v1/rag/reindex/jobs", ("GET",)),
+    ("APIRoute", "/api/v1/rag/reindex/jobs/{job_id}", ("GET",)),
+    ("APIRoute", "/api/v1/rag/reindex/jobs/{job_id}", ("DELETE",)),
 })
 
 

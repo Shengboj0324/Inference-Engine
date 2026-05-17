@@ -29,6 +29,7 @@ from app.local.embedding_provider import (
     EmbeddingUnavailable,
     LocalEmbeddingProvider,
 )
+from app.local.rag_jobs import ReindexJob, ReindexJobManager, get_reindex_jobs
 from app.local.rag_retriever import (
     LocalRAGRetriever,
     RetrievedSnippet,
@@ -83,11 +84,52 @@ class RAGSnippet(BaseModel):
     published_at: float
     score: float
     text: str
+    base_score: float = 0.0
+    personalization_bonus: float = 0.0
 
 
 class RAGSearchResponse(BaseModel):
     query: str
     snippets: List[RAGSnippet]
+
+
+# ---------------------------------------------------------------------------
+# Personalization schemas
+# ---------------------------------------------------------------------------
+
+
+class RAGFeedbackRequest(BaseModel):
+    content_id: str = Field(..., min_length=1, max_length=128)
+    score: float = Field(
+        ..., ge=-1.0, le=1.0,
+        description="Use +1.0 for thumbs-up, -1.0 for thumbs-down. "
+                    "Fractional values are accepted to support a slider UI; "
+                    "the signals store clamps the running total on its side.",
+    )
+
+
+class RAGFeedbackResponse(BaseModel):
+    content_id: str
+    feedback_total: float = Field(
+        ...,
+        description="Running total of feedback after this update (clamped by the store).",
+    )
+
+
+class RAGSignalRow(BaseModel):
+    content_id: str
+    cited: int
+    feedback: float
+    last_seen: float
+
+
+class RAGSignalsResponse(BaseModel):
+    count: int
+    rows: List[RAGSignalRow]
+
+
+class RAGSignalsClearResponse(BaseModel):
+    cleared: int
 
 
 class RAGReindexRequest(BaseModel):
@@ -117,6 +159,33 @@ class RAGReindexResponse(BaseModel):
         description="Items that are still missing an embedding OR pinned to a prior model "
                     "(would be picked up by the next call).",
     )
+
+
+class RAGReindexStartRequest(BaseModel):
+    batch_size: int = Field(
+        16, ge=1, le=128,
+        description="Number of texts sent per embedding API call.",
+    )
+
+
+class RAGReindexJobStatus(BaseModel):
+    id: str
+    status: str = Field(
+        ..., description="One of: queued, running, done, cancelled, error.",
+    )
+    scanned: int
+    embedded: int
+    skipped: int
+    errors: int
+    total: int
+    batch_size: int
+    started_at: Optional[float]
+    finished_at: Optional[float]
+    detail: Optional[str] = None
+
+
+class RAGReindexJobsResponse(BaseModel):
+    jobs: List[RAGReindexJobStatus]
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +254,87 @@ async def search(request: RAGSearchRequest) -> RAGSearchResponse:
     )
 
 
+async def _run_reindex_batches(
+    *,
+    store: ContentStore,
+    embedder: LocalEmbeddingProvider,
+    current_version: Optional[str],
+    max_items: int,
+    batch_size: int,
+    progress: Optional[ReindexJob] = None,
+    should_cancel: Optional[callable] = None,  # type: ignore[valid-type]
+) -> tuple[int, int, int, int]:
+    """Drain stale embeddings in batches.  Shared by sync + background paths.
+
+    Returns ``(scanned, embedded, skipped, errors)``.  When ``progress`` is
+    provided each batch updates its counters in-place so a UI poll can see
+    incremental progress.  When ``should_cancel`` returns True the loop
+    exits cleanly between batches.
+    """
+    pending = store.list_stale_embeddings(current_version, limit=max_items)
+    scanned = len(pending)
+    if progress is not None:
+        progress.total = max(progress.total, scanned)
+    embedded = 0
+    errors = 0
+    skipped = 0
+    for offset in range(0, scanned, batch_size):
+        if should_cancel is not None and should_cancel():
+            break
+        chunk = pending[offset: offset + batch_size]
+        # Filter out rows with no usable text — they cannot be embedded
+        # and would otherwise be re-pulled forever, leaving the UI
+        # convinced there is work remaining.
+        prepared = [(cid, ((title or "") + "\n" + (raw or "")).strip())
+                    for cid, title, raw in chunk]
+        usable = [(cid, text) for cid, text in prepared if text]
+        skipped += len(prepared) - len(usable)
+        if not usable:
+            if progress is not None:
+                progress.scanned += len(prepared)
+                progress.skipped = skipped
+            continue
+        try:
+            vectors = await embedder.embed_batch([t for _, t in usable])
+        except EmbeddingUnavailable as exc:
+            # Permission revoked mid-run: abort cleanly with what we got.
+            logger.warning("reindex aborted: %s", exc)
+            errors += len(usable)
+            break
+        except Exception:  # noqa: BLE001 - per-batch isolation
+            logger.exception("reindex batch failed (offset=%d)", offset)
+            errors += len(usable)
+            if progress is not None:
+                progress.scanned += len(prepared)
+                progress.errors = errors
+            continue
+        if len(vectors) != len(usable):
+            logger.warning(
+                "reindex batch returned %d vectors for %d inputs; skipping",
+                len(vectors), len(usable),
+            )
+            errors += len(usable)
+            if progress is not None:
+                progress.scanned += len(prepared)
+                progress.errors = errors
+            continue
+        for (cid, _text), vec in zip(usable, vectors):
+            try:
+                if store.set_embedding(cid, vec, version=current_version):
+                    embedded += 1
+                else:
+                    errors += 1
+            except Exception:  # noqa: BLE001 - per-item isolation
+                logger.exception("reindex persist failed for %s", cid)
+                errors += 1
+        if progress is not None:
+            progress.scanned += len(prepared)
+            progress.embedded = embedded
+            progress.errors = errors
+            progress.skipped = skipped
+    return scanned, embedded, skipped, errors
+
+
 @router.post("/reindex", response_model=RAGReindexResponse)
 async def reindex(request: RAGReindexRequest) -> RAGReindexResponse:
     """Embed up to ``max_items`` rows that currently lack an embedding.
@@ -208,49 +358,13 @@ async def reindex(request: RAGReindexRequest) -> RAGReindexResponse:
         current_version: Optional[str] = embedder.model
     except Exception:  # noqa: BLE001
         current_version = None
-    pending = store.list_stale_embeddings(current_version, limit=request.max_items)
-    scanned = len(pending)
-    embedded = 0
-    errors = 0
-    skipped = 0
-    for offset in range(0, scanned, request.batch_size):
-        chunk = pending[offset: offset + request.batch_size]
-        # Filter out rows with no usable text — they cannot be embedded
-        # and would otherwise be re-pulled forever, leaving the UI
-        # convinced there is work remaining.
-        prepared = [(cid, ((title or "") + "\n" + (raw or "")).strip())
-                    for cid, title, raw in chunk]
-        usable = [(cid, text) for cid, text in prepared if text]
-        skipped += len(prepared) - len(usable)
-        if not usable:
-            continue
-        try:
-            vectors = await embedder.embed_batch([t for _, t in usable])
-        except EmbeddingUnavailable as exc:
-            # Permission revoked mid-run: abort cleanly with what we got.
-            logger.warning("reindex aborted: %s", exc)
-            errors += len(usable)
-            break
-        except Exception:  # noqa: BLE001 - per-batch isolation
-            logger.exception("reindex batch failed (offset=%d)", offset)
-            errors += len(usable)
-            continue
-        if len(vectors) != len(usable):
-            logger.warning(
-                "reindex batch returned %d vectors for %d inputs; skipping",
-                len(vectors), len(usable),
-            )
-            errors += len(usable)
-            continue
-        for (cid, _text), vec in zip(usable, vectors):
-            try:
-                if store.set_embedding(cid, vec, version=current_version):
-                    embedded += 1
-                else:
-                    errors += 1
-            except Exception:  # noqa: BLE001 - per-item isolation
-                logger.exception("reindex persist failed for %s", cid)
-                errors += 1
+    scanned, embedded, skipped, errors = await _run_reindex_batches(
+        store=store,
+        embedder=embedder,
+        current_version=current_version,
+        max_items=request.max_items,
+        batch_size=request.batch_size,
+    )
     return RAGReindexResponse(
         scanned=scanned,
         embedded=embedded,
@@ -258,3 +372,157 @@ async def reindex(request: RAGReindexRequest) -> RAGReindexResponse:
         errors=errors,
         remaining=store.count_stale_embeddings(current_version),
     )
+
+
+# ---------------------------------------------------------------------------
+# Personalization: feedback + signals transparency
+# ---------------------------------------------------------------------------
+
+
+@router.post("/feedback", response_model=RAGFeedbackResponse)
+async def submit_feedback(request: RAGFeedbackRequest) -> RAGFeedbackResponse:
+    """Record explicit user feedback on a retrieved snippet.
+
+    Soft-fails to 0.0 on any persistence error so a flaky signals DB
+    never blocks the chat surface — the route still returns 200.
+    """
+    r = _retriever()
+    try:
+        total = r.record_feedback(request.content_id, request.score)
+    except Exception:  # noqa: BLE001 - signals must never break the UI
+        logger.exception("feedback persist failed for %s", request.content_id)
+        total = 0.0
+    return RAGFeedbackResponse(content_id=request.content_id, feedback_total=total)
+
+
+@router.get("/signals", response_model=RAGSignalsResponse)
+async def list_signals(limit: int = 50) -> RAGSignalsResponse:
+    """Top personalization signals, surfaced for transparency / debug.
+
+    The desktop UI is expected to render these in a "Why am I seeing this?"
+    drawer so the user can see exactly which items have accumulated
+    citation / feedback weight against their session.
+    """
+    limit = max(1, min(int(limit), 500))
+    r = _retriever()
+    rows = r.signals_store.list_top(limit=limit)
+    return RAGSignalsResponse(
+        count=r.signals_store.count(),
+        rows=[
+            RAGSignalRow(
+                content_id=row["content_id"],
+                cited=int(row.get("cited", 0)),
+                feedback=float(row.get("feedback", 0.0)),
+                last_seen=float(row.get("last_seen", 0.0)),
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.delete("/signals", response_model=RAGSignalsClearResponse)
+async def clear_signals() -> RAGSignalsClearResponse:
+    """Wipe all personalization signals.  Useful for "reset my preferences"."""
+    r = _retriever()
+    cleared = r.signals_store.clear()
+    return RAGSignalsClearResponse(cleared=cleared)
+
+
+# ---------------------------------------------------------------------------
+# Background reindex jobs
+# ---------------------------------------------------------------------------
+
+
+def _jobs() -> ReindexJobManager:
+    return get_reindex_jobs()
+
+
+def _job_to_status(job: ReindexJob) -> RAGReindexJobStatus:
+    d = job.to_dict()
+    return RAGReindexJobStatus(**d)
+
+
+@router.post(
+    "/reindex/jobs",
+    response_model=RAGReindexJobStatus,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_reindex_job(
+    request: RAGReindexStartRequest,
+) -> RAGReindexJobStatus:
+    """Kick off a fire-and-forget reindex over *all* stale rows.
+
+    Returns ``202 Accepted`` with the job snapshot; the UI polls
+    ``GET /reindex/jobs/{id}`` for progress.  Returns 409 when the
+    RAG layer is unavailable or when another job is already running.
+    """
+    retriever = _retriever()
+    if not retriever.is_available():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="RAG layer unavailable: configure an embedding key and "
+                   "grant USE_LLM_KEY before scheduling a reindex job.",
+        )
+    store = _store()
+    embedder = _embedder()
+    try:
+        current_version: Optional[str] = embedder.model
+    except Exception:  # noqa: BLE001
+        current_version = None
+    total = store.count_stale_embeddings(current_version)
+
+    async def worker(job: ReindexJob, should_cancel) -> None:
+        # Drain in chunks so a corpus of 100k rows can still complete
+        # without holding the entire candidate list in memory.
+        page = max(1, min(2_000, job.batch_size * 32))
+        while not should_cancel():
+            scanned, _emb, _skp, _err = await _run_reindex_batches(
+                store=store,
+                embedder=embedder,
+                current_version=current_version,
+                max_items=page,
+                batch_size=job.batch_size,
+                progress=job,
+                should_cancel=should_cancel,
+            )
+            if scanned == 0:
+                break
+
+    try:
+        job = _jobs().start(worker, batch_size=request.batch_size, total=total)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc),
+        )
+    return _job_to_status(job)
+
+
+@router.get("/reindex/jobs", response_model=RAGReindexJobsResponse)
+async def list_reindex_jobs() -> RAGReindexJobsResponse:
+    return RAGReindexJobsResponse(
+        jobs=[_job_to_status(j) for j in _jobs().list()],
+    )
+
+
+@router.get("/reindex/jobs/{job_id}", response_model=RAGReindexJobStatus)
+async def get_reindex_job(job_id: str) -> RAGReindexJobStatus:
+    job = _jobs().get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no reindex job with id {job_id!r}",
+        )
+    return _job_to_status(job)
+
+
+@router.delete("/reindex/jobs/{job_id}", response_model=RAGReindexJobStatus)
+async def cancel_reindex_job(job_id: str) -> RAGReindexJobStatus:
+    mgr = _jobs()
+    job = mgr.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no reindex job with id {job_id!r}",
+        )
+    mgr.cancel(job_id)
+    return _job_to_status(job)
