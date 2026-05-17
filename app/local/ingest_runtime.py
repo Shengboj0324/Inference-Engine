@@ -367,6 +367,18 @@ class IngestRuntime:
             return
         if vector:
             item.embedding = list(vector)
+            # Stamp the model identifier into metadata so
+            # ``ContentStore.upsert`` can lift it into the
+            # ``embedding_version`` column; a later model swap then
+            # surfaces the row as stale to the reindex route.
+            try:
+                version = self._embedder.model
+            except Exception:  # noqa: BLE001 - non-fatal best-effort
+                version = None
+            if version:
+                new_meta = dict(item.metadata)
+                new_meta["embedding_version"] = version
+                item.metadata = new_meta
             self.stats.items_embedded += 1
 
     async def _apply_multimodal(self, item) -> None:

@@ -87,6 +87,16 @@ class LocalEmbeddingProvider:
     # Capability probes
     # ------------------------------------------------------------------
 
+    @property
+    def model(self) -> str:
+        """Identifier of the embedding model this provider issues calls against.
+
+        Surfaced so the RAG layer can stamp ``embedding_version`` on each
+        persisted vector and detect stale rows after a model upgrade
+        without rescanning every payload.
+        """
+        return f"{self._provider}:{self._model}"
+
     def is_configured(self) -> bool:
         """True if a key is in the vault for the configured provider."""
         return bool(self._vault.get(self._provider))

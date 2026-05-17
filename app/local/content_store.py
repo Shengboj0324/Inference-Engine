@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS content_items (
     topics_json TEXT NOT NULL DEFAULT '[]',
     lang TEXT,
     embedding BLOB,
+    embedding_version TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(user_id, source_platform, source_id)
 );
@@ -93,17 +94,38 @@ class ContentStore:
     def ensure_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Idempotent migration for stores created before
+            # ``embedding_version`` existed: the CREATE above is a no-op
+            # on an existing table, so the column must be added
+            # explicitly.  ``PRAGMA table_info`` is the standard probe;
+            # SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``.
+            cols = {
+                r["name"] for r in self._conn.execute(
+                    "PRAGMA table_info(content_items)"
+                ).fetchall()
+            }
+            if "embedding_version" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE content_items ADD COLUMN embedding_version TEXT"
+                )
 
     def upsert(self, item: ContentItem) -> bool:
         """Insert ``item``; return True if new, False if duplicate."""
         emb_blob = encode_vector(item.embedding) if item.embedding else None
+        # ``embedding_version`` rides in ``metadata`` because ContentItem
+        # itself has no slot for it — the ingest runtime stamps the
+        # provider's ``model`` identifier there after a successful embed
+        # so a future model swap is detectable without re-fetching.
+        emb_version = None
+        if emb_blob is not None:
+            emb_version = item.metadata.get("embedding_version") if item.metadata else None
         params = (
             str(item.id), str(item.user_id), item.source_platform.value,
             item.source_id, item.source_url, item.author, item.channel,
             item.title, item.raw_text, item.media_type.value,
             json.dumps(list(item.media_urls)),
             _to_epoch(item.published_at), _to_epoch(item.fetched_at),
-            json.dumps(list(item.topics)), item.lang, emb_blob,
+            json.dumps(list(item.topics)), item.lang, emb_blob, emb_version,
             json.dumps(item.metadata, default=str),
         )
         with self._lock:
@@ -112,8 +134,8 @@ class ContentStore:
                     "INSERT INTO content_items(id, user_id, source_platform, "
                     "source_id, source_url, author, channel, title, raw_text, "
                     "media_type, media_urls_json, published_at, fetched_at, "
-                    "topics_json, lang, embedding, metadata_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "topics_json, lang, embedding, embedding_version, metadata_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params,
                 )
                 return True
@@ -150,6 +172,28 @@ class ContentStore:
             ).fetchone()
         return int(row["n"])
 
+    def count_stale_embeddings(self, current_version: Optional[str]) -> int:
+        """Count rows whose embedding is missing or pinned to a prior model.
+
+        When ``current_version`` is ``None`` (no embedder configured) we
+        only count outright-missing rows — a stale-vs-current comparison
+        is meaningless without a reference version.
+        """
+        with self._lock:
+            if not current_version:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM content_items WHERE embedding IS NULL"
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM content_items "
+                    "WHERE embedding IS NULL "
+                    "   OR embedding_version IS NULL "
+                    "   OR embedding_version != ?",
+                    (current_version,),
+                ).fetchone()
+        return int(row["n"])
+
     def list_missing_embeddings(
         self, *, limit: int = 500,
     ) -> List[Tuple[str, str, str]]:
@@ -169,20 +213,50 @@ class ContentStore:
             ).fetchall()
         return [(r["id"], r["title"] or "", r["raw_text"] or "") for r in rows]
 
-    def set_embedding(self, content_id: str, vector: Sequence[float]) -> bool:
-        """Persist ``vector`` on the row keyed by ``content_id``.
+    def list_stale_embeddings(
+        self, current_version: Optional[str], *, limit: int = 500,
+    ) -> List[Tuple[str, str, str]]:
+        """Return rows whose embedding is missing OR was made by a prior model.
+
+        Superset of :meth:`list_missing_embeddings`; used by the reindex
+        route so a model upgrade triggers re-embedding of historical rows
+        without operator intervention beyond the explicit POST.
+        """
+        if not current_version:
+            return self.list_missing_embeddings(limit=limit)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, title, raw_text FROM content_items "
+                "WHERE embedding IS NULL "
+                "   OR embedding_version IS NULL "
+                "   OR embedding_version != ? "
+                "ORDER BY published_at DESC LIMIT ?",
+                (current_version, int(limit)),
+            ).fetchall()
+        return [(r["id"], r["title"] or "", r["raw_text"] or "") for r in rows]
+
+    def set_embedding(
+        self,
+        content_id: str,
+        vector: Sequence[float],
+        *,
+        version: Optional[str] = None,
+    ) -> bool:
+        """Persist ``vector`` (and optionally ``version``) on the row.
 
         Returns ``True`` when a row was updated, ``False`` when the id is
-        unknown or ``vector`` is empty (no-op).  Used by the RAG backfill
-        path so historical items become searchable without re-ingestion.
+        unknown or ``vector`` is empty (no-op).  ``version`` should be
+        the embedder's :pyattr:`LocalEmbeddingProvider.model` so a future
+        model swap surfaces these rows as stale.
         """
         if not vector:
             return False
         blob = encode_vector(vector)
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE content_items SET embedding = ? WHERE id = ?",
-                (blob, str(content_id)),
+                "UPDATE content_items "
+                "SET embedding = ?, embedding_version = ? WHERE id = ?",
+                (blob, version, str(content_id)),
             )
             return cur.rowcount > 0
 
