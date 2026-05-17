@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import asdict, dataclass
+import threading
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Iterable, List, Optional
 
@@ -49,6 +51,17 @@ _FEEDBACK_WEIGHT = 0.05
 _OVERSAMPLE = 3
 _MAX_OVERSAMPLE_HITS = 60
 
+# Exponential half-life for the personalization bonus.  After ~30 days
+# without a fresh citation or thumbs the contribution of a signal row
+# has decayed to half; after ~90 days it is ~1/8.  Picked to match the
+# typical "feed I'm working out of this quarter" cadence without
+# making engagement from yesterday meaningless.
+_BONUS_HALFLIFE_SECONDS = 30 * 24 * 3600.0
+# Decay floor so very old signals still contribute *something* (1%) of
+# their original weight rather than being silently dropped; keeps the
+# transparency drawer's numbers consistent with the ranking they drive.
+_BONUS_DECAY_FLOOR = 0.01
+
 
 @dataclass(frozen=True)
 class RetrievedSnippet:
@@ -70,6 +83,26 @@ class RetrievedSnippet:
         return asdict(self)
 
 
+@dataclass
+class PersonalizationTelemetry:
+    """Counters exposed via ``GET /api/v1/rag/telemetry``.
+
+    All counters are monotonic per-process; the desktop sidecar is
+    expected to be re-launched on upgrade and the UI tolerates a
+    counter reset.  Persisting them on disk would force a second
+    write per chat turn and offers no operational value.
+    """
+
+    queries_total: int = 0
+    queries_personalized: int = 0  # personalize=True AND signals were applied
+    queries_reordered: int = 0     # personalize=True AND the top-k order changed
+    queries_promoted_to_top: int = 0  # the #1 result changed
+    signal_lookups_failed: int = 0  # signals DB threw; ranking continued
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 class LocalRAGRetriever:
     """BYOK-aware retrieval over the desktop :class:`ContentStore`."""
 
@@ -82,6 +115,7 @@ class LocalRAGRetriever:
         signals: Optional[RetrievalSignalsStore] = None,
         max_snippet_chars: int = _DEFAULT_SNIPPET_CHARS,
         personalize: bool = True,
+        bonus_halflife_seconds: float = _BONUS_HALFLIFE_SECONDS,
     ) -> None:
         self._content = content if content is not None else get_content_store()
         self._embedder = embedder if embedder is not None else LocalEmbeddingProvider()
@@ -89,6 +123,9 @@ class LocalRAGRetriever:
         self._signals = signals if signals is not None else get_signals_store()
         self._max_chars = max(120, int(max_snippet_chars))
         self._personalize = bool(personalize)
+        self._halflife = max(1.0, float(bonus_halflife_seconds))
+        self._telemetry = PersonalizationTelemetry()
+        self._telemetry_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Capability probe
@@ -154,19 +191,42 @@ class LocalRAGRetriever:
             vector, k=search_k, since=since, platforms=platforms, min_score=min_score,
         )
         if not hits:
+            self._bump_telemetry(queries_total=1)
             return []
         if not do_personalize:
+            self._bump_telemetry(queries_total=1)
             return [self._snippet_for(item, score, bonus=0.0) for item, score in hits]
         signals = {}
+        signal_lookup_failed = False
         try:
             signals = self._signals.get_signals([str(item.id) for item, _ in hits])
         except Exception:  # noqa: BLE001 - signals must never break retrieval
             logger.exception("retrieval signals load failed; ranking without them")
+            signal_lookup_failed = True
+        now = time.time()
         rescored: List = []
         for item, score in hits:
-            bonus = self._personalization_bonus(signals.get(str(item.id)))
+            bonus = self._personalization_bonus(
+                signals.get(str(item.id)), halflife=self._halflife, now=now,
+            )
             rescored.append((item, float(score), bonus))
         rescored.sort(key=lambda r: r[1] + r[2], reverse=True)
+        # Telemetry: count this query, and whether personalization actually
+        # changed the order or moved a new item into the top slot.  Computed
+        # *before* truncating to ``k`` so the baseline tail is comparable.
+        baseline_ids = [str(item.id) for item, _ in hits[:k]]
+        reranked_ids = [str(item.id) for item, _, _ in rescored[:k]]
+        applied = bool(signals) and any(b > 0.0 or b < 0.0 for _, _, b in rescored[:k])
+        reordered = reranked_ids != baseline_ids
+        promoted = bool(baseline_ids and reranked_ids
+                        and baseline_ids[0] != reranked_ids[0])
+        self._bump_telemetry(
+            queries_total=1,
+            queries_personalized=int(applied),
+            queries_reordered=int(reordered),
+            queries_promoted_to_top=int(promoted),
+            signal_lookups_failed=int(signal_lookup_failed),
+        )
         return [
             self._snippet_for(item, base_score, bonus=bonus)
             for item, base_score, bonus in rescored[:k]
@@ -177,21 +237,73 @@ class LocalRAGRetriever:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _personalization_bonus(sig: Optional[dict]) -> float:
-        """Map raw signal counters onto a bounded additive score bonus.
+    def _personalization_bonus(
+        sig: Optional[dict],
+        *,
+        halflife: float = _BONUS_HALFLIFE_SECONDS,
+        now: Optional[float] = None,
+    ) -> float:
+        """Map raw signal counters onto a bounded, time-decayed score bonus.
 
         The curve is intentionally flat: ``log(1+cited)`` saturates
         quickly, and the feedback weight is capped by the signals
-        store's own clamp.  Worst-case bonus on a current cosine in
-        ``[-1, 1]`` is ~``0.05 + 0.05 = 0.10`` \u2014 enough to break ties
-        and promote near-misses, never enough to override a strong
-        semantic mismatch.
+        store's own clamp.  Worst-case un-decayed bonus on a current
+        cosine in ``[-1, 1]`` is ~``0.05 + 0.05 = 0.10`` \u2014 enough to
+        break ties and promote near-misses, never enough to override a
+        strong semantic mismatch.
+
+        A multiplicative exponential decay on ``(now - last_seen)`` is
+        applied so engagement from months ago contributes a fraction of
+        its original weight.  The decay is floored at
+        :data:`_BONUS_DECAY_FLOOR` so very old signals do not vanish
+        entirely (the transparency drawer would otherwise show a row
+        the ranker treats as zero).
         """
         if not sig:
             return 0.0
         cited = max(0, int(sig.get("cited", 0)))
         feedback = float(sig.get("feedback", 0.0))
-        return _CITED_WEIGHT * math.log1p(cited) + _FEEDBACK_WEIGHT * math.tanh(feedback / 3.0)
+        raw = (
+            _CITED_WEIGHT * math.log1p(cited)
+            + _FEEDBACK_WEIGHT * math.tanh(feedback / 3.0)
+        )
+        if raw == 0.0:
+            return 0.0
+        last_seen = float(sig.get("last_seen", 0.0) or 0.0)
+        if last_seen <= 0.0:
+            return raw
+        age = max(0.0, (now if now is not None else time.time()) - last_seen)
+        decay = math.exp(-age * math.log(2.0) / max(1.0, float(halflife)))
+        return raw * max(_BONUS_DECAY_FLOOR, decay)
+
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+
+    def _bump_telemetry(self, **deltas: int) -> None:
+        """Increment telemetry counters under the instance lock.
+
+        Kept private; the public surface is :meth:`telemetry_snapshot`
+        which returns an immutable dict copy.
+        """
+        with self._telemetry_lock:
+            for name, delta in deltas.items():
+                if not delta:
+                    continue
+                setattr(
+                    self._telemetry, name,
+                    getattr(self._telemetry, name) + int(delta),
+                )
+
+    def telemetry_snapshot(self) -> dict:
+        """Return a copy of the personalization telemetry counters."""
+        with self._telemetry_lock:
+            return self._telemetry.to_dict()
+
+    def reset_telemetry(self) -> None:
+        """Zero every counter.  Used by the dedicated telemetry route."""
+        with self._telemetry_lock:
+            self._telemetry = PersonalizationTelemetry()
 
     def _snippet_for(self, item, score: float, *, bonus: float = 0.0) -> RetrievedSnippet:
         # Prefer the body text; fall back to the title so we always have

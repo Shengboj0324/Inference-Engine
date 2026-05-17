@@ -265,3 +265,78 @@ class TestRAGRoutes:
             "/api/v1/rag/reindex/jobs", json={"batch_size": 4},
         )
         assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 follow-up: time decay + telemetry
+# ---------------------------------------------------------------------------
+
+
+class TestBonusTimeDecay:
+    # Use a realistic ``now`` so ``now - 5*365d`` stays positive and does not
+    # trip the "no last_seen" short-circuit branch in the bonus calculator.
+    _NOW = 1_700_000_000.0  # 2023-11-14, well beyond 5 years past epoch.
+
+    def test_one_halflife_halves_the_bonus(self) -> None:
+        now = self._NOW
+        sig_fresh = {"cited": 10, "feedback": 2.0, "last_seen": now}
+        sig_old = {"cited": 10, "feedback": 2.0, "last_seen": now - 30 * 24 * 3600}
+        fresh = LocalRAGRetriever._personalization_bonus(sig_fresh, now=now)
+        old = LocalRAGRetriever._personalization_bonus(sig_old, now=now)
+        assert fresh > 0.0
+        # Halflife is exactly 30 days; allow 1% tolerance for float drift.
+        assert abs(old / fresh - 0.5) < 0.01, (fresh, old)
+
+    def test_ancient_signal_still_contributes_floor(self) -> None:
+        now = self._NOW
+        sig = {"cited": 10, "feedback": 2.0, "last_seen": now - 5 * 365 * 24 * 3600}
+        b = LocalRAGRetriever._personalization_bonus(sig, now=now)
+        raw = LocalRAGRetriever._personalization_bonus(
+            {"cited": 10, "feedback": 2.0, "last_seen": now}, now=now,
+        )
+        # Floor is 1% of the raw bonus; ancient signals stay visible but tiny.
+        assert b >= raw * 0.01 - 1e-9
+        assert b < raw * 0.5
+
+    def test_missing_last_seen_skips_decay(self) -> None:
+        now = self._NOW
+        sig = {"cited": 10, "feedback": 2.0, "last_seen": 0.0}
+        b = LocalRAGRetriever._personalization_bonus(sig, now=now)
+        raw = LocalRAGRetriever._personalization_bonus(
+            {"cited": 10, "feedback": 2.0, "last_seen": now}, now=now,
+        )
+        # last_seen of 0 = no time information; do not penalise.
+        assert b == pytest.approx(raw)
+
+
+class TestTelemetryRoute:
+    def test_counters_track_personalization_effect(
+        self, desktop_client: TestClient,
+    ) -> None:
+        store = get_content_store()
+        a = _mk("A", [1.0, 0.0, 0.0], "ta")
+        b = _mk("B", [0.99, 0.1, 0.0], "tb")
+        store.upsert(a); store.upsert(b)
+
+        desktop_client.post("/api/v1/rag/search", json={"query": "x", "k": 2})
+        for _ in range(8):
+            desktop_client.post(
+                "/api/v1/rag/feedback",
+                json={"content_id": str(b.id), "score": 1.0},
+            )
+        desktop_client.post("/api/v1/rag/search", json={"query": "x", "k": 2})
+        desktop_client.post("/api/v1/rag/search", json={"query": "x", "k": 2})
+
+        body = desktop_client.get("/api/v1/rag/telemetry").json()
+        assert body["queries_total"] >= 3
+        assert body["queries_personalized"] >= 1
+        assert body["queries_promoted_to_top"] >= 1
+        assert body["queries_reordered"] >= 1
+        assert body["signal_lookups_failed"] == 0
+
+        r = desktop_client.delete("/api/v1/rag/telemetry")
+        assert r.status_code == 200 and r.json()["reset"] is True
+        body2 = desktop_client.get("/api/v1/rag/telemetry").json()
+        assert body2["queries_total"] == 0
+        assert body2["queries_personalized"] == 0
+        assert body2["queries_promoted_to_top"] == 0

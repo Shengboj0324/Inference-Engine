@@ -132,6 +132,38 @@ class RAGSignalsClearResponse(BaseModel):
     cleared: int
 
 
+class RAGTelemetryResponse(BaseModel):
+    """Per-process personalization counters surfaced for the UX panel."""
+
+    queries_total: int = Field(
+        ..., description="Every call to LocalRAGRetriever.retrieve that produced a hit OR an empty result.",
+    )
+    queries_personalized: int = Field(
+        ...,
+        description="Subset of ``queries_total`` where ``personalize`` was on AND at least one "
+                    "candidate received a non-zero personalization bonus.",
+    )
+    queries_reordered: int = Field(
+        ...,
+        description="Subset of ``queries_personalized`` where the post-rerank top-k order "
+                    "differed from the pure cosine baseline.",
+    )
+    queries_promoted_to_top: int = Field(
+        ...,
+        description="Subset of ``queries_reordered`` where the #1 result changed identity \u2014 "
+                    "the strongest signal that personalization is materially affecting the user.",
+    )
+    signal_lookups_failed: int = Field(
+        ...,
+        description="Counter of personalization queries where loading the signals DB raised. "
+                    "Always > 0 indicates a disk-level fault; the ranker continued without signals.",
+    )
+
+
+class RAGTelemetryResetResponse(BaseModel):
+    reset: bool
+
+
 class RAGReindexRequest(BaseModel):
     max_items: int = Field(
         500, ge=1, le=5_000,
@@ -426,6 +458,25 @@ async def clear_signals() -> RAGSignalsClearResponse:
     r = _retriever()
     cleared = r.signals_store.clear()
     return RAGSignalsClearResponse(cleared=cleared)
+
+
+@router.get("/telemetry", response_model=RAGTelemetryResponse)
+async def get_telemetry() -> RAGTelemetryResponse:
+    """Return per-process personalization counters.
+
+    The desktop sidecar is short-lived (one process per launch) so these
+    counters are not persisted.  The UX panel uses them to display a
+    "personalization affected N% of your recent searches" tile.
+    """
+    snap = _retriever().telemetry_snapshot()
+    return RAGTelemetryResponse(**snap)
+
+
+@router.delete("/telemetry", response_model=RAGTelemetryResetResponse)
+async def reset_telemetry() -> RAGTelemetryResetResponse:
+    """Zero every telemetry counter.  Used by the "start fresh" UX action."""
+    _retriever().reset_telemetry()
+    return RAGTelemetryResetResponse(reset=True)
 
 
 # ---------------------------------------------------------------------------

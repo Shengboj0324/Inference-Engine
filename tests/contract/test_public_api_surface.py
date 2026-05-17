@@ -137,6 +137,8 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     ("APIRoute", "/api/v1/rag/feedback", ("POST",)),
     ("APIRoute", "/api/v1/rag/signals", ("GET",)),
     ("APIRoute", "/api/v1/rag/signals", ("DELETE",)),
+    ("APIRoute", "/api/v1/rag/telemetry", ("GET",)),
+    ("APIRoute", "/api/v1/rag/telemetry", ("DELETE",)),
     ("APIRoute", "/api/v1/rag/reindex/jobs", ("POST",)),
     ("APIRoute", "/api/v1/rag/reindex/jobs", ("GET",)),
     ("APIRoute", "/api/v1/rag/reindex/jobs/{job_id}", ("GET",)),
