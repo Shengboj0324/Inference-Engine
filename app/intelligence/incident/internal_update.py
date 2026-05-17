@@ -48,23 +48,85 @@ _FIELDS_LINE_RX = re.compile(
 )
 _SCHOOL_RX = re.compile(r"matches\s+a\s+real\s+([A-Z][A-Za-z]+(?:\s+High)?)\s+roster",
                         re.IGNORECASE)
+_BLOCK_START_RX = re.compile(r"^##\s+Internal\s+Security\s+Update\b",
+                             re.IGNORECASE)
+_BLOCK_END_RX = re.compile(r"^(##\s+|#\s+)", re.IGNORECASE)
 
 
-def parse_internal_update(text: str) -> InternalVerificationUpdate:
-    low = text.lower()
-    rows = 184
-    m_rows = _EXPORT_LINE_RX.search(text)
-    if m_rows:
-        rows = int(m_rows.group(1))
-    school = "Northview High"
-    m_school = _SCHOOL_RX.search(text)
+def extract_internal_update_block(raw: str) -> str:
+    """Return the verbatim ``## Internal Security Update`` section body.
+
+    Looks for the section header and reads until the next ``##``/``#``
+    header.  Raises :class:`ValueError` if the section is absent so
+    callers fail loudly instead of silently parsing rubric prose.
+    """
+    if not isinstance(raw, str):
+        raise TypeError("raw must be str")
+    lines = raw.splitlines()
+    start: Optional[int] = None
+    for i, line in enumerate(lines):
+        if _BLOCK_START_RX.match(line):
+            start = i + 1
+            break
+    if start is None:
+        raise ValueError(
+            "internal_update: '## Internal Security Update' section not found"
+        )
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if _BLOCK_END_RX.match(lines[j]):
+            end = j
+            break
+    return "\n".join(lines[start:end])
+
+
+def parse_internal_update(text: str, *, strict: bool = True
+                          ) -> InternalVerificationUpdate:
+    """Parse a verified-findings block into a typed object.
+
+    If ``strict`` (default) and the text does not contain a recognisable
+    row count, school name, or sample-match indicator, a
+    :class:`ValueError` is raised.  Pass ``strict=False`` for tests that
+    exercise partial-input behaviour.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    # Auto-detect: if the caller hands us the whole file, isolate the
+    # block; otherwise treat ``text`` as the block body itself.
+    if _BLOCK_START_RX.search(text):
+        body = extract_internal_update_block(text)
+    else:
+        body = text
+    low = body.lower()
+
+    m_rows = _EXPORT_LINE_RX.search(body)
+    m_school = _SCHOOL_RX.search(body)
+    sample_matches = "matches a real" in low
+
+    if strict:
+        missing: List[str] = []
+        if not m_rows:
+            missing.append("exported row count ('contained N student rows')")
+        if not m_school:
+            missing.append("affected school ('matches a real <School> roster')")
+        if not sample_matches:
+            missing.append("sample-match indicator ('matches a real')")
+        if missing:
+            raise ValueError(
+                "internal_update: missing required findings: "
+                + "; ".join(missing)
+            )
+
+    rows = int(m_rows.group(1)) if m_rows else 0
     if m_school:
         school = m_school.group(1).title()
         if "high" not in school.lower():
             school = school + " High"
+    else:
+        school = ""
 
-    # Canonical exposed-field set per the scenario's verified update.
-    fields = _parse_exposed_fields(text)
+    fields = _parse_exposed_fields(body)
+    text = body  # remaining helpers below read from the isolated body
 
     return InternalVerificationUpdate(
         sample_matches_production="matches a real" in low,

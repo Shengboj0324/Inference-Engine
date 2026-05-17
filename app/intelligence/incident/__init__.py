@@ -29,6 +29,7 @@ from app.intelligence.incident.signal_detectors import (  # noqa: F401
 )
 from app.intelligence.incident.internal_update import (  # noqa: F401
     InternalVerificationUpdate,
+    extract_internal_update_block,
     parse_internal_update,
 )
 from app.intelligence.incident.report_models import (  # noqa: F401

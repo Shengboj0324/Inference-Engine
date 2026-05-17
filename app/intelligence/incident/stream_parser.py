@@ -74,8 +74,18 @@ def _platform_for(label: str) -> str:
 # Regex
 # ---------------------------------------------------------------------------
 _STAGE_RX = re.compile(r"^#\s*Stage\s+(\d+)\s*:", re.IGNORECASE)
+_TOP_HEADER_RX = re.compile(r"^#\s+(?!Stage\s)", re.IGNORECASE)
 _POST_RX = re.compile(
     r"^###\s+Post\s+\d+\s*[\-\u2013\u2014]?\s*(.*)$", re.IGNORECASE,
+)
+_SUBSECTION_RX = re.compile(r"^##\s+")
+_SKIP_SUBSECTION_RX = re.compile(
+    r"^##\s+(Required\s+Model\s+Output|Hidden\s+Pattern|"
+    r"Internal\s+Security\s+Update)",
+    re.IGNORECASE,
+)
+_RESUME_SUBSECTION_RX = re.compile(
+    r"^##\s+(Input\s+Batch|Time\s+Window)", re.IGNORECASE,
 )
 _HANDLE_LINE_RX = re.compile(r"^`?(@[A-Za-z0-9_]+)`?\s*:?\s*$")
 _INLINE_HANDLE_RX = re.compile(r"^`?(@[A-Za-z0-9_]+)`?\s*:\s*(.+)$")
@@ -87,12 +97,22 @@ _CODE_FENCE_RX = re.compile(r"^```")
 # Main parser
 # ---------------------------------------------------------------------------
 def parse_incident_stream(raw: str) -> List[IncidentStreamItem]:
+    """Parse stage-scoped posts out of the scenario markdown.
+
+    The scenario document interleaves the input batches the radar is
+    supposed to consume (``# Stage N`` / ``### Post N``) with rubric and
+    expected-output sections (``## Required Model Output ...``, ``##
+    Hidden Pattern ...``, ``## Internal Security Update``) that must not
+    be fed back into the model.  This parser self-skips those sections so
+    callers can hand it the entire file safely.
+    """
     if not isinstance(raw, str):
         raise TypeError("raw must be str")
     items: List[IncidentStreamItem] = []
     lines = raw.splitlines()
     i = 0
     current_stage: Optional[str] = None
+    skip_section = False
     in_code = False
     code_buf: List[str] = []
     code_platform = "screenshot"
@@ -102,6 +122,23 @@ def parse_incident_stream(raw: str) -> List[IncidentStreamItem]:
         m_stage = _STAGE_RX.match(line)
         if m_stage:
             current_stage = f"stage{m_stage.group(1)}"
+            skip_section = False
+            i += 1
+            continue
+        if _TOP_HEADER_RX.match(line):
+            current_stage = None
+            skip_section = False
+            i += 1
+            continue
+        if _SKIP_SUBSECTION_RX.match(line):
+            skip_section = True
+            i += 1
+            continue
+        if _RESUME_SUBSECTION_RX.match(line):
+            skip_section = False
+            i += 1
+            continue
+        if skip_section:
             i += 1
             continue
         if _CODE_FENCE_RX.match(line):
@@ -153,13 +190,15 @@ def parse_incident_stream(raw: str) -> List[IncidentStreamItem]:
 
 def _collect_post(lines: List[str], start: int, default_platform: str
                   ) -> Tuple[Optional[str], str, Optional[str], str]:
-    """Read until the next ``### Post`` / ``# Stage`` header or EOF."""
+    """Read until the next ``### Post`` / ``## `` / ``# `` header or EOF."""
     handle: Optional[str] = None
     body_parts: List[str] = []
     j = start
     while j < len(lines):
         line = lines[j].rstrip()
-        if _POST_RX.match(line) or _STAGE_RX.match(line):
+        if (_POST_RX.match(line) or _STAGE_RX.match(line)
+                or _TOP_HEADER_RX.match(line)
+                or _SUBSECTION_RX.match(line)):
             break
         if _CODE_FENCE_RX.match(line):
             break

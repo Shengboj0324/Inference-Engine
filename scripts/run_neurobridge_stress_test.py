@@ -17,7 +17,6 @@ deterministic for this scenario).
 from __future__ import annotations
 
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -69,49 +68,8 @@ _BULK = BulkPattern(
 )
 
 
-_STAGE_HDR_RX = re.compile(r"^#\s*Stage\s+(\d+)\s*:", re.IGNORECASE)
-_STAGE_END_RX = re.compile(
-    r"^##\s*(Required\s+Model\s+Output|Hidden\s+Pattern)",
-    re.IGNORECASE,
-)
-_INTERNAL_HDR_RX = re.compile(r"^##\s*Internal\s+Security\s+Update",
-                              re.IGNORECASE)
-
-
-def _extract_input_stream(md: str) -> tuple:
-    """Return (stream_text, internal_update_text)."""
-    lines = md.splitlines()
-    out: list = []
-    internal: list = []
-    keep = False
-    capture_internal = False
-    in_internal_block = False
-    for line in lines:
-        m_stage = _STAGE_HDR_RX.match(line)
-        if m_stage:
-            keep = True
-            in_internal_block = False
-            out.append(line)
-            continue
-        if keep and _INTERNAL_HDR_RX.match(line):
-            in_internal_block = True
-            capture_internal = True
-            internal.append(line)
-            continue
-        if keep and _STAGE_END_RX.match(line):
-            keep = False
-            in_internal_block = False
-            continue
-        if in_internal_block:
-            internal.append(line)
-        if keep:
-            out.append(line)
-    return "\n".join(out), "\n".join(internal)
-
-
 def main() -> int:
     md = _SCENARIO_PATH.read_text()
-    stream_text, internal_text = _extract_input_stream(md)
 
     print("-" * 78)
     print("NEUROBRIDGE INCIDENT INTELLIGENCE PIPELINE")
@@ -122,7 +80,7 @@ def main() -> int:
           f"{len(actors.all())} known actor(s), "
           f"{len(issues.all())} known issue(s)")
 
-    items = parse_incident_stream(stream_text)
+    items = parse_incident_stream(md)
     print(f"  parsed {len(items)} stream item(s) across "
           f"{len({i.stage_id for i in items})} stage(s); "
           f"{len({i.handle for i in items if i.handle})} unique handle(s)")
@@ -139,7 +97,7 @@ def main() -> int:
         f"false_claims={len(signals.false_claims)}"
     )
 
-    update = parse_internal_update(internal_text)
+    update = parse_internal_update(md)
     print(f"  internal verification: school={update.affected_school}, "
           f"rows={update.affected_row_count}, "
           f"fields={len(update.exposed_fields)}, "
