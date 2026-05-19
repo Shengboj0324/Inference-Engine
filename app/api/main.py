@@ -12,6 +12,7 @@ import time
 from app.api.routes import (
     auth,
     chat,
+    classify,
     desktop,
     digest,
     ingest,
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 #: (``tests/contract/test_public_api_surface.py``) imports this constant
 #: and the desktop shell reads it from ``/api/v1/desktop/manifest`` so
 #: the UI can refuse to load against an incompatible sidecar.
-API_CONTRACT_VERSION = "phase5.0"
+API_CONTRACT_VERSION = "phase6.0"
 
 
 async def _probe_redis() -> None:
@@ -146,6 +147,7 @@ app.add_middleware(
 # Include routers
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(signals.router, prefix="/api/v1", tags=["Signals"])  # Primary product interface
+app.include_router(classify.router, prefix="/api/v1", tags=["Classify"])  # Grounded SituationEngine
 app.include_router(sources.router, prefix="/api/v1/sources", tags=["Sources"])
 app.include_router(digest.router, prefix="/api/v1/digest", tags=["Digest"])
 app.include_router(search.router, prefix="/api/v1/search", tags=["Search"])

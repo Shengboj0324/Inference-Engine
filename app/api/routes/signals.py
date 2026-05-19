@@ -792,6 +792,118 @@ async def stream_signal_inference(
 
 
 # ---------------------------------------------------------------------------
+# SituationEngine adapter — grounded, citation-verified report path
+# ---------------------------------------------------------------------------
+
+from app.evals.scenario_loader import Observation as _EngineObservation
+from app.intelligence.situation_report import SituationReport as _SituationReport
+
+
+class SituationRequest(BaseModel):
+    """Wrap a ``RawObservation`` with optional engine-routing knobs."""
+
+    raw_observation: RawObservation
+    min_confidence: float = Field(0.0, ge=0.0, le=1.0)
+    primary_model: Optional[str] = Field(None, max_length=200)
+    fallback_model: Optional[str] = Field(None, max_length=200)
+
+
+class SituationResponse(BaseModel):
+    """Response payload: validated SituationReport plus provenance."""
+
+    report: _SituationReport
+    used_fallback: bool
+    redaction_count: int
+
+
+def _raw_to_observation(raw: RawObservation) -> _EngineObservation:
+    """Convert a connector ``RawObservation`` into an engine ``Observation``.
+
+    Title and body are joined with a newline so the model receives the same
+    text a human reviewer would see; ``observation_id`` is the source-side
+    UUID stringified.
+    """
+    body = (raw.raw_text or "").strip()
+    title = (raw.title or "").strip()
+    if title and body:
+        text = f"{title}\n{body}"
+    else:
+        text = title or body or "(no text)"
+    return _EngineObservation(
+        observation_id=str(raw.id),
+        text=text,
+        source=raw.source_platform.value,
+        timestamp=raw.published_at.isoformat() if raw.published_at else None,
+    )
+
+
+@router.post(
+    "/situation",
+    response_model=SituationResponse,
+    summary="Run the grounded SituationEngine on a single raw observation",
+)
+async def classify_situation(
+    payload: SituationRequest,
+    current_user: User = Depends(get_current_user),
+) -> SituationResponse:
+    """Run the Phase 3 ``SituationEngine`` on one ``RawObservation``.
+
+    Unlike :func:`stream_signal_inference`, this endpoint bypasses the
+    legacy :class:`InferencePipeline` and returns a fully citation-verified
+    :class:`~app.intelligence.situation_report.SituationReport`. The
+    underlying engine performs PII scrubbing, generation, structural
+    grounding verification, and optional fallback re-routing to a
+    frontier model when ``payload.fallback_model`` is set.
+    """
+    from app.intelligence.citation_verifier import CitationGroundingError
+    from app.intelligence.situation_engine import (
+        AsyncSituationEngine,
+        GenerationError,
+        OutputParseError,
+        build_router_generator,
+    )
+    from app.llm.router import get_router
+
+    observation = _raw_to_observation(payload.raw_observation)
+    router_instance = get_router()
+    primary = build_router_generator(
+        router_instance, model=payload.primary_model
+    )
+    fallback = None
+    if payload.fallback_model:
+        fallback = build_router_generator(
+            router_instance, model=payload.fallback_model
+        )
+    engine = AsyncSituationEngine(
+        generate=primary,
+        fallback_generate=fallback,
+        min_confidence=payload.min_confidence,
+    )
+    try:
+        result = await engine.analyze([observation])
+    except CitationGroundingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "citation_grounding_failed", "message": str(exc)},
+        )
+    except OutputParseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "output_parse_failed", "message": str(exc)},
+        )
+    except GenerationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "generator_failed", "message": str(exc)},
+        )
+    return SituationResponse(
+        report=result.report,
+        used_fallback=result.used_fallback,
+        redaction_count=result.redaction_count,
+    )
+
+
+# ---------------------------------------------------------------------------
 # WebSocket real-time signal stream
 # ---------------------------------------------------------------------------
 

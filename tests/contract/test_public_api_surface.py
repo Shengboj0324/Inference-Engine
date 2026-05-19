@@ -69,6 +69,10 @@ FROZEN_ROUTES: FrozenSet[Tuple[str, str, Tuple[str, ...]]] = frozenset({
     ("APIRoute", "/api/v1/signals/{signal_id}/assign", ("POST",)),
     ("APIRoute", "/api/v1/signals/team", ("GET",)),
     ("APIRoute", "/api/v1/signals/{signal_id}/feedback", ("POST",)),
+    # Phase 6 — Grounded SituationEngine surface
+    ("APIRoute", "/api/v1/signals/situation", ("POST",)),
+    ("APIRoute", "/api/v1/classify", ("POST",)),
+    ("APIRoute", "/api/v1/classify/stream", ("POST",)),
     # Sources
     ("APIRoute", "/api/v1/sources/", ("GET",)),
     ("APIRoute", "/api/v1/sources/", ("POST",)),

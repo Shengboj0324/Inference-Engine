@@ -177,3 +177,103 @@ async def test_router_generator_translates_messages_and_returns_content():
     assert roles == ["system", "user"]
     contents = [m.content for m in captured["messages"]]
     assert contents == ["sys", "usr"]
+
+
+# ---------------------------------------------------------------------------
+# Optional re-routing (fallback)
+# ---------------------------------------------------------------------------
+
+
+def _make_low_conf_report(observations: List[Observation]) -> SituationReport:
+    base = _report_for(observations)
+    return base.model_copy(update={"calibrated_confidence": 0.20})
+
+
+def _make_high_conf_report(observations: List[Observation]) -> SituationReport:
+    base = _report_for(observations)
+    return base.model_copy(update={"calibrated_confidence": 0.95})
+
+
+def test_min_confidence_outside_range_rejected():
+    with pytest.raises(ValueError):
+        SituationEngine(generate=lambda _m: "{}", min_confidence=1.5)
+
+
+def test_fallback_invoked_when_primary_confidence_below_threshold():
+    observations = [_obs("obs_1", "hello world example")]
+    primary, _ = _make_generator(_make_low_conf_report(observations))
+    fallback, fb_capture = _make_generator(_make_high_conf_report(observations))
+    engine = SituationEngine(
+        generate=primary, fallback_generate=fallback, min_confidence=0.5
+    )
+    result = engine.analyze(observations)
+    assert result.used_fallback is True
+    assert result.report.calibrated_confidence == pytest.approx(0.95)
+    assert result.primary_report is not None
+    assert result.primary_report.calibrated_confidence == pytest.approx(0.20)
+    assert "messages" in fb_capture
+
+
+def test_fallback_skipped_when_primary_confidence_meets_threshold():
+    observations = [_obs("obs_1", "hello world example")]
+    primary, _ = _make_generator(_make_high_conf_report(observations))
+
+    def _fallback(_messages):
+        raise AssertionError("fallback must not run when primary passes")
+
+    engine = SituationEngine(
+        generate=primary, fallback_generate=_fallback, min_confidence=0.5
+    )
+    result = engine.analyze(observations)
+    assert result.used_fallback is False
+    assert result.primary_report is None
+
+
+def test_fallback_invoked_when_primary_generator_raises():
+    observations = [_obs("obs_1", "hello world example")]
+
+    def _primary(_messages):
+        raise RuntimeError("provider down")
+
+    fallback, _ = _make_generator(_make_high_conf_report(observations))
+    engine = SituationEngine(
+        generate=_primary, fallback_generate=fallback, min_confidence=0.0
+    )
+    result = engine.analyze(observations)
+    assert result.used_fallback is True
+    assert result.primary_report is None
+
+
+def test_fallback_failure_keeps_primary_if_primary_succeeded():
+    observations = [_obs("obs_1", "hello world example")]
+    primary, _ = _make_generator(_make_low_conf_report(observations))
+
+    def _fallback(_messages):
+        raise RuntimeError("fallback offline")
+
+    engine = SituationEngine(
+        generate=primary, fallback_generate=_fallback, min_confidence=0.9
+    )
+    result = engine.analyze(observations)
+    assert result.used_fallback is False
+    assert result.report.calibrated_confidence == pytest.approx(0.20)
+
+
+@pytest.mark.asyncio
+async def test_async_engine_invokes_fallback_below_threshold():
+    observations = [_obs("obs_1", "hello world example")]
+    low = _make_low_conf_report(observations)
+    high = _make_high_conf_report(observations)
+
+    async def _primary(_messages):
+        return json.dumps(low.model_dump(mode="json"))
+
+    async def _fallback(_messages):
+        return json.dumps(high.model_dump(mode="json"))
+
+    engine = AsyncSituationEngine(
+        generate=_primary, fallback_generate=_fallback, min_confidence=0.5
+    )
+    result = await engine.analyze(observations)
+    assert result.used_fallback is True
+    assert result.report.calibrated_confidence == pytest.approx(0.95)
