@@ -22,6 +22,10 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+_REPO_ROOT_FOR_PATH = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT_FOR_PATH) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_FOR_PATH))
+
 from app.evals.scenario_eval import ScenarioJudge
 from app.evals.scenario_loader import ScenarioCase, ScenarioLoader
 from app.intelligence.situation_report import SituationReport
