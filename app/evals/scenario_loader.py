@@ -56,6 +56,12 @@ class ScenarioMetadata(BaseModel):
     adversarial_tags: List[str] = Field(default_factory=list)
     pii_review_passed: bool
     pii_reviewer_id: Optional[str] = Field(None, max_length=64)
+    # Set by the Lead when a batch is quarantined after an IAA failure
+    # (deliverables §3.2.3 / §3.4) or a PII leak (deliverables §4.4).
+    # Quarantined scenarios are excluded from the training set by
+    # ``scripts/build_training_set.py``; Phase-1 close requires this to be
+    # ``False`` everywhere (deliverables §3.5 / §5).
+    quarantined: bool = False
 
     model_config = ConfigDict(extra="forbid")
 

@@ -97,13 +97,23 @@ def main(argv: list[str] | None = None) -> int:
 
     loader = ScenarioLoader(args.scenarios_root)
     require_pii = not args.allow_unsigned_pii
+
+    def _eligible(it):
+        # Quarantined scenarios (IAA-failed batches per §3.4, or PII leaks per
+        # §4.4) must never enter train.jsonl / val.jsonl, even when signed.
+        for c in it:
+            if getattr(c.metadata, "quarantined", False):
+                logger.warning("skipping quarantined scenario %s", c.scenario_id)
+                continue
+            yield c
+
     # Sort cases by scenario_id for deterministic JSONL output across runs.
     train_cases = sorted(
-        loader.discover(split="train", require_pii_signoff=require_pii),
+        _eligible(loader.discover(split="train", require_pii_signoff=require_pii)),
         key=lambda c: c.scenario_id,
     )
     val_cases = sorted(
-        loader.discover(split="val", require_pii_signoff=require_pii),
+        _eligible(loader.discover(split="val", require_pii_signoff=require_pii)),
         key=lambda c: c.scenario_id,
     )
 
