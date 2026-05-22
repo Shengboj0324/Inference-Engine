@@ -32,6 +32,15 @@ from app.personalization.topic_embedding_profile import TopicEmbeddingProfile
 from app.personalization.feedback_learner import FeedbackLearner
 from app.personalization.user_digest_ranker import UserDigestRanker
 from app.personalization.novelty_vs_relevance_tradeoff import NoveltyRelevanceTradeoff
+from app.personalization.user_persona import (
+    REASONING_TRAITS,
+    STYLE_TRAITS,
+    Trait,
+    UserPersonaProfile,
+)
+from app.personalization.persona_bayes import BetaBinomialTrait, PopulationPrior
+from app.personalization.persona_bandit import ThompsonDirectiveSelector
+from app.personalization.persona_predictor import NextStylePredictor
 
 __all__ = [
     # Models
@@ -50,5 +59,15 @@ __all__ = [
     "NoveltyRelevanceTradeoff",
     "TopicEmbeddingProfile",
     "UserDigestRanker",
+    # Persona memory
+    "STYLE_TRAITS",
+    "REASONING_TRAITS",
+    "Trait",
+    "UserPersonaProfile",
+    # Bayesian / bandit / predictive extensions
+    "BetaBinomialTrait",
+    "PopulationPrior",
+    "ThompsonDirectiveSelector",
+    "NextStylePredictor",
 ]
 

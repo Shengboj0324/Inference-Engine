@@ -17,13 +17,15 @@ reviewed module under `app/` or a script under `scripts/`. It integrates, in ord
 2. **Gate 1 — readiness board** (`scripts/finetune_readiness.py`): 12 component checks.
 3. **Gate 2 — full-scale stress test** (`scripts/stress_test_full.py`): component board + end-to-end pipeline + integrated memory/personalization/self-improvement loop.
 4. **Corpus integration** — `ScenarioLoader` over `data/scenarios` (180 train/val + 40 held-out).
-5. **Memory integration** — build a `ContextMemoryStore` exemplar/rationale memory from the gold corpus.
-6. **Personalization integration** — interest graph + feedback learner + digest ranker; per-user `signal_type` weighting.
-7. **Pre-flight (CPU)** — `SituationEngineFineTuner.preflight()`.
-8. **Train (QLoRA)** — `SituationEngineFineTuner.run()` (assistant-only loss masking, NF4 4-bit, LoRA r=16).
-9. **Calibration + self-improvement** — post-train calibration (ECE/Brier) and the online `ConfidenceCalibrator` / `OutcomeFeedbackStore` loop; optional RL action-ranking.
-10. **Promote** — held-out LLM-judge gate (`scripts/promote_checkpoint.py`, floor 85) after a manifest-integrity check.
-11. **Final readiness confirmation** — asserts every gate and prints the fine-tune-ready / promoted banner.
+5. **Information acquisition** — hybrid dense+sparse candidate retrieval (HNSW + TF-IDF, RRF-normalised) with a Recall@k / MRR / nDCG acquisition gate.
+6. **Memory integration** — build a `ContextMemoryStore` exemplar/rationale memory from the gold corpus.
+7. **Personalization integration** — interest graph + feedback learner + digest ranker; per-user `signal_type` weighting.
+8. **Persona personalization** — dedicated per-user persona memory (style/reasoning/hobbies/characteristics) learned from turn signals and injected into the live answer path as a style directive.
+9. **Pre-flight (CPU)** — `SituationEngineFineTuner.preflight()`.
+10. **Train (QLoRA)** — `SituationEngineFineTuner.run()` (assistant-only loss masking, NF4 4-bit, LoRA r=16).
+11. **Calibration + self-improvement** — post-train calibration (ECE/Brier) and the online `ConfidenceCalibrator` / `OutcomeFeedbackStore` loop; optional RL action-ranking.
+12. **Promote** — held-out LLM-judge gate (`scripts/promote_checkpoint.py`, floor 85) after a manifest-integrity check.
+13. **Final readiness confirmation** — asserts every gate and prints the fine-tune-ready / promoted banner.
 
 > **The unbreakable rule** (`docs/intelligence_migration.md` §0): zero keyword
 > matching, hard-coded outputs, templates, or rule-based answering in the
@@ -117,7 +119,129 @@ assert len(splits['heldout']) == 40
 from collections import Counter
 print('train signal types:', dict(Counter(c.gold_report.signal_type for c in splits['train'])))""")
 
-md("""## 7. Memory integration — `ContextMemoryStore`
+md("""## 7. Information acquisition — hybrid candidate retrieval & retrieval-quality gate
+
+Build the **candidate-retrieval exemplar bank** from the gold corpus and verify
+the hybrid dense+sparse acquisition path that feeds LLM adjudication (Stage B).
+This exercises two acquisition-hardening upgrades:
+
+* **`HNSWIndex` brute-force fallback** — dense retrieval now degrades to *exact*
+  pure-numpy search when the optional `hnswlib` wheel is absent (it is not in
+  `requirements.txt`), so the acquisition stage never hard-fails on a missing
+  dependency. The active backend is printed below.
+* **RRF score normalisation** — fused dense+sparse scores are normalised onto
+  `[0, 1]` so the semantic signal competes fairly with the entity-regex and
+  platform-prior sources, instead of being structurally out-weighed by coarse
+  keyword matches (the prior "information-acquisition mismatch").
+
+Acquisition recall is then scored with `RetrievalEvaluator`
+(Recall@k / MRR / nDCG@k) over the held-out observations and gated on a floor.
+This cell is CPU-only and self-contained (depends only on `splits` from §6).""")
+code("""from pathlib import Path
+from datetime import datetime, timezone
+from uuid import uuid4
+import app.intelligence.hnsw_search as _hs
+from app.core.models import MediaType, SourcePlatform
+from app.domain.inference_models import SignalType
+from app.domain.normalized_models import NormalizedObservation
+from app.intelligence.candidate_retrieval import CandidateRetriever, ExemplarSignal
+from app.intelligence.context_memory import _bow_embed
+from app.intelligence.retrieval.retrieval_evaluator import RetrievalEvaluator, RetrievalQuery
+
+def _to_sig(v):
+    try:
+        return SignalType(v)
+    except ValueError:
+        return SignalType.UNCLEAR
+
+# 1) Exemplar bank from gold-train (one exemplar per scenario).
+exemplars = [
+    ExemplarSignal(signal_type=_to_sig(c.gold_report.signal_type),
+                   text=c.gold_report.summary,
+                   embedding=_bow_embed(c.gold_report.summary),
+                   entities=[], platform='')
+    for c in splits['train']
+]
+bank_path  = Path('/content/drive/MyDrive/situation_engine/exemplar_bank.json')
+prior_path = Path('/content/drive/MyDrive/situation_engine/retrieval_config.json')
+retriever = CandidateRetriever(exemplar_bank=exemplars, top_k=5,
+                               exemplar_bank_path=bank_path, priors_config_path=prior_path)
+print('dense backend:',
+      'hnswlib' if _hs.hnswlib is not None else 'numpy brute-force fallback')
+print('exemplars indexed:', retriever.get_stats()['total_exemplars'])
+
+# 2) Acquisition recall over held-out: relevant id == the gold signal type.
+def _mk_obs(text):
+    now = datetime.now(timezone.utc)
+    return NormalizedObservation(
+        raw_observation_id=uuid4(), user_id=uuid4(),
+        source_platform=SourcePlatform.RSS, source_id='probe',
+        source_url='https://example.com', title='', normalized_text=text,
+        media_type=MediaType.TEXT, published_at=now, fetched_at=now,
+        embedding=_bow_embed(text))
+
+def _retrieve(query):
+    return [c.signal_type.value for c in retriever.retrieve_candidates(_mk_obs(query))]
+
+queries = [
+    RetrievalQuery(query_id=f'h{i}', query_text=c.observations[0].text,
+                   relevant_chunk_ids={_to_sig(c.gold_report.signal_type).value})
+    for i, c in enumerate(splits['heldout'])
+]
+metrics = RetrievalEvaluator().evaluate(queries, _retrieve, k=5)
+print(metrics)
+# Gate 3 — acquisition recall floor (tune upward as the corpus and exemplar
+# embeddings improve; bag-of-words is a conservative lower bound vs real embeds).
+assert metrics.recall_at_k >= 0.50, f'acquisition Recall@5 below floor: {metrics.recall_at_k:.3f}'
+print('Gate 3 PASS — hybrid acquisition Recall@5 =', round(metrics.recall_at_k, 3))
+
+# 3) Persist the exemplar bank so the serving retriever reuses it.
+bank_path.parent.mkdir(parents=True, exist_ok=True)
+retriever._persist_exemplar_bank()
+print('persisted exemplar bank to', bank_path)""")
+
+code("""# Tier 1.1 (learned fusion) + Tier 1.2 (reranker) — measured against the
+# fixed-weight baseline above, with a no-regression gate.
+from app.intelligence.retrieval_fusion import LogisticFusion
+from app.intelligence.reranker import Reranker
+
+# 1.1 — train the logistic fusion combiner on gold-train per-source features.
+_X, _y = [], []
+for c in splits['train']:
+    gold = _to_sig(c.gold_report.signal_type)
+    _obs = _mk_obs(c.observations[0].text)
+    for st, fv in retriever.extract_fusion_features(_obs).items():
+        _X.append(fv); _y.append(1.0 if st == gold else 0.0)
+fusion = LogisticFusion(n_features=3).fit(_X, _y) if _X else LogisticFusion(3)
+print('learned fusion weights:',
+      dict(zip(['emb', 'ent', 'plat'], [round(float(w), 3) for w in fusion.w])),
+      'bias=', round(fusion.b, 3))
+
+retriever.fusion_model = fusion
+m_fused = RetrievalEvaluator().evaluate(queries, _retrieve, k=5)
+retriever.fusion_model = None
+
+# 1.2 — retrieve-then-rerank with the cross-encoder (TF-IDF fallback here).
+retriever.reranker = Reranker()
+m_rerank = RetrievalEvaluator().evaluate(queries, _retrieve, k=5)
+retriever.reranker = None
+
+print(f"{'stage':16}{'Recall@5':>10}{'MRR':>8}{'nDCG@5':>9}")
+for _name, _m in [('baseline', metrics), ('learned-fusion', m_fused), ('reranker', m_rerank)]:
+    print(f"{_name:16}{_m.recall_at_k:10.3f}{_m.mrr:8.3f}{_m.ndcg_at_k:9.3f}")
+
+# Gate: neither upgrade may meaningfully regress baseline recall. On real dense
+# embeddings the learned fusion is expected to *beat* the baseline; with the
+# bag-of-words dev embedding it should at least match it (tolerance 0.02).
+assert m_fused.recall_at_k >= metrics.recall_at_k - 0.02, 'learned fusion regressed recall'
+assert m_rerank.recall_at_k >= metrics.recall_at_k - 0.02, 'reranker regressed recall'
+print('Tier 1.1/1.2 gate PASS - no recall regression vs baseline.')
+
+# Persist the trained fusion model next to the exemplar bank for serving reuse.
+fusion.save(Path('/content/drive/MyDrive/situation_engine/retrieval_fusion.json'))
+print('persisted learned fusion model.')""")
+
+md("""## 8. Memory integration — `ContextMemoryStore`
 
 Build a per-user **rationale/exemplar memory** from the gold corpus so the
 runtime can retrieve the most semantically similar past gold rationales as
@@ -152,7 +276,33 @@ mem_path.parent.mkdir(parents=True, exist_ok=True)
 store.persist(mem_path)
 print('persisted exemplar memory to', mem_path)""")
 
-md("""## 8. Personalization integration
+code("""# Tier 1.3 - calibrate retrieval similarity into a relevance probability.
+from app.intelligence.similarity_calibration import SimilarityCalibrator
+import numpy as _np
+
+# (similarity, relevant) pairs from the gold corpus: nearest rationale counts as
+# relevant when its signal type matches the probe's gold signal type.
+_sims, _labels = [], []
+for case in splits['train']:
+    _gold = _to_signal(case.gold_report.signal_type)
+    _probe = case.observations[0].text
+    for hit in store.retrieve_similar_rationales(corpus_user, store._embed_fn(_probe), top_k=5):
+        _sims.append(float(hit['score']))
+        _labels.append(1.0 if hit['signal_type'] == _gold.value else 0.0)
+
+if len(_sims) >= 20 and 0 < sum(_labels) < len(_labels):
+    cal = SimilarityCalibrator('isotonic').fit(_sims, _labels)
+    _raw = _np.clip(_np.array(_sims), 0.0, 1.0)
+    _cprob = _np.array([cal.transform(s) for s in _sims])
+    _ece = SimilarityCalibrator.expected_calibration_error
+    print(f'similarity ECE  raw={_ece(_raw, _labels):.3f}  calibrated={_ece(_cprob, _labels):.3f}')
+    assert _ece(_cprob, _labels) <= _ece(_raw, _labels) + 0.02, 'calibration must not worsen ECE'
+    cal.save(Path('/content/drive/MyDrive/situation_engine/similarity_calibrator.json'))
+    print('Tier 1.3 gate PASS - similarity calibrator fit + persisted.')
+else:
+    print('Tier 1.3 - insufficient labelled pairs in dev corpus; skipping fit.')""")
+
+md("""## 9. Personalization integration
 
 Build a per-user interest profile (interest graph + topic-embedding profile),
 learn online from feedback, and rank candidate signals with the multi-signal
@@ -191,7 +341,104 @@ cm_user = uuid4()
 store.update_signal_preference(cm_user, SignalType.COMPLAINT, OutcomeType.DISMISSED)
 print('per-user signal weights:', store.get_signal_type_weights(cm_user))""")
 
-md("""## 9. Pre-flight (CPU)
+md("""## 10. Persona personalization — dedicated user-memory & style directive
+
+Build a **dedicated per-user persona memory** (`UserPersonaProfile`, stored in
+`ContextMemoryStore`) that learns the user's communication & reasoning style,
+hobbies, and stated characteristics from turn signals, then renders a compact
+**style directive** that the live answer path injects as a `system` message
+(`app/local/persona_memory.py` wired into `app/api/routes/chat.py`).
+
+The estimator is a confidence-weighted, recency-decaying running mean with an
+online weighted-variance consistency penalty, so the directive only carries
+preferences the model is actually confident about. CPU-only.""")
+code("""from app.intelligence.context_memory import ContextMemoryStore as _CMS
+from app.local.persona_memory import extract_style_signals
+from uuid import uuid4 as _uuid4
+
+try:
+    _pstore = store            # reuse the §8 ContextMemoryStore if defined
+except NameError:
+    _pstore = _CMS()
+_puser = _uuid4()
+
+_turns = ['please be concise', 'no emojis', 'be concise please',
+          'walk me through it step by step', 'be concise']
+for _t in _turns:
+    _sig = extract_style_signals(_t)
+    if _sig:
+        _pstore.observe_user_persona(_puser, traits=_sig)
+    print(f'  turn={_t!r:42} signals={_sig}')
+
+_persona = _pstore.get_user_persona(_puser)
+_vt = _persona.trait('verbosity')
+print()
+print('learned verbosity value:', round(_vt.value, 3), '| confidence:', round(_vt.confidence, 3))
+_directive = _persona.render_style_directive(min_confidence=0.3)
+print()
+print('--- style directive injected into the answer path ---')
+print(_directive)
+assert _directive, 'expected a non-empty directive after repeated explicit requests'
+assert 'concise' in _directive
+print('Persona personalization PASS - directive ready for prompt injection.')""")
+
+code("""# Tier 2.1-2.4 - Bayesian confidence, cold-start prior, bandit, next-style.
+import numpy as _np
+from app.personalization import (BetaBinomialTrait, PopulationPrior,
+    ThompsonDirectiveSelector, NextStylePredictor, UserPersonaProfile)
+from app.personalization.persona_bandit import ARM_HIGH
+
+_rng = _np.random.default_rng(0)
+
+# 2.1 Beta-Binomial confidence tightens with consistent evidence.
+_bt = BetaBinomialTrait()
+for _ in range(8):
+    _bt.observe(1.0, 1.0, 45.0)
+print(f'2.1 Beta-Binomial emoji-off: value={_bt.value:.2f} confidence={_bt.confidence:.2f}')
+
+# 2.2 Population prior -> empirical-Bayes cold-start shrinkage.
+_prior = PopulationPrior(strength=3.0)
+for _ in range(150):
+    _tu = float(_rng.beta(2, 5)); _bp = UserPersonaProfile('b')
+    for _ in range(25):
+        _bp.observe_trait('verbosity', 1.0 if _rng.random() < _tu else 0.0)
+    _prior.build_from_personas([_bp])
+_mse_no = _mse_pr = 0.0
+for _ in range(300):
+    _tu = float(_rng.beta(2, 5))
+    _pn = UserPersonaProfile('n'); _pp = UserPersonaProfile('p', prior=_prior)
+    for _ in range(2):
+        _x = 1.0 if _rng.random() < _tu else 0.0
+        _pn.observe_trait('verbosity', _x); _pp.observe_trait('verbosity', _x)
+    _mse_no += (_pn.trait('verbosity').value - _tu) ** 2
+    _mse_pr += (_pp.trait('verbosity').value - _tu) ** 2
+print(f'2.2 cold-start MSE: flat={_mse_no/300:.3f}  prior-seeded={_mse_pr/300:.3f}')
+assert _mse_pr < _mse_no, 'population prior must reduce cold-start error'
+
+# 2.3 Thompson directive bandit regret vs random.
+_sel = ThompsonDirectiveSelector(seed=1); _r2 = _np.random.default_rng(1); _reg = 0.0
+for _ in range(500):
+    _arm = _sel.select('step'); _ptrue = 0.8 if _arm == ARM_HIGH else 0.3
+    _sel.update('step', _arm, 1.0 if _r2.random() < _ptrue else 0.0); _reg += 0.8 - _ptrue
+_best_high = _sel.best_arm('step') == ARM_HIGH
+print(f'2.3 Thompson regret over 500 rounds = {_reg:.1f} (random ~125); best-arm-high={_best_high}')
+assert _best_high
+
+# 2.4 Next-style predictor beats the majority baseline on sticky streams.
+def _sticky(n):
+    s = [1.0 if _rng.random() < 0.5 else 0.0]
+    for _ in range(n - 1):
+        s.append(s[-1] if _rng.random() < 0.85 else 1.0 - s[-1])
+    return s
+_nsp = NextStylePredictor(window=4).fit([_sticky(40) for _ in range(120)])
+_X, _y = _nsp.build_dataset([_sticky(40) for _ in range(60)])
+_acc = float(_np.mean([(_nsp._model.predict_one(x) >= 0.5) == (yy >= 0.5) for x, yy in zip(_X, _y)]))
+_maj = max(float(_np.mean(_y)), 1.0 - float(_np.mean(_y)))
+print(f'2.4 next-style acc={_acc:.3f}  majority={_maj:.3f}')
+assert _acc > _maj + 0.05
+print('Tier 2.1-2.4 gate PASS.')""")
+
+md("""## 11. Pre-flight (CPU)
 
 Validate prompt + training files **without** loading the model. This is the
 last cheap gate before the GPU is touched.""")
@@ -211,7 +458,7 @@ ft = SituationEngineFineTuner(cfg)
 report = ft.preflight()
 print(report)""")
 
-md("""## 10. Train (QLoRA)
+md("""## 12. Train (QLoRA)
 
 `run()` loads Llama 3.1 8B in NF4 4-bit, attaches LoRA (r=16, α=32 on attn+MLP
 projections), tokenizes with **assistant-only loss masking** (system + user
@@ -220,7 +467,7 @@ writes the adapter + run manifest to Drive. Requires the A100.""")
 code("""metrics = ft.run()
 metrics""")
 
-md("""## 11. Calibration + self-improvement
+md("""## 13. Calibration + self-improvement
 
 After training, run the fine-tuned adapter over the validation split, compute
 calibration (ECE / Brier) against the gold reports, then exercise the online
@@ -276,7 +523,7 @@ try:
 except Exception as exc:
     print('RL stage skipped:', exc)""")
 
-md("""## 12. Promote — held-out judge gate (floor 85)
+md("""## 14. Promote — held-out judge gate (floor 85)
 
 First verify the held-out folders are untampered (SHA-256 manifest), then run
 the LLM-as-judge over all 40 held-out scenarios with the fine-tuned adapter.
@@ -297,7 +544,7 @@ rc = subprocess.call([sys.executable, 'scripts/promote_checkpoint.py',
     '--manifest', str(OUT / 'promotion_manifest.json')])
 print('promotion exit code:', rc)""")
 
-md("""## 13. Final readiness confirmation
+md("""## 15. Final readiness confirmation
 
 Aggregate every gate into a single verdict and write a confirmation file next to
 the checkpoint. The checkpoint is **fine-tune-ready and promotable** only when

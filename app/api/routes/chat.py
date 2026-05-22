@@ -237,6 +237,40 @@ def _record_citations(snippets: List[RetrievedSnippet]) -> None:
         logger.exception("personalization citation hook failed")
 
 
+def _augment_with_persona(
+    messages: List[chat_streamer.StreamMessage],
+) -> List[chat_streamer.StreamMessage]:
+    """Prepend the learned per-user persona directive as a ``system`` message.
+
+    The directive (communication/reasoning style, interests, known context) is
+    learned over time and only rendered once the model is confident, so early
+    chats are unaffected.  Soft-fails to the unmodified messages — the persona
+    shapes *how* the model answers but never blocks the answer.
+    """
+    try:
+        from app.local.persona_memory import persona_system_prompt
+        directive = persona_system_prompt()
+    except Exception:  # noqa: BLE001 - personalization must never break chat
+        logger.exception("persona augmentation failed")
+        return messages
+    if not directive:
+        return messages
+    return [chat_streamer.StreamMessage(role="system", content=directive), *messages]
+
+
+def _learn_persona_from_turn(text: str) -> None:
+    """Fold the user turn's explicit style requests into the persona memory.
+
+    Memory-only side effect (does not generate or alter answer text); runs
+    after the reply and soft-fails so it never blocks chat.
+    """
+    try:
+        from app.local.persona_memory import learn_from_user_turn
+        learn_from_user_turn(text)
+    except Exception:  # noqa: BLE001 - learning must never block chat
+        logger.exception("persona learning hook failed")
+
+
 @router.post("/sessions/{session_id}/messages", response_model=ReplyResponse,
              status_code=201)
 async def post_message(session_id: str, request: MessageCreateRequest) -> ReplyResponse:
@@ -248,6 +282,7 @@ async def post_message(session_id: str, request: MessageCreateRequest) -> ReplyR
     source = chat_streamer.pick_default_source()
     base = _stream_messages_for(session_id)
     messages, snippets = await _augment_with_rag(request, base)
+    messages = _augment_with_persona(messages)
     parts: List[str] = []
     async for chunk in source.stream(
         messages,
@@ -260,6 +295,7 @@ async def post_message(session_id: str, request: MessageCreateRequest) -> ReplyR
         session_id, role="assistant", content=assistant_text
     )
     _record_citations(snippets)
+    _learn_persona_from_turn(request.content)
     return ReplyResponse(
         user_message=MessageResponse.from_orm_like(user_msg),
         assistant_message=MessageResponse.from_orm_like(assistant_msg),
@@ -288,6 +324,7 @@ async def stream_message(session_id: str, request: MessageCreateRequest) -> Stre
     source = chat_streamer.pick_default_source()
     base = _stream_messages_for(session_id)
     messages, snippets = await _augment_with_rag(request, base)
+    messages = _augment_with_persona(messages)
 
     async def event_stream():
         yield _sse("user_message", MessageResponse.from_orm_like(user_msg).model_dump())
@@ -319,6 +356,7 @@ async def stream_message(session_id: str, request: MessageCreateRequest) -> Stre
         yield _sse("assistant_message",
                    MessageResponse.from_orm_like(assistant_msg).model_dump())
         _record_citations(snippets)
+        _learn_persona_from_turn(request.content)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

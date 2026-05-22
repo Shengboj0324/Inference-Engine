@@ -19,8 +19,12 @@ It also maintains:
   ``StrategicPriorities.competitors`` at inference time.
 - **Preferred channel map** — ``SignalType`` → ``ResponseChannel`` learned from
   user action history.
-- **Persistence** — all preference, history, and metadata state can be flushed
-  to / restored from a JSON file via :meth:`persist` / :meth:`load_from_disk`.
+- **Persistence** — the core per-user vector memory (observation records and
+  their embeddings) plus all preference, history, profile, and metadata state
+  are flushed to / restored from a JSON file via :meth:`persist` /
+  :meth:`load_from_disk`, so semantic recall survives a process restart.
+  Snapshot format ``"1.1"`` adds the ``records`` / ``embeddings`` buckets;
+  older ``"1.0"`` snapshots still load (the new buckets default to empty).
 
 ``OutcomeFeedbackStore`` records per-``(user_id, signal_inference_id)`` outcome
 labels (``OutcomeType``) and drives the adaptive threshold and federated
@@ -51,6 +55,7 @@ import logging
 import math
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -162,7 +167,11 @@ class ContextMemoryStore:
         self._history_ttl_days: int = history_ttl_days
         self._rationale_ttl_days: int = rationale_ttl_days
 
-        # Single re-entrant lock protecting all mutable state.
+        # Single non-reentrant lock protecting all mutable state.  All public
+        # methods acquire it at most once and never call another locked method
+        # while holding it (e.g. OutcomeFeedbackStore performs threshold
+        # updates outside the lock), so a plain Lock is sufficient and avoids
+        # masking accidental re-entrancy.
         self._lock: threading.Lock = threading.Lock()
 
         # Keyed by user_id (str) for fast per-user lookup.
@@ -212,6 +221,20 @@ class ContextMemoryStore:
         # Every textual value is PII-scrubbed via DataResidencyGuard before
         # being written so the profile is safe to serialise and export.
         self._user_profiles: Dict[str, Dict[str, Any]] = {}
+
+        # ── Dedicated per-user persona memory ────────────────────────────────
+        # user_id → serialised UserPersonaProfile dict (see
+        # app.personalization.user_persona).  Captures learned communication /
+        # reasoning style, hobbies, stated characteristics, and acquisition
+        # preferences.  Persisted alongside the rest of the per-user state so a
+        # user's personalization survives restarts.
+        self._user_personas: Dict[str, Dict[str, Any]] = {}
+
+        # ── Optional similarity → probability calibrator (Tier 1.3) ──────────
+        # When set, retrieve() maps each raw cosine similarity through the
+        # calibrator so ``min_score`` is a calibrated relevance probability and
+        # is comparable across embedding models.  ``None`` → raw cosine (default).
+        self._sim_calibrator: Any = None
 
         # ── Cross-user access audit trail ────────────────────────────────────
         # Append-only ring buffer of dicts describing every rejected read.
@@ -282,14 +305,32 @@ class ContextMemoryStore:
             self._embeddings[uid].append(vector)
             self._total += 1
 
-            # Evict oldest record when capacity is exceeded.
-            if self._total > self._max_records:
-                for key in self._records:
-                    if self._records[key]:
-                        self._records[key].pop(0)
-                        self._embeddings[key].pop(0)
-                        self._total -= 1
-                        break
+            # Evict the GLOBALLY-oldest record(s) when capacity is exceeded.
+            #
+            # Records are appended in chronological order within each per-user
+            # bucket, so the eviction candidate for a bucket is always its
+            # front element (index 0).  The previous implementation popped the
+            # front of the *first non-empty bucket in dict-iteration order*,
+            # which under skewed multi-user load could evict a recent record
+            # from one user while keeping a far older record from another.
+            # We instead select the bucket whose front record has the smallest
+            # ``created_at`` and evict that, guaranteeing true global-oldest
+            # eviction and keeping ``_records`` / ``_embeddings`` in lockstep.
+            while self._total > self._max_records:
+                victim_uid: Optional[str] = None
+                victim_ts: Optional[datetime] = None
+                for key, recs in self._records.items():
+                    if not recs:
+                        continue
+                    front_ts = recs[0].created_at
+                    if victim_ts is None or front_ts < victim_ts:
+                        victim_ts = front_ts
+                        victim_uid = key
+                if victim_uid is None:  # pragma: no cover - all buckets empty
+                    break
+                self._records[victim_uid].pop(0)
+                self._embeddings[victim_uid].pop(0)
+                self._total -= 1
 
         _elapsed_ms = (time.perf_counter() - _t0) * 1000
         logger.debug(
@@ -306,6 +347,9 @@ class ContextMemoryStore:
         query_text: str,
         top_k: int = 5,
         requesting_user_id: Optional[UUID] = None,
+        recency_half_life_days: Optional[float] = None,
+        signal_types: Optional[Set[SignalType]] = None,
+        min_score: float = 0.0,
     ) -> List[MemoryRecord]:
         """Return the ``top_k`` most similar past records for ``user_id``.
 
@@ -321,11 +365,22 @@ class ContextMemoryStore:
                 and an audit entry is appended.  This is the canonical hook
                 that callers (API layer, agents) should use to enforce
                 cross-user isolation.
+            recency_half_life_days: When set, each record's cosine similarity
+                is multiplied by an exponential recency weight
+                ``0.5 ** (age_days / half_life)`` so that, among
+                similarly-relevant memories, more recent ones rank higher.
+                ``None`` (default) preserves the original pure-cosine ranking.
+            signal_types: Optional whitelist of ``SignalType``\\s; records whose
+                ``signal_type`` is not in the set are excluded.  ``None`` keeps
+                all types (default).
+            min_score: Records whose final score is below this threshold are
+                dropped.  Defaults to ``0.0`` (keep everything non-negative).
 
         Returns:
-            List of ``MemoryRecord`` objects sorted by ``score`` descending,
-            with ``score`` populated as the cosine similarity.  Returns an
-            empty list when the user has no stored records.
+            List of ``MemoryRecord`` objects sorted by ``score`` descending.
+            ``score`` is the cosine similarity, or the recency-weighted score
+            when ``recency_half_life_days`` is supplied.  Returns an empty list
+            when the user has no stored records.
 
         Raises:
             MemoryLeakError: If ``requesting_user_id`` is set and does not
@@ -361,13 +416,31 @@ class ContextMemoryStore:
         if q_norm < 1e-9:
             return []
 
+        _now = datetime.now(timezone.utc)
+        _calibrator = self._sim_calibrator
         scored: List[Tuple[float, MemoryRecord]] = []
         for vec, rec in zip(embeddings_snapshot, records_snapshot):
+            if signal_types is not None and rec.signal_type not in signal_types:
+                continue
             v_norm = float(np.linalg.norm(vec))
             if v_norm < 1e-9:
                 continue
             similarity: float = float(np.dot(query_vec, vec) / (q_norm * v_norm))
-            scored.append((similarity, rec))
+            # Tier 1.3 — map raw cosine to a calibrated relevance probability so
+            # ``min_score`` is portable across embedding models (opt-in).
+            if _calibrator is not None:
+                similarity = float(_calibrator.transform(similarity))
+            score = similarity
+            if recency_half_life_days is not None and recency_half_life_days > 0:
+                created = rec.created_at
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_days = max(0.0, (_now - created).total_seconds() / 86400.0)
+                recency_weight = 0.5 ** (age_days / recency_half_life_days)
+                score = similarity * recency_weight
+            if score < min_score:
+                continue
+            scored.append((score, rec))
 
         scored.sort(key=lambda t: t[0], reverse=True)
         results: List[MemoryRecord] = []
@@ -564,8 +637,17 @@ class ContextMemoryStore:
             List of dicts — newest last.  Empty list when no history exists.
         """
         uid = str(user_id)
+        _ttl_cutoff_iso = (
+            datetime.now(timezone.utc) - timedelta(days=self._history_ttl_days)
+        ).isoformat()
         with self._lock:
-            history = list(self._inference_history.get(uid, []))
+            # Exclude TTL-expired entries on read as well as on write, so a
+            # long-idle user's bucket (no recent writes to trigger pruning)
+            # never returns stale history.
+            history = [
+                r for r in self._inference_history.get(uid, [])
+                if r.get("inferred_at", "") >= _ttl_cutoff_iso
+            ]
         logger.debug(
             "ContextMemoryStore.get_inference_history: user=%s limit=%d found=%d",
             user_id, limit, min(limit, len(history)),
@@ -849,8 +931,33 @@ class ContextMemoryStore:
         path = Path(path)
         _t0 = time.perf_counter()
         with self._lock:
+            # Serialise the core per-user vector memory (records + their
+            # embeddings) so that semantic recall survives a process restart.
+            # Prior to v1.1 these two buckets were silently omitted, so every
+            # restart reset the observation memory to empty — the dominant
+            # cause of the "insufficient memory" symptom.  Embeddings are
+            # written as plain float lists; records keep the fields needed to
+            # rebuild a fully-typed :class:`MemoryRecord` on load.
+            records_payload: Dict[str, List[Dict[str, Any]]] = {}
+            for u, recs in self._records.items():
+                records_payload[u] = [
+                    {
+                        "observation_id": str(r.observation_id),
+                        "normalized_text": r.normalized_text,
+                        "signal_type": r.signal_type.value,
+                        "confidence": float(r.confidence),
+                        "created_at": r.created_at.isoformat(),
+                    }
+                    for r in recs
+                ]
+            embeddings_payload: Dict[str, List[List[float]]] = {
+                u: [v.tolist() for v in vecs]
+                for u, vecs in self._embeddings.items()
+            }
             payload = {
-                "version": "1.0",
+                "version": "1.1",
+                "records": records_payload,
+                "embeddings": embeddings_payload,
                 "preferences": self._preferences,
                 "inference_history": self._inference_history,
                 "history_seen": {
@@ -862,6 +969,8 @@ class ContextMemoryStore:
                 "competitor_aliases": self._competitor_aliases,
                 "channel_prefs": self._channel_prefs,
                 "source_embeddings": self._source_embeddings,
+                "user_profiles": self._user_profiles,
+                "user_personas": self._user_personas,
             }
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -904,9 +1013,62 @@ class ContextMemoryStore:
             self._competitor_aliases = payload.get("competitor_aliases", {})
             self._channel_prefs = payload.get("channel_prefs", {})
             self._source_embeddings = payload.get("source_embeddings", {})
+            self._user_profiles = payload.get("user_profiles", {})
+            self._user_personas = payload.get("user_personas", {})
+
+            # Restore the core vector memory (added in v1.1).  Snapshots written
+            # by older versions simply lack these keys and load as empty, which
+            # preserves backward compatibility.  We rebuild fully-typed
+            # MemoryRecords and float32 embeddings, skip any record whose
+            # signal_type is no longer a valid enum member (enum drift across
+            # releases), and enforce the records/embeddings lockstep invariant.
+            records_raw = payload.get("records", {}) or {}
+            embeddings_raw = payload.get("embeddings", {}) or {}
+            self._records = {}
+            self._embeddings = {}
+            _skipped = 0
+            for u, recs in records_raw.items():
+                vecs = embeddings_raw.get(u, [])
+                n = min(len(recs), len(vecs))
+                if n != len(recs) or n != len(vecs):
+                    logger.warning(
+                        "ContextMemoryStore.load_from_disk: records/embeddings "
+                        "length mismatch for user=%s (%d records, %d embeddings)"
+                        " — truncating to %d to preserve lockstep invariant",
+                        u, len(recs), len(vecs), n,
+                    )
+                rebuilt: List[MemoryRecord] = []
+                rebuilt_vecs: List[np.ndarray] = []
+                for rec_d, vec in zip(recs[:n], vecs[:n]):
+                    try:
+                        signal_type = SignalType(rec_d["signal_type"])
+                    except ValueError:
+                        _skipped += 1
+                        continue
+                    try:
+                        created_at = datetime.fromisoformat(rec_d["created_at"])
+                    except (KeyError, ValueError):
+                        created_at = datetime.now(timezone.utc)
+                    rebuilt.append(
+                        MemoryRecord(
+                            user_id=UUID(u),
+                            observation_id=UUID(rec_d["observation_id"]),
+                            normalized_text=rec_d.get("normalized_text", ""),
+                            signal_type=signal_type,
+                            confidence=float(rec_d.get("confidence", 0.0)),
+                            created_at=created_at,
+                        )
+                    )
+                    rebuilt_vecs.append(np.array(vec, dtype=np.float32))
+                if rebuilt:
+                    self._records[u] = rebuilt
+                    self._embeddings[u] = rebuilt_vecs
+            self._total = sum(len(v) for v in self._records.values())
         logger.info(
-            "ContextMemoryStore.load_from_disk: loaded %s in %.1f ms",
+            "ContextMemoryStore.load_from_disk: loaded %s in %.1f ms "
+            "(records=%d users=%d skipped=%d)",
             path, (time.perf_counter() - _t0) * 1000,
+            self._total, len(self._records), _skipped,
         )
 
     # ── Cross-user isolation helpers ─────────────────────────────────────────
@@ -954,6 +1116,16 @@ class ContextMemoryStore:
         with self._lock:
             return [dict(e) for e in self._leak_audit]
 
+    def set_similarity_calibrator(self, calibrator: Any) -> None:
+        """Attach (or clear) a similarity→probability calibrator for retrieve().
+
+        ``calibrator`` must expose ``transform(sim: float) -> float`` (e.g.
+        :class:`app.intelligence.similarity_calibration.SimilarityCalibrator`).
+        Pass ``None`` to revert to raw cosine scoring.  Opt-in: does not change
+        any other behaviour.
+        """
+        self._sim_calibrator = calibrator
+
     # ── GDPR / user-profile API (additive) ───────────────────────────────────
 
     def clear_user_data(self, user_id: UUID) -> Dict[str, int]:
@@ -980,6 +1152,7 @@ class ContextMemoryStore:
                 "competitor_aliases": len(self._competitor_aliases.pop(uid, [])),
                 "channel_prefs": len(self._channel_prefs.pop(uid, {})),
                 "profile": 1 if self._user_profiles.pop(uid, None) else 0,
+                "persona": 1 if self._user_personas.pop(uid, None) else 0,
             }
             self._noise_thresholds.pop(uid, None)
             self._total = sum(len(v) for v in self._records.values())
@@ -1020,6 +1193,7 @@ class ContextMemoryStore:
                 "competitor_aliases": list(self._competitor_aliases.get(uid, [])),
                 "channel_prefs": dict(self._channel_prefs.get(uid, {})),
                 "profile": dict(self._user_profiles.get(uid, {})),
+                "persona": dict(self._user_personas.get(uid, {})),
                 "exported_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -1029,6 +1203,63 @@ class ContextMemoryStore:
         uid = str(user_id)
         with self._lock:
             return dict(self._user_profiles.get(uid, {}))
+
+    # ── Dedicated per-user persona memory ────────────────────────────────────
+
+    def get_user_persona(self, user_id: UUID) -> "UserPersonaProfile":
+        """Return the user's :class:`UserPersonaProfile` (reconstructed from disk-safe state).
+
+        A fresh, empty profile is returned for users with no recorded persona,
+        so callers can always rely on a non-``None`` object.  Mutating the
+        returned object does **not** persist it — call :meth:`save_user_persona`
+        or use :meth:`observe_user_persona` for the load-modify-store cycle.
+        """
+        self._validate_user_id(user_id, op="get_user_persona")
+        from app.personalization.user_persona import UserPersonaProfile
+        uid = str(user_id)
+        with self._lock:
+            stored = self._user_personas.get(uid)
+            stored = dict(stored) if stored else None
+        if stored:
+            return UserPersonaProfile.from_dict(stored)
+        return UserPersonaProfile(user_id=uid)
+
+    def save_user_persona(self, user_id: UUID, persona: "UserPersonaProfile") -> None:
+        """Persist (in-memory) the serialised state of ``persona`` for ``user_id``."""
+        self._validate_user_id(user_id, op="save_user_persona")
+        with self._lock:
+            self._user_personas[str(user_id)] = persona.to_dict()
+
+    def observe_user_persona(
+        self,
+        user_id: UUID,
+        *,
+        traits: Optional[Dict[str, float]] = None,
+        hobbies: Optional[List[str]] = None,
+        characteristics: Optional[Dict[str, str]] = None,
+        acquisition: Optional[Dict[str, float]] = None,
+        strength: float = 1.0,
+    ) -> "UserPersonaProfile":
+        """Load-modify-store convenience: fold observations into the persona.
+
+        This is the canonical entry point used by the agent loop to teach the
+        persona memory from a turn's signals (e.g. the user asked for a shorter
+        answer → ``traits={"verbosity": 0.0}``; mentioned a hobby; stated a
+        fact).  All updates use the confidence-weighted, recency-decayed
+        estimator in :class:`UserPersonaProfile`.  Returns the updated persona.
+        """
+        self._validate_user_id(user_id, op="observe_user_persona")
+        persona = self.get_user_persona(user_id)
+        for name, value in (traits or {}).items():
+            persona.observe_trait(name, value, strength=strength)
+        for tag in (hobbies or []):
+            persona.observe_hobby(tag, strength=strength)
+        for key, value in (characteristics or {}).items():
+            persona.observe_characteristic(key, value, strength=strength)
+        for source, value in (acquisition or {}).items():
+            persona.observe_acquisition(source, value, strength=strength)
+        self.save_user_persona(user_id, persona)
+        return persona
 
     def update_user_profile(
         self,
@@ -1280,11 +1511,30 @@ class OutcomeFeedbackStore:
 _VOCAB_SIZE: int = 512  # Fixed dimension for reproducibility
 
 
+def _stable_token_bucket(token: str) -> int:
+    """Map a token to a stable hashing-trick bucket in ``[0, _VOCAB_SIZE)``.
+
+    Uses :func:`zlib.crc32` over the UTF-8 bytes rather than the built-in
+    :func:`hash`.  ``hash()`` for ``str`` is salted per-process via
+    ``PYTHONHASHSEED`` (randomised by default since CPython 3.3), which means
+    the same token maps to *different* buckets in different processes.  That
+    silently corrupts any embedding that is persisted and later compared
+    against a query embedded in a fresh process — exactly the failure mode
+    that broke cross-restart recall in :class:`ContextMemoryStore`.  ``crc32``
+    is deterministic across processes, platforms, and Python versions.
+    """
+    return zlib.crc32(token.encode("utf-8")) % _VOCAB_SIZE
+
+
 def _bow_embed(text: str) -> List[float]:
     """Lightweight bag-of-words hashing embedding (512-dim, L2-normalised).
 
     This fallback is used when no ``embed_fn`` is injected.  It provides
     coarse semantic signal sufficient for development and tests.
+
+    The bucket assignment is **deterministic across processes** (see
+    :func:`_stable_token_bucket`) so that embeddings persisted to disk remain
+    comparable to embeddings computed after a restart.
 
     Args:
         text: Input string to embed.
@@ -1295,8 +1545,7 @@ def _bow_embed(text: str) -> List[float]:
     vec: List[float] = [0.0] * _VOCAB_SIZE
     tokens = text.lower().split()
     for token in tokens:
-        idx = hash(token) % _VOCAB_SIZE
-        vec[idx] += 1.0
+        vec[_stable_token_bucket(token)] += 1.0
     norm = math.sqrt(sum(v * v for v in vec)) or 1.0
     return [v / norm for v in vec]
 

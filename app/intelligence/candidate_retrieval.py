@@ -29,6 +29,12 @@ from app.domain.normalized_models import NormalizedObservation
 from app.domain.inference_models import SignalType
 from app.intelligence.hnsw_search import HNSWIndex, HNSWConfig, SearchResult
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid import cost / cycles at runtime
+    from app.intelligence.retrieval_fusion import LogisticFusion
+    from app.intelligence.reranker import Reranker
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -207,6 +213,8 @@ class CandidateRetriever:
         platform_weight: float = 0.3,
         exemplar_bank_path: Optional[Path] = None,
         priors_config_path: Optional[Path] = None,
+        fusion_model: Optional["LogisticFusion"] = None,
+        reranker: Optional["Reranker"] = None,
     ):
         """Initialize candidate retriever.
 
@@ -241,6 +249,13 @@ class CandidateRetriever:
         self.embedding_weight = embedding_weight
         self.entity_weight = entity_weight
         self.platform_weight = platform_weight
+
+        # Tier 1.1 — optional learned fusion model.  When attached *and*
+        # trained, retrieve_candidates() routes through the learned combiner;
+        # otherwise the original fixed-weight path runs unchanged.
+        self.fusion_model = fusion_model
+        # Tier 1.2 — optional cross-encoder reranker for the candidate path.
+        self.reranker = reranker
 
         # Build HNSW index for fast similarity search
         self.hnsw_index: Optional[HNSWIndex] = None
@@ -527,6 +542,12 @@ class CandidateRetriever:
         Returns:
             List of signal candidates with scores
         """
+        # Tier 1.1 — when a trained learned-fusion model is attached, score
+        # candidates with it instead of the fixed-weight linear blend.  The
+        # legacy path below is the default and is preserved byte-for-byte.
+        if self.fusion_model is not None and self.fusion_model.is_trained():
+            return self._retrieve_candidates_fused(observation)
+
         candidates: Dict[SignalType, float] = {}
         reasoning: Dict[SignalType, List[str]] = {}
         
@@ -580,6 +601,70 @@ class CandidateRetriever:
         
         logger.debug(
             f"Retrieved {len(result)} candidates for observation {observation.id}"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Tier 1.1 — learned fusion
+    # ------------------------------------------------------------------
+
+    def extract_fusion_features(
+        self, observation: NormalizedObservation
+    ) -> Dict[SignalType, List[float]]:
+        """Return per-signal-type ``[embedding, entity, platform]`` source scores.
+
+        Runs the three weak-signal sources and aggregates each source's score
+        per signal type by ``max`` (so a type backed by multiple matches is not
+        double-counted).  These vectors are the features consumed by the learned
+        fusion model both at training time (notebook) and at inference time
+        (:meth:`_retrieve_candidates_fused`).  The feature order matches
+        ``retrieval_fusion.FEATURE_NAMES``.
+        """
+        emb: Dict[SignalType, float] = {}
+        ent: Dict[SignalType, float] = {}
+        plat: Dict[SignalType, float] = {}
+
+        if observation.embedding and self.hnsw_index:
+            for st, score, _ in self._retrieve_by_embedding(observation):
+                emb[st] = max(emb.get(st, 0.0), score)
+        if observation.entities:
+            for st, score, _ in self._retrieve_by_entities(observation):
+                ent[st] = max(ent.get(st, 0.0), score)
+        for st, score, _ in self._retrieve_by_platform(observation):
+            plat[st] = max(plat.get(st, 0.0), score)
+
+        types = set(emb) | set(ent) | set(plat)
+        return {
+            st: [emb.get(st, 0.0), ent.get(st, 0.0), plat.get(st, 0.0)]
+            for st in types
+        }
+
+    def _retrieve_candidates_fused(
+        self, observation: NormalizedObservation
+    ) -> List[SignalCandidate]:
+        """Score candidate signal types with the learned fusion model."""
+        feats = self.extract_fusion_features(observation)
+        scored: List[Tuple[SignalType, float, List[float]]] = []
+        for st, fv in feats.items():
+            prob = self.fusion_model.predict_one(fv)  # type: ignore[union-attr]
+            scored.append((st, prob, fv))
+        scored.sort(key=lambda t: t[1], reverse=True)
+        result: List[SignalCandidate] = []
+        for st, prob, fv in scored[: self.top_k]:
+            result.append(
+                SignalCandidate(
+                    signal_type=st,
+                    score=max(0.0, min(1.0, prob)),
+                    reasoning=(
+                        f"Learned fusion (emb={fv[0]:.2f}, ent={fv[1]:.2f}, "
+                        f"plat={fv[2]:.2f}) -> p={prob:.3f}"
+                    ),
+                    source="learned_fusion",
+                )
+            )
+        logger.debug(
+            "Retrieved %d fused candidates for observation %s",
+            len(result), observation.id,
         )
         return result
 
@@ -639,23 +724,50 @@ class CandidateRetriever:
         merged = _rrf_merge([dense_indices, sparse_indices])
 
         # ── 4. Convert to (SignalType, score, reason) tuples ─────────────────
-        candidates = []
-        for idx, rrf_score in merged[: self.top_k]:
+        #
+        # Normalise fused RRF scores onto [0, 1] by the maximum fused score in
+        # the result set, so the top semantic candidate is comparable in
+        # magnitude to the entity-regex (0.4–0.8) and platform-prior (0.15–0.3)
+        # sources.  The previous fixed ``rrf_score * 10`` heuristic left fused
+        # scores around ~0.03–0.33, so even an exact dense+sparse match was
+        # structurally out-weighed by a coarse keyword regex hit — the root
+        # cause of the reported "information acquisition mismatch", where
+        # semantic relevance lost to surface keyword matches.
+        #
+        # Candidates are also aggregated per signal type by *max* (not sum), so
+        # a signal type backed by many exemplars is not double-counted when
+        # ``retrieve_candidates`` later sums the per-source contributions.
+        merged_top = merged[: self.top_k]
+        max_rrf = max((s for _, s in merged_top), default=0.0)
+        best_by_type: Dict[SignalType, Tuple[float, str]] = {}
+        for idx, rrf_score in merged_top:
             if idx >= len(self.exemplar_bank):
                 continue
             exemplar = self.exemplar_bank[idx]
             dense_sim = dense_scores.get(idx, 0.0)
             in_sparse = idx in sparse_indices
-            reason = (
-                f"Hybrid RRF (dense_sim={dense_sim:.2f}, sparse={'yes' if in_sparse else 'no'}): "
-                f"'{exemplar.text[:50]}...'"
-            )
-            candidates.append((
-                exemplar.signal_type,
-                max(0.0, min(1.0, rrf_score * 10)),  # scale RRF score to [0,1]
-                reason,
-            ))
-        return candidates
+
+            # Tier 1.2 — retrieve-then-rerank: when a reranker is attached, the
+            # candidate's score is the cross-encoder relevance of (query,
+            # exemplar text); otherwise fall back to the normalised RRF score.
+            # Both are in [0, 1], so the downstream blend is unaffected.
+            if self.reranker is not None:
+                score = max(0.0, min(1.0, self.reranker.score_pair(query_text, exemplar.text)))
+                reason = (
+                    f"Reranked (score={score:.2f}, dense_sim={dense_sim:.2f}, "
+                    f"sparse={'yes' if in_sparse else 'no'}): '{exemplar.text[:50]}...'"
+                )
+            else:
+                score = (rrf_score / max_rrf) if max_rrf > 0 else 0.0
+                score = max(0.0, min(1.0, score))
+                reason = (
+                    f"Hybrid RRF (norm={score:.2f}, dense_sim={dense_sim:.2f}, "
+                    f"sparse={'yes' if in_sparse else 'no'}): '{exemplar.text[:50]}...'"
+                )
+            prev = best_by_type.get(exemplar.signal_type)
+            if prev is None or score > prev[0]:
+                best_by_type[exemplar.signal_type] = (score, reason)
+        return [(st, score, reason) for st, (score, reason) in best_by_type.items()]
 
     def _retrieve_by_entities(
         self, observation: NormalizedObservation

@@ -114,6 +114,20 @@ class Reranker:
         """
         return _tf_idf_score(_tokenize(query), _tokenize(candidate_text))
 
+    def score_pair(self, query: str, candidate_text: str) -> float:
+        """Public, never-raising relevance score for an arbitrary text pair.
+
+        Wraps :meth:`_score_pair` so other stages (e.g. candidate retrieval's
+        exemplar reranking) can reuse the cross-encoder/TF-IDF scorer on raw
+        strings without touching ``NormalizedObservation``.  Returns ``0.0`` on
+        any internal error so callers never have to guard it.
+        """
+        try:
+            return float(self._score_pair(query, candidate_text))
+        except Exception:  # noqa: BLE001 - scoring must never raise into retrieval
+            logger.warning("Reranker.score_pair failed; returning 0.0", exc_info=True)
+            return 0.0
+
     def _candidate_text(self, candidate: NormalizedObservation) -> str:
         """Assemble the text representation of a candidate for scoring."""
         parts: List[str] = [candidate.title]

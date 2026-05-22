@@ -22,6 +22,110 @@ except ImportError:
     hnswlib = None  # type: ignore[assignment]
 
 
+class _BruteForceBackend:
+    """Pure-numpy fallback that mimics the subset of the ``hnswlib.Index`` API
+    used by :class:`HNSWIndex`.
+
+    Activated automatically when the optional ``hnswlib`` package is not
+    installed (it is not a hard requirement), so dense vector search degrades
+    gracefully to *exact* brute-force search instead of crashing the entire
+    candidate-retrieval stage with an ``ImportError``.  Distances follow
+    hnswlib's conventions (cosine → ``1 - cosine_similarity``; l2 → squared
+    L2; ip → ``1 - inner_product``) so callers that compute ``1.0 - distance``
+    to recover similarity keep working unchanged.
+
+    The trade-off versus real HNSW is search complexity — O(n) per query
+    rather than ~O(log n) — which is acceptable for the modest exemplar banks
+    used by candidate retrieval and for any environment where installing the
+    native ``hnswlib`` wheel is not possible.
+    """
+
+    def __init__(self, space: str = "cosine", dim: int = 0) -> None:
+        self._space = space
+        self._dim = dim
+        self._vectors: Dict[int, np.ndarray] = {}
+        self._max_elements = 0
+
+    # -- lifecycle (match the hnswlib surface; mostly no-ops) -------------
+    def init_index(self, max_elements: int, ef_construction: int = 200, M: int = 16) -> None:
+        self._max_elements = max_elements
+
+    def set_num_threads(self, n: int) -> None:  # pragma: no cover - no-op
+        pass
+
+    def set_ef(self, ef: int) -> None:  # pragma: no cover - no-op
+        pass
+
+    # -- mutation --------------------------------------------------------
+    def add_items(self, data, ids) -> None:
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+            id_list = [int(ids)]
+        else:
+            id_list = [int(i) for i in np.atleast_1d(ids)]
+        for vec, label in zip(arr, id_list):
+            self._vectors[label] = np.asarray(vec, dtype=np.float32)
+
+    # -- query -----------------------------------------------------------
+    def _distance(self, q: np.ndarray, v: np.ndarray) -> float:
+        if self._space == "l2":
+            diff = q - v
+            return float(np.dot(diff, diff))
+        if self._space == "ip":
+            return 1.0 - float(np.dot(q, v))
+        # default: cosine distance
+        qn = float(np.linalg.norm(q))
+        vn = float(np.linalg.norm(v))
+        if qn < 1e-12 or vn < 1e-12:
+            return 1.0
+        return 1.0 - float(np.dot(q, v) / (qn * vn))
+
+    def knn_query(self, data, k: int = 10):
+        q = np.asarray(data, dtype=np.float32).reshape(-1)
+        if not self._vectors:
+            return (np.empty((1, 0), dtype=np.int64),
+                    np.empty((1, 0), dtype=np.float32))
+        labels = list(self._vectors.keys())
+        dists = [self._distance(q, self._vectors[label]) for label in labels]
+        n = max(0, min(int(k), len(labels)))
+        order = np.argsort(dists)[:n]
+        out_labels = np.array([[labels[i] for i in order]], dtype=np.int64)
+        out_dists = np.array([[dists[i] for i in order]], dtype=np.float32)
+        return out_labels, out_dists
+
+    # -- introspection ---------------------------------------------------
+    def get_current_count(self) -> int:
+        return len(self._vectors)
+
+    def get_max_elements(self) -> int:
+        return self._max_elements or len(self._vectors)
+
+    # -- persistence -----------------------------------------------------
+    def save_index(self, path: str) -> None:
+        with open(path, "wb") as fh:
+            pickle.dump(
+                {
+                    "space": self._space,
+                    "dim": self._dim,
+                    "max_elements": self._max_elements,
+                    "vectors": {k: v.tolist() for k, v in self._vectors.items()},
+                },
+                fh,
+            )
+
+    def load_index(self, path: str) -> None:
+        with open(path, "rb") as fh:
+            data = pickle.load(fh)
+        self._space = data.get("space", self._space)
+        self._dim = data.get("dim", self._dim)
+        self._max_elements = data.get("max_elements", 0)
+        self._vectors = {
+            int(k): np.asarray(v, dtype=np.float32)
+            for k, v in data.get("vectors", {}).items()
+        }
+
+
 class SearchResult(BaseModel):
     """Search result with ID and distance."""
 
@@ -88,15 +192,24 @@ class HNSWIndex:
 
         try:
             if hnswlib is None:
-                raise ImportError("hnswlib package not available")
+                logger.warning(
+                    "hnswlib not installed — falling back to exact pure-numpy "
+                    "brute-force vector search. Dense retrieval still works; "
+                    "install hnswlib for approximate O(log n) search at scale: "
+                    "pip install hnswlib"
+                )
+                self.index = _BruteForceBackend(
+                    space=self.config.space,
+                    dim=self.config.dimension,
+                )
+            else:
+                logger.info(f"Initializing HNSW index with dimension={self.config.dimension}")
 
-            logger.info(f"Initializing HNSW index with dimension={self.config.dimension}")
-
-            # Create index using module-level name (patchable in tests)
-            self.index = hnswlib.Index(
-                space=self.config.space,
-                dim=self.config.dimension,
-            )
+                # Create index using module-level name (patchable in tests)
+                self.index = hnswlib.Index(
+                    space=self.config.space,
+                    dim=self.config.dimension,
+                )
 
             # Initialize index
             self.index.init_index(
