@@ -48,7 +48,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from app.personalization.persona_bayes import BetaBinomialTrait, PopulationPrior
 
@@ -321,23 +321,41 @@ class UserPersonaProfile:
     def acquisition_preferences(self, min_confidence: float = 0.3) -> Dict[str, float]:
         return {s: t.value for s, t in self.acquisition.items() if t.confidence >= min_confidence}
 
-    def render_style_directive(self, min_confidence: float = 0.35, max_items: int = 8) -> str:
+    def render_style_directive(
+        self,
+        min_confidence: float = 0.35,
+        max_items: int = 8,
+        fallback: Optional[Callable[[str], Optional[bool]]] = None,
+    ) -> str:
         """Render a compact, natural-language instruction block for the agent.
 
         Only confidence-passing, non-neutral traits are included, so the agent
         is never told to apply a preference the model is unsure about.  Returns
         an empty string when nothing is confident enough yet (cold start).
+
+        When ``fallback`` is supplied, traits the estimator is *not* confident
+        about are offered to it: ``fallback(name)`` returns ``True`` (apply the
+        high pole), ``False`` (low pole), or ``None`` (still skip).  This is the
+        seam the Thompson-sampling bandit uses to drive explore/exploit choices
+        for uncertain traits without baking the bandit into this class.
         """
         lines: List[str] = []
         scored: List[Tuple[float, str]] = []
         for name, (low, high) in _ALL_TRAIT_POLES.items():
             t = self.trait(name)
-            if t is None or t.confidence < min_confidence:
+            decided_high: Optional[bool] = None
+            conf = min_confidence
+            if (t is not None and t.confidence >= min_confidence
+                    and abs(t.value - 0.5) >= _NEUTRAL_BAND):
+                decided_high = t.value >= 0.5
+                conf = t.confidence
+            elif fallback is not None:
+                fb = fallback(name)
+                if fb is not None:
+                    decided_high = bool(fb)
+            if decided_high is None:
                 continue
-            if abs(t.value - 0.5) < _NEUTRAL_BAND:
-                continue  # no clear preference either way
-            phrase = high if t.value >= 0.5 else low
-            scored.append((t.confidence, phrase))
+            scored.append((conf, high if decided_high else low))
         scored.sort(key=lambda x: x[0], reverse=True)
         for _conf, phrase in scored[:max_items]:
             lines.append(f"- {phrase}")

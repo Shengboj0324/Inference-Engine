@@ -302,6 +302,68 @@ if len(_sims) >= 20 and 0 < sum(_labels) < len(_labels):
 else:
     print('Tier 1.3 - insufficient labelled pairs in dev corpus; skipping fit.')""")
 
+code("""# Tier 3 - embedding versioning, memory consolidation, MMR diversification.
+from app.intelligence.embedding_backend import EmbeddingBackend, detect_stale_versions
+from app.intelligence.context_memory import ContextMemoryStore as _CMS
+from app.domain.inference_models import SignalInference as _SI, SignalPrediction as _SP, SignalType as _ST
+from app.domain.normalized_models import (NormalizedObservation as _NO,
+    ContentQuality as _CQ, SentimentPolarity as _SPol)
+from app.core.models import MediaType as _MT, SourcePlatform as _SPlat
+from uuid import uuid4 as _uuid4
+from datetime import datetime as _dt, timezone as _tz
+import asyncio as _asyncio
+
+# 3.1 - real embedding backend with deterministic fallback + version stamp.
+_backend = EmbeddingBackend()           # sentence-transformer if installed, else bow
+print('3.1 embedding backend version:', _backend.embedding_version,
+      '| real model:', _backend.uses_real_model)
+
+def _mk(uid, text):
+    now = _dt.now(_tz.utc)
+    return _NO(raw_observation_id=_uuid4(), user_id=uid, source_platform=_SPlat.RSS,
+        source_id='c', source_url='https://x', author='a', title='', normalized_text=text,
+        original_language='en', sentiment_polarity=_SPol.NEUTRAL, content_quality=_CQ.HIGH,
+        pii_scrubbed=False, pii_entity_count=0, audit_trail={}, media_type=_MT.TEXT,
+        published_at=now, fetched_at=now)
+def _inf(uid, n):
+    _p = _SP(signal_type=_ST.PRAISE, probability=0.8, evidence_spans=[], rationale='m')
+    return _SI(normalized_observation_id=n.id, user_id=uid, predictions=[_p], top_prediction=_p,
+        abstained=False, abstention_reason=None, model_name='m', model_version='0',
+        inference_method='single_call')
+
+_mem = _CMS(embed_fn=_backend)          # backend is callable -> usable as embed_fn
+_mem.set_embedding_version(_backend.embedding_version)
+_u = _uuid4()
+_topics = ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
+
+async def _run():
+    for _t in _topics:
+        for _ in range(20):
+            _n = _mk(_u, f'{_t} {_t} {_t}'); await _mem.store(_u, _n, _inf(_u, _n))
+    _before = len(_mem._records[str(_u)])
+    # 3.2 - consolidate 100 records -> 5 representatives, retaining every topic.
+    _out = _mem.consolidate_user(_u, target_k=5)
+    _hits = 0
+    for _t in _topics:
+        _r = await _mem.retrieve(_u, f'{_t} {_t}', top_k=1)
+        if _r and _t in _r[0].normalized_text:
+            _hits += 1
+    print(f'3.2 consolidation: {_before} -> {_out["after"]} records; topic recall {_hits}/5')
+    assert _out['after'] == 5 and _hits == 5, 'consolidation must retain all topics'
+    # 3.3 - MMR diversification surfaces a distinct-but-relevant memory.
+    _m = _uuid4()
+    for _ in range(4):
+        _n = _mk(_m, 'alpha alpha alpha'); await _mem.store(_m, _n, _inf(_m, _n))
+    _n = _mk(_m, 'beta beta beta'); await _mem.store(_m, _n, _inf(_m, _n))
+    _plain = await _mem.retrieve(_m, 'alpha alpha beta', top_k=3)
+    _div = await _mem.retrieve(_m, 'alpha alpha beta', top_k=3, mmr_lambda=0.7)
+    _plain_div = any('beta' in r.normalized_text for r in _plain)
+    _mmr_div = any('beta' in r.normalized_text for r in _div)
+    print(f'3.3 MMR diversity: plain_has_beta={_plain_div}  mmr_has_beta={_mmr_div}')
+    assert _mmr_div and not _plain_div, 'MMR must diversify while default does not'
+_asyncio.run(_run())
+print('Tier 3 gate PASS - versioning + consolidation + MMR verified.')""")
+
 md("""## 9. Personalization integration
 
 Build a per-user interest profile (interest graph + topic-embedding profile),

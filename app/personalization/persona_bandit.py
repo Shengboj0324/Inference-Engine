@@ -91,6 +91,23 @@ class ThompsonDirectiveSelector:
         b = self._bandit(trait)
         return (b.posterior_mean(ARM_LOW), b.posterior_mean(ARM_HIGH))
 
+    def recommend(self, trait: str, min_pulls: float = 3.0, margin: float = 0.1) -> Optional[int]:
+        """Exploit recommendation for ``trait``, or ``None`` if not yet confident.
+
+        Returns the better arm only when enough reward evidence has accrued
+        (``min_pulls`` beyond the uniform priors) *and* the two arms' posterior
+        means are separated by at least ``margin`` — otherwise ``None`` so the
+        caller declines to apply a directive it is unsure about.
+        """
+        b = self._bandits.get(trait)
+        if b is None:
+            return None
+        pulls = (b.alpha[0] - 1.0) + (b.beta[0] - 1.0) + (b.alpha[1] - 1.0) + (b.beta[1] - 1.0)
+        lo, hi = b.posterior_mean(ARM_LOW), b.posterior_mean(ARM_HIGH)
+        if pulls < min_pulls or abs(hi - lo) < margin:
+            return None
+        return ARM_HIGH if hi >= lo else ARM_LOW
+
     def to_dict(self) -> Dict[str, Any]:
         return {"version": "1.0", "bandits": {t: b.to_dict() for t, b in self._bandits.items()}}
 

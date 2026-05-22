@@ -32,15 +32,49 @@ logger = logging.getLogger(__name__)
 DESKTOP_USER_ID: uuid.UUID = uuid.uuid5(uuid.NAMESPACE_DNS, "smr-desktop-user")
 
 _PERSONA_FILENAME = "persona_memory.json"
+_BANDIT_FILENAME = "directive_bandit.json"
 
 _lock = threading.Lock()
 _store = None          # type: ignore[var-annotated]  # ContextMemoryStore singleton
 _loaded = False
+_bandit = None         # type: ignore[var-annotated]  # ThompsonDirectiveSelector singleton
+_bandit_loaded = False
 
 
 def _persona_path() -> Path:
     from app.local.user_data_dir import get_user_data_dir
     return get_user_data_dir(ensure=True) / _PERSONA_FILENAME
+
+
+def _bandit_path() -> Path:
+    from app.local.user_data_dir import get_user_data_dir
+    return get_user_data_dir(ensure=True) / _BANDIT_FILENAME
+
+
+def get_directive_bandit():
+    """Return the process-wide Thompson directive bandit (lazy-loaded).
+
+    The bandit accumulates, per style trait, which directive pole the user has
+    reinforced through explicit requests, and recommends a pole for traits the
+    persona estimator is not yet confident about (explore/exploit).
+    """
+    global _bandit, _bandit_loaded
+    with _lock:
+        if _bandit is None:
+            from app.personalization.persona_bandit import ThompsonDirectiveSelector
+            _bandit = ThompsonDirectiveSelector()
+        if not _bandit_loaded:
+            _bandit_loaded = True
+            try:
+                import json as _json
+                from app.personalization.persona_bandit import ThompsonDirectiveSelector
+                p = _bandit_path()
+                if p.exists():
+                    _bandit = ThompsonDirectiveSelector.from_dict(
+                        _json.loads(p.read_text(encoding="utf-8")))
+            except Exception:  # noqa: BLE001 - never block chat on load
+                logger.exception("persona_memory: bandit load failed; starting empty")
+        return _bandit
 
 
 def get_persona_memory():
@@ -62,11 +96,26 @@ def get_persona_memory():
 
 
 def persona_system_prompt(min_confidence: float = 0.35) -> Optional[str]:
-    """Return the learned persona directive to inject, or ``None`` if not ready."""
+    """Return the learned persona directive to inject, or ``None`` if not ready.
+
+    Confident traits come from the persona estimator; for traits it is unsure
+    about, the Thompson bandit's accumulated turn-signal evidence supplies an
+    explore/exploit recommendation so personalization kicks in sooner.
+    """
     try:
         store = get_persona_memory()
         persona = store.get_user_persona(DESKTOP_USER_ID)
-        directive = persona.render_style_directive(min_confidence=min_confidence)
+        try:
+            from app.personalization.persona_bandit import ARM_HIGH
+            bandit = get_directive_bandit()
+
+            def _fallback(name: str):
+                rec = bandit.recommend(name)
+                return None if rec is None else (rec == ARM_HIGH)
+        except Exception:  # noqa: BLE001 - bandit is optional
+            _fallback = None
+        directive = persona.render_style_directive(
+            min_confidence=min_confidence, fallback=_fallback)
         return directive or None
     except Exception:  # noqa: BLE001 - personalization must never break chat
         logger.exception("persona_memory: directive render failed")
@@ -140,4 +189,16 @@ def learn_from_user_turn(text: str, strength: float = 1.0) -> Dict[str, float]:
         store.persist(_persona_path())
     except Exception:  # noqa: BLE001 - learning must never block chat
         logger.exception("persona_memory: learn_from_user_turn failed")
+    # Bandit reward from the turn signal: an explicit request for a pole is
+    # positive evidence (reward=1) for that pole's arm.  Persisted so the
+    # explore/exploit posterior survives restarts.
+    try:
+        import json as _json
+        from app.personalization.persona_bandit import ARM_HIGH, ARM_LOW
+        bandit = get_directive_bandit()
+        for trait, value in signals.items():
+            bandit.update(trait, ARM_HIGH if value >= 0.5 else ARM_LOW, reward=1.0)
+        _bandit_path().write_text(_json.dumps(bandit.to_dict(), indent=2), encoding="utf-8")
+    except Exception:  # noqa: BLE001 - bandit update must never block chat
+        logger.exception("persona_memory: bandit update failed")
     return signals

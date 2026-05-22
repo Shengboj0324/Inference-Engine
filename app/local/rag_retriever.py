@@ -144,6 +144,7 @@ class LocalRAGRetriever:
         max_snippet_chars: int = _DEFAULT_SNIPPET_CHARS,
         personalize: bool = True,
         bonus_halflife_seconds: float = _BONUS_HALFLIFE_SECONDS,
+        calibrator: Optional[object] = None,
     ) -> None:
         self._content = content if content is not None else get_content_store()
         self._embedder = embedder if embedder is not None else LocalEmbeddingProvider()
@@ -154,10 +155,36 @@ class LocalRAGRetriever:
         self._halflife = max(1.0, float(bonus_halflife_seconds))
         self._telemetry = PersonalizationTelemetry()
         self._telemetry_lock = threading.Lock()
+        # Tier 1.3 — optional similarity→probability calibrator.  When set, raw
+        # cosine scores are mapped to calibrated relevance probabilities so the
+        # snippet ``score`` is comparable across embedding models.  Calibration
+        # is monotonic, so result *ordering* is unchanged; only the score scale
+        # (and the meaning of any downstream threshold) changes.  ``None`` →
+        # raw cosine, identical to prior behaviour.
+        self._calibrator = calibrator
 
     # ------------------------------------------------------------------
     # Capability probe
     # ------------------------------------------------------------------
+
+    def set_similarity_calibrator(self, calibrator: Optional[object]) -> None:
+        """Attach (or clear) a similarity→probability calibrator.
+
+        ``calibrator`` must expose ``transform(score: float) -> float``.  Pass
+        ``None`` to revert to raw cosine scoring.  Opt-in; never raises.
+        """
+        self._calibrator = calibrator
+
+    def _calibrate(self, score: float) -> float:
+        """Map a raw cosine score to a calibrated probability (soft-fail)."""
+        cal = self._calibrator
+        if cal is None:
+            return float(score)
+        try:
+            return float(cal.transform(float(score)))
+        except Exception:  # noqa: BLE001 - calibration must never break retrieval
+            logger.exception("similarity calibration failed; using raw score")
+            return float(score)
 
     def is_available(self) -> bool:
         """True when the embedding provider can be invoked right now."""
@@ -224,7 +251,8 @@ class LocalRAGRetriever:
             return []
         if not do_personalize:
             self._bump_telemetry(queries_total=1)
-            snippets = [self._snippet_for(item, score, bonus=0.0) for item, score in hits]
+            snippets = [self._snippet_for(item, self._calibrate(score), bonus=0.0)
+                        for item, score in hits]
             return _apply_source_balance(snippets, k, max_per_platform)
         signals = {}
         signal_lookup_failed = False
@@ -239,7 +267,7 @@ class LocalRAGRetriever:
             bonus = self._personalization_bonus(
                 signals.get(str(item.id)), halflife=self._halflife, now=now,
             )
-            rescored.append((item, float(score), bonus))
+            rescored.append((item, self._calibrate(float(score)), bonus))
         rescored.sort(key=lambda r: r[1] + r[2], reverse=True)
         # Telemetry: count this query, and whether personalization actually
         # changed the order or moved a new item into the top slot.  Computed
@@ -386,11 +414,31 @@ class LocalRAGRetriever:
 _global_retriever: Optional[LocalRAGRetriever] = None
 
 
+def _load_persisted_calibrator() -> Optional[object]:
+    """Load a trained similarity calibrator from the user-data dir, if present.
+
+    Operators place a ``similarity_calibrator.json`` (produced by the training
+    notebook, Tier 1.3) under the user-data dir to enable calibrated retrieval
+    scores.  Absent / malformed file → ``None`` (raw cosine).  Never raises.
+    """
+    try:
+        from app.local.user_data_dir import get_user_data_dir
+        from app.intelligence.similarity_calibration import SimilarityCalibrator
+        path = get_user_data_dir() / "similarity_calibrator.json"
+        if path.exists():
+            cal = SimilarityCalibrator.load(path)
+            logger.info("rag retriever: loaded similarity calibrator from %s", path)
+            return cal
+    except Exception:  # noqa: BLE001 - calibrator is optional; never block startup
+        logger.exception("rag retriever: failed to load similarity calibrator")
+    return None
+
+
 def get_rag_retriever() -> LocalRAGRetriever:
     """Process-wide :class:`LocalRAGRetriever` singleton."""
     global _global_retriever
     if _global_retriever is None:
-        _global_retriever = LocalRAGRetriever()
+        _global_retriever = LocalRAGRetriever(calibrator=_load_persisted_calibrator())
     return _global_retriever
 
 

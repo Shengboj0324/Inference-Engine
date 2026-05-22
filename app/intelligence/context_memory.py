@@ -52,10 +52,8 @@ import asyncio
 import dataclasses
 import json
 import logging
-import math
 import threading
 import time
-import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -236,6 +234,11 @@ class ContextMemoryStore:
         # is comparable across embedding models.  ``None`` → raw cosine (default).
         self._sim_calibrator: Any = None
 
+        # ── Embedding-version stamp (Tier 3.1) ───────────────────────────────
+        # Records the embedding-space version the stored vectors were computed
+        # under, so a model upgrade can be detected (see ``needs_reembed``).
+        self._embedding_version: Optional[str] = None
+
         # ── Cross-user access audit trail ────────────────────────────────────
         # Append-only ring buffer of dicts describing every rejected read.
         # Capped at 1024 entries to bound memory growth.
@@ -350,6 +353,7 @@ class ContextMemoryStore:
         recency_half_life_days: Optional[float] = None,
         signal_types: Optional[Set[SignalType]] = None,
         min_score: float = 0.0,
+        mmr_lambda: Optional[float] = None,
     ) -> List[MemoryRecord]:
         """Return the ``top_k`` most similar past records for ``user_id``.
 
@@ -418,13 +422,14 @@ class ContextMemoryStore:
 
         _now = datetime.now(timezone.utc)
         _calibrator = self._sim_calibrator
-        scored: List[Tuple[float, MemoryRecord]] = []
+        scored: List[Tuple[float, MemoryRecord, np.ndarray]] = []
         for vec, rec in zip(embeddings_snapshot, records_snapshot):
             if signal_types is not None and rec.signal_type not in signal_types:
                 continue
             v_norm = float(np.linalg.norm(vec))
             if v_norm < 1e-9:
                 continue
+            unit_vec = vec / v_norm
             similarity: float = float(np.dot(query_vec, vec) / (q_norm * v_norm))
             # Tier 1.3 — map raw cosine to a calibrated relevance probability so
             # ``min_score`` is portable across embedding models (opt-in).
@@ -440,13 +445,33 @@ class ContextMemoryStore:
                 score = similarity * recency_weight
             if score < min_score:
                 continue
-            scored.append((score, rec))
+            scored.append((score, rec, unit_vec))
 
         scored.sort(key=lambda t: t[0], reverse=True)
         results: List[MemoryRecord] = []
-        for sim, rec in scored[:top_k]:
-            result = dataclasses.replace(rec, score=sim)
-            results.append(result)
+        if mmr_lambda is not None and 0.0 <= mmr_lambda <= 1.0 and scored:
+            # Tier 3.3 — Maximal Marginal Relevance: greedily pick the candidate
+            # maximising ``score - λ · max cosine-similarity to already-picked``,
+            # so near-duplicate memories don't crowd out complementary context.
+            # ``λ=0`` reduces to pure relevance; higher λ favours diversity.
+            remaining = list(scored)
+            selected_units: List[np.ndarray] = []
+            first = remaining.pop(0)
+            results.append(dataclasses.replace(first[1], score=first[0]))
+            selected_units.append(first[2])
+            while remaining and len(results) < top_k:
+                best_idx, best_mmr = 0, None
+                for i, (s, _rec, uv) in enumerate(remaining):
+                    redundancy = max(float(np.dot(uv, su)) for su in selected_units)
+                    mmr = s - mmr_lambda * redundancy
+                    if best_mmr is None or mmr > best_mmr:
+                        best_mmr, best_idx = mmr, i
+                s, rec, uv = remaining.pop(best_idx)
+                results.append(dataclasses.replace(rec, score=s))
+                selected_units.append(uv)
+        else:
+            for sim, rec, _uv in scored[:top_k]:
+                results.append(dataclasses.replace(rec, score=sim))
 
         _elapsed_ms = (time.perf_counter() - _t0) * 1000
         logger.debug(
@@ -971,6 +996,7 @@ class ContextMemoryStore:
                 "source_embeddings": self._source_embeddings,
                 "user_profiles": self._user_profiles,
                 "user_personas": self._user_personas,
+                "embedding_version": self._embedding_version,
             }
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1015,6 +1041,7 @@ class ContextMemoryStore:
             self._source_embeddings = payload.get("source_embeddings", {})
             self._user_profiles = payload.get("user_profiles", {})
             self._user_personas = payload.get("user_personas", {})
+            self._embedding_version = payload.get("embedding_version")
 
             # Restore the core vector memory (added in v1.1).  Snapshots written
             # by older versions simply lack these keys and load as empty, which
@@ -1126,6 +1153,23 @@ class ContextMemoryStore:
         """
         self._sim_calibrator = calibrator
 
+    def set_embedding_version(self, version: Optional[str]) -> None:
+        """Stamp the embedding-space version the current vectors belong to."""
+        self._embedding_version = version
+
+    def needs_reembed(self, current_version: str) -> bool:
+        """True when stored vectors exist under a different embedding version.
+
+        Use after loading a snapshot: if the active :class:`EmbeddingBackend`
+        reports a different ``embedding_version`` than the one the persisted
+        vectors were computed under (or the snapshot is unstamped/legacy), the
+        vectors live in an incompatible space and should be re-embedded.
+        """
+        with self._lock:
+            has_vectors = any(self._embeddings.values())
+            stored = self._embedding_version
+        return bool(has_vectors) and stored != current_version
+
     # ── GDPR / user-profile API (additive) ───────────────────────────────────
 
     def clear_user_data(self, user_id: UUID) -> Dict[str, int]:
@@ -1161,6 +1205,59 @@ class ContextMemoryStore:
             user_id, removed,
         )
         return removed
+
+    def consolidate_user(
+        self,
+        user_id: UUID,
+        target_k: int,
+        summarize_fn: Optional[Callable[[List[str]], str]] = None,
+        seed: int = 0,
+    ) -> Dict[str, int]:
+        """Cluster a user's records and keep one representative per cluster.
+
+        Bounds per-user memory to ``target_k`` records while retaining the
+        breadth of distinct topics (Tier 3.2) — far less lossy than dropping the
+        oldest records.  When ``summarize_fn`` is given, each kept record's text
+        is replaced by a summary of its cluster's member texts; otherwise the
+        extractive medoid text is kept as-is.  No-op when the user already has
+        ``<= target_k`` records.  Thread-safe.
+
+        Returns counts: ``{"before": n, "after": m, "removed": n-m}``.
+        """
+        self._validate_user_id(user_id, op="consolidate_user")
+        if target_k <= 0:
+            raise ValueError("target_k must be positive")
+        from app.intelligence.memory_consolidation import MemoryConsolidator
+        uid = str(user_id)
+        with self._lock:
+            recs = self._records.get(uid, [])
+            vecs = self._embeddings.get(uid, [])
+            before = len(recs)
+            if before <= target_k:
+                return {"before": before, "after": before, "removed": 0}
+            reps, labels = MemoryConsolidator(seed=seed).consolidate(
+                [v.tolist() for v in vecs], target_k
+            )
+            new_recs: List[MemoryRecord] = []
+            new_vecs: List[np.ndarray] = []
+            for j, rep_idx in enumerate(reps):
+                rec = recs[rep_idx]
+                if summarize_fn is not None:
+                    member_texts = [recs[i].normalized_text
+                                    for i, lbl in enumerate(labels) if lbl == labels[rep_idx]]
+                    try:
+                        rec = dataclasses.replace(rec, normalized_text=summarize_fn(member_texts))
+                    except Exception:  # noqa: BLE001 - summary is best-effort
+                        logger.exception("consolidate_user: summarize_fn failed; keeping medoid text")
+                new_recs.append(rec)
+                new_vecs.append(vecs[rep_idx])
+            self._records[uid] = new_recs
+            self._embeddings[uid] = new_vecs
+            self._total = sum(len(v) for v in self._records.values())
+            after = len(new_recs)
+        logger.info("ContextMemoryStore.consolidate_user: user=%s %d -> %d records",
+                    user_id, before, after)
+        return {"before": before, "after": after, "removed": before - after}
 
     def export_user_data(self, user_id: UUID) -> Dict[str, Any]:
         """Return a JSON-serialisable snapshot of every byte stored for ``user_id``.
@@ -1510,42 +1607,10 @@ class OutcomeFeedbackStore:
 
 _VOCAB_SIZE: int = 512  # Fixed dimension for reproducibility
 
-
-def _stable_token_bucket(token: str) -> int:
-    """Map a token to a stable hashing-trick bucket in ``[0, _VOCAB_SIZE)``.
-
-    Uses :func:`zlib.crc32` over the UTF-8 bytes rather than the built-in
-    :func:`hash`.  ``hash()`` for ``str`` is salted per-process via
-    ``PYTHONHASHSEED`` (randomised by default since CPython 3.3), which means
-    the same token maps to *different* buckets in different processes.  That
-    silently corrupts any embedding that is persisted and later compared
-    against a query embedded in a fresh process — exactly the failure mode
-    that broke cross-restart recall in :class:`ContextMemoryStore`.  ``crc32``
-    is deterministic across processes, platforms, and Python versions.
-    """
-    return zlib.crc32(token.encode("utf-8")) % _VOCAB_SIZE
-
-
-def _bow_embed(text: str) -> List[float]:
-    """Lightweight bag-of-words hashing embedding (512-dim, L2-normalised).
-
-    This fallback is used when no ``embed_fn`` is injected.  It provides
-    coarse semantic signal sufficient for development and tests.
-
-    The bucket assignment is **deterministic across processes** (see
-    :func:`_stable_token_bucket`) so that embeddings persisted to disk remain
-    comparable to embeddings computed after a restart.
-
-    Args:
-        text: Input string to embed.
-
-    Returns:
-        A 512-dimensional L2-normalised float list.
-    """
-    vec: List[float] = [0.0] * _VOCAB_SIZE
-    tokens = text.lower().split()
-    for token in tokens:
-        vec[_stable_token_bucket(token)] += 1.0
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
+# The deterministic bag-of-words fallback embedder lives in
+# ``app.core.text_embedding`` so there is a single implementation shared by the
+# context store, the embedding backend, and candidate retrieval.  Re-exported
+# here under the historical private names for backward compatibility.
+from app.core.text_embedding import bow_embed as _bow_embed  # noqa: E402
+from app.core.text_embedding import stable_token_bucket as _stable_token_bucket  # noqa: E402
 

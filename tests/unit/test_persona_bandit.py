@@ -50,3 +50,27 @@ class TestThompsonDirectiveSelector:
             sel.update("t", ARM_HIGH, 1.0)
         s2 = ThompsonDirectiveSelector.from_dict(sel.to_dict())
         assert s2.posterior_means("t") == sel.posterior_means("t")
+
+
+class TestRecommend:
+    def test_recommends_reinforced_pole(self):
+        sel = ThompsonDirectiveSelector(seed=0)
+        for _ in range(5):
+            sel.update("verbosity", ARM_LOW, 1.0)
+        assert sel.recommend("verbosity") == ARM_LOW
+
+    def test_declines_on_thin_evidence(self):
+        sel = ThompsonDirectiveSelector(seed=0)
+        sel.update("t", ARM_HIGH, 1.0)  # only 1 pull < min_pulls
+        assert sel.recommend("t") is None
+
+    def test_declines_when_arms_close(self):
+        sel = ThompsonDirectiveSelector(seed=0)
+        # equal reinforcement -> means equal -> below margin
+        for _ in range(4):
+            sel.update("t", ARM_HIGH, 1.0)
+            sel.update("t", ARM_LOW, 1.0)
+        assert sel.recommend("t", margin=0.1) is None
+
+    def test_unknown_trait_returns_none(self):
+        assert ThompsonDirectiveSelector(seed=0).recommend("never_seen") is None

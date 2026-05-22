@@ -79,3 +79,43 @@ class TestLearnRenderPersist:
     def test_neutral_turn_does_not_learn(self):
         assert pm.learn_from_user_turn("what is the capital of France?") == {}
         assert pm.persona_system_prompt() is None
+
+
+class TestBanditRewardLoop:
+    @pytest.fixture(autouse=True)
+    def _isolated(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SMR_DATA_DIR", str(tmp_path))
+        for attr in ("_store", "_bandit"):
+            monkeypatch.setattr(pm, attr, None, raising=False)
+        for attr in ("_loaded", "_bandit_loaded"):
+            monkeypatch.setattr(pm, attr, False, raising=False)
+        self.tmp_path = tmp_path
+        yield
+        pm._store = None; pm._loaded = False
+        pm._bandit = None; pm._bandit_loaded = False
+
+    def test_turn_signals_reward_bandit(self):
+        from app.personalization.persona_bandit import ARM_LOW
+        for _ in range(5):
+            pm.learn_from_user_turn("please be concise")
+        bandit = pm.get_directive_bandit()
+        assert bandit.recommend("verbosity") == ARM_LOW
+        assert (self.tmp_path / "directive_bandit.json").exists()
+
+    def test_bandit_fallback_supplies_directive_at_high_threshold(self):
+        for _ in range(5):
+            pm.learn_from_user_turn("please be concise")
+        # the estimator alone is silent at 0.95, but the bandit fills it in
+        store = pm.get_persona_memory()
+        persona = store.get_user_persona(pm.DESKTOP_USER_ID)
+        assert persona.render_style_directive(min_confidence=0.95) == ""
+        with_bandit = pm.persona_system_prompt(min_confidence=0.95)
+        assert with_bandit is not None and "concise" in with_bandit
+
+    def test_bandit_survives_restart(self):
+        from app.personalization.persona_bandit import ARM_LOW
+        for _ in range(5):
+            pm.learn_from_user_turn("be concise")
+        pm._bandit = None
+        pm._bandit_loaded = False
+        assert pm.get_directive_bandit().recommend("verbosity") == ARM_LOW
