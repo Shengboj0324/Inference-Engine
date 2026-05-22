@@ -1,4 +1,4 @@
-.PHONY: help install dev-install test lint format clean docker-up docker-down migrate
+.PHONY: help install dev-install test lint format clean docker-up docker-down migrate corpus-gate stress-test
 
 help:
 	@echo "Social Media Radar - Development Commands"
@@ -29,6 +29,10 @@ help:
 	@echo "  make lint          Run linters"
 	@echo "  make format        Format code"
 	@echo "  make type-check    Run type checker"
+	@echo ""
+	@echo "Fine-tune readiness (mirrors .github/workflows/finetune-stress.yml):"
+	@echo "  make corpus-gate   Fast labelling-corpus / manifest / IAA gate (PyYAML only)"
+	@echo "  make stress-test   Full readiness board + full-scale stress + phase-2 tests"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean         Remove generated files"
@@ -91,6 +95,22 @@ format:
 
 type-check:
 	poetry run mypy app
+
+# Fast, dependency-light gate (PyYAML only) — labelling corpus, held-out
+# manifest integrity, IAA at target, and the zero-rule-based-answer-path guard.
+corpus-gate:
+	python scripts/verify_phase1_corpus.py
+	python scripts/check_no_keyword_rules.py
+	python scripts/verify_heldout_manifest.py
+	python scripts/compute_iaa.py --week-ending 2026-05-15 --dry-run
+
+# Full fine-tune stress: 12-check readiness board (strict), full-scale stress
+# (component board + end-to-end pipeline + integrated memory/personalization/
+# self-improvement loop), and the phase-2 unit suite. Requires the dev env.
+stress-test:
+	poetry run python scripts/finetune_readiness.py --strict-deferred
+	poetry run python scripts/stress_test_full.py
+	poetry run pytest tests/evals tests/scripts -q
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +

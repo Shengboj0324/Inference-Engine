@@ -1,0 +1,312 @@
+name: Fine-Tune Stress Tests
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase-1 (labelling corpus) + Phase-2 (fine-tune) stress & readiness gates.
+#
+# This workflow is the CI guardrail for everything the SituationEngine fine-tune
+# depends on. It runs the same gates the training notebook
+# (notebooks/train_situation_engine.ipynb) runs before spending a GPU minute:
+#
+#   * scripts/verify_phase1_corpus.py     — 180+40 labelled corpus integrity
+#   * scripts/check_no_keyword_rules.py   — zero rule-based answer path
+#   * scripts/verify_heldout_manifest.py  — held-out SHA-256 tamper-evidence
+#   * scripts/compute_iaa.py --dry-run    — inter-annotator agreement at target
+#   * scripts/finetune_readiness.py       — 12-check component readiness board
+#   * scripts/stress_test_full.py         — board + e2e pipeline + integrated
+#                                            memory/personalization/self-improve
+#   * pytest tests/evals tests/scripts    — scenario infra, promotion gate,
+#                                            phase-2 stress, quarantine
+#
+# Tiering keeps it fast for unrelated PRs:
+#   - corpus-gate / notebook-validation are dependency-light (PyYAML / stdlib)
+#     and finish in well under a minute.
+#   - finetune-stress does a full Poetry install (incl. torch) because
+#     app/llm/training/lora_trainer.py imports torch at module load, so the
+#     readiness board's QLoRA-config check needs it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "data/scenarios/**"
+      - "data/labelling/**"
+      - "data/training/**"
+      - "app/llm/training/**"
+      - "app/llm/prompts/**"
+      - "app/intelligence/**"
+      - "app/personalization/**"
+      - "app/evals/**"
+      - "app/domain/**"
+      - "app/core/data_residency.py"
+      - "scripts/**"
+      - "notebooks/**"
+      - "docs/labelling/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - ".github/workflows/finetune-stress.yml"
+  push:
+    branches: [main, develop]
+    paths:
+      - "data/scenarios/**"
+      - "data/labelling/**"
+      - "app/llm/training/**"
+      - "app/llm/prompts/**"
+      - "app/intelligence/**"
+      - "app/personalization/**"
+      - "app/evals/**"
+      - "scripts/**"
+      - "notebooks/**"
+      - ".github/workflows/finetune-stress.yml"
+  # Weekly drift / regression sweep, independent of code changes
+  # (mirrors the nightly-judge cadence in docs/intelligence_migration.md §4).
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  # Allow operators to trigger a full run on demand from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      run_full_stress:
+        description: "Run the heavy stress_test_full stage (requires torch install)"
+        type: boolean
+        default: true
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  POETRY_VERSION: "1.7.1"
+  # Settings-import shims (app.core.config requires these at import time).
+  # These are non-secret CI placeholders; the stress tests never make a real
+  # network/LLM call — generators and the judge are mocked.
+  ENCRYPTION_KEY: test-encryption-key-32-chars!!
+  SECRET_KEY: test-secret-key-for-ci-testing-only
+  OPENAI_API_KEY: sk-test-key-for-ci
+  ANTHROPIC_API_KEY: sk-ant-test-key-for-ci
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1) FAST GATE — labelling corpus + manifest + IAA + no-rules guard.
+  #    PyYAML is the only dependency, so this runs in seconds and gives quick
+  #    feedback on data-only PRs without paying for the heavy install.
+  # ───────────────────────────────────────────────────────────────────────────
+  corpus-gate:
+    name: Corpus / Manifest / IAA Gate (fast)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install minimal deps
+        run: pip install "pyyaml>=6.0"
+
+      - name: Static syntax check of phase-1/2 scripts
+        run: |
+          python -m py_compile \
+            scripts/verify_phase1_corpus.py \
+            scripts/finetune_readiness.py \
+            scripts/stress_test_full.py \
+            scripts/stress_test_phase2.py \
+            scripts/build_training_set.py \
+            scripts/compute_iaa.py \
+            scripts/verify_heldout_manifest.py \
+            scripts/run_scenario_eval.py \
+            scripts/promote_checkpoint.py
+          echo "All gate scripts compile."
+
+      - name: Corpus integrity (180 train/val + 40 held-out, schema/offsets/PII)
+        run: python scripts/verify_phase1_corpus.py --repo-root .
+
+      - name: Zero rule-based answer path
+        run: python scripts/check_no_keyword_rules.py
+
+      - name: Held-out manifest tamper-evidence (SHA-256)
+        run: python scripts/verify_heldout_manifest.py
+
+      - name: Inter-annotator agreement at target (latest week, dry-run)
+        run: python scripts/compute_iaa.py --week-ending 2026-05-15 --dry-run
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2) NOTEBOOK VALIDATION — the training notebook stays valid and wired to the
+  #    gate scripts. Pure stdlib (json + ast); no install needed.
+  # ───────────────────────────────────────────────────────────────────────────
+  notebook-validation:
+    name: Training Notebook Validation (fast)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Validate notebook structure, cells, and gate wiring
+        run: |
+          python - <<'PYEOF'
+          import ast, json, sys
+          NB = "notebooks/train_situation_engine.ipynb"
+          nb = json.load(open(NB))
+          assert nb.get("nbformat") == 4, "notebook must be nbformat 4"
+          cells = nb["cells"]
+          codes = [c for c in cells if c["cell_type"] == "markdown" or c["cell_type"] == "code"]
+          code_cells = [c for c in cells if c["cell_type"] == "code"]
+          assert len(cells) >= 20, f"expected a fully-integrated notebook, got {len(cells)} cells"
+
+          # Every pure-Python code cell (no Jupyter magics / shell) must parse.
+          checked = errs = 0
+          for i, c in enumerate(code_cells):
+              src = c["source"] if isinstance(c["source"], str) else "".join(c["source"])
+              if any(l.lstrip().startswith(("!", "%")) for l in src.splitlines()):
+                  continue
+              checked += 1
+              try:
+                  ast.parse(src)
+              except SyntaxError as e:
+                  errs += 1
+                  print(f"  SYNTAX ERROR in code cell {i}: {e}", file=sys.stderr)
+          assert errs == 0, f"{errs} code cell(s) failed to parse"
+
+          # The notebook must wire the gate scripts (orchestration must not drift).
+          blob = json.dumps(nb)
+          for needle in ("scripts/finetune_readiness.py",
+                         "scripts/stress_test_full.py",
+                         "scripts/build_training_set.py",
+                         "scripts/verify_heldout_manifest.py",
+                         "scripts/promote_checkpoint.py"):
+              assert needle in blob, f"notebook no longer references {needle}"
+          print(f"Notebook OK: {len(cells)} cells, {checked} python cells parsed, gate scripts wired.")
+          PYEOF
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3) HEAVY GATE — full component readiness + full-scale stress + unit tests.
+  #    One Poetry install (cached) feeds three named gate steps so each failure
+  #    points at the exact subsystem. No DB/Redis services are needed: every
+  #    generator and the LLM judge are mocked in these paths.
+  # ───────────────────────────────────────────────────────────────────────────
+  finetune-stress:
+    name: Fine-Tune Readiness + Full-Scale Stress
+    runs-on: ubuntu-latest
+    needs: [corpus-gate]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libpq-dev \
+            libgomp1 \
+            libglib2.0-0
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Import smoke test (full training/self-improve/memory/personalization stack)
+        run: |
+          poetry run python - <<'PYEOF'
+          # Confirm the entire fine-tune dependency graph imports cleanly with
+          # the CI env shims set — catches missing symbols / broken __init__ early.
+          import importlib
+          mods = [
+              "app.evals.scenario_loader",
+              "app.evals.scenario_eval",
+              "app.evals.synthetic_scenarios",
+              "app.intelligence.situation_report",
+              "app.intelligence.context_memory",
+              "app.intelligence.calibration",
+              "app.intelligence.reinforcement_learning",
+              "app.intelligence.feedback_processor",
+              "app.llm.training.situation_engine_finetune",
+              "app.llm.training.lora_trainer",
+              "app.llm.training.calibration",
+              "app.llm.training.inferencer",
+              "app.llm.training.promotion",
+              "app.llm.training.situation_prompt",
+              "app.personalization",
+          ]
+          for m in mods:
+              importlib.import_module(m)
+              print(f"  import OK: {m}")
+          print("Full fine-tune stack imports cleanly.")
+          PYEOF
+
+      - name: Build training set from labelled corpus
+        run: |
+          poetry run python scripts/build_training_set.py \
+            --scenarios-root data/scenarios --out-dir data/training
+          wc -l data/training/train.jsonl data/training/val.jsonl
+
+      - name: "Gate A — readiness board (12 checks, --strict-deferred)"
+        run: poetry run python scripts/finetune_readiness.py --strict-deferred
+
+      - name: "Gate B — full-scale stress test (board + e2e pipeline + integrated loop)"
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_full_stress }}
+        run: poetry run python scripts/stress_test_full.py
+
+      - name: "Gate C — phase-2 unit tests (scenario infra, promotion, stress, quarantine)"
+        run: poetry run pytest tests/evals tests/scripts -v --maxfail=1
+
+      - name: Upload stress artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finetune-stress-artifacts
+          path: |
+            data/training/train.jsonl
+            data/training/val.jsonl
+            data/labelling/iaa_log.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4) SUMMARY — single required status check that aggregates all gates.
+  #    Set this job as the branch-protection required check.
+  # ───────────────────────────────────────────────────────────────────────────
+  stress-summary:
+    name: Fine-Tune Stress Summary
+    runs-on: ubuntu-latest
+    needs: [corpus-gate, notebook-validation, finetune-stress]
+    if: always()
+    steps:
+      - name: Aggregate gate results
+        run: |
+          echo "corpus-gate          : ${{ needs.corpus-gate.result }}"
+          echo "notebook-validation  : ${{ needs.notebook-validation.result }}"
+          echo "finetune-stress      : ${{ needs.finetune-stress.result }}"
+          if [ "${{ needs.corpus-gate.result }}" != "success" ] || \
+             [ "${{ needs.notebook-validation.result }}" != "success" ] || \
+             [ "${{ needs.finetune-stress.result }}" != "success" ]; then
+            echo "::error::One or more fine-tune stress gates failed — not fine-tune ready."
+            exit 1
+          fi
+          echo "ALL FINE-TUNE STRESS GATES GREEN — corpus, notebook, and full stress passed."
