@@ -176,6 +176,13 @@ _DEFAULT_EXEMPLAR_BANK_PATH: Path = Path("training/exemplar_bank.json")
 #: Default path for the platform-prior configuration file.
 _DEFAULT_PRIORS_CONFIG_PATH: Path = Path("training/retrieval_config.json")
 
+#: Retrieve-then-rerank pool multiplier (Tier 1.2).  When a cross-encoder
+#: reranker is attached, dense+sparse retrieval fetches ``top_k * this`` high-
+#: recall candidates so the reranker can promote a strong match that the
+#: first-stage ranking buried below the final cut.  Without a reranker the pool
+#: stays at ``top_k`` (byte-identical to the original behaviour).
+_RERANK_POOL_MULTIPLIER: int = 5
+
 
 class SignalCandidate(BaseModel):
     """A candidate signal type with weak prior score."""
@@ -690,10 +697,17 @@ class CandidateRetriever:
         if not observation.embedding or not self.hnsw_index:
             return []
 
+        # Retrieve-then-rerank (Tier 1.2): with a reranker attached, pull a wider
+        # high-recall candidate pool so the cross-encoder can promote a strong
+        # match the first-stage RRF ranking buried below the final cut.  Without
+        # a reranker the pool stays at top_k (unchanged first-stage behaviour).
+        pool_k = (self.top_k * _RERANK_POOL_MULTIPLIER
+                  if self.reranker is not None else self.top_k)
+
         # ── 1. Dense HNSW retrieval ───────────────────────────────────────────
         hnsw_results = self.hnsw_index.search(
             query_vector=observation.embedding,
-            k=self.top_k,
+            k=pool_k,
         )
         dense_indices: List[int] = []
         dense_scores: Dict[int, float] = {}
@@ -718,7 +732,7 @@ class CandidateRetriever:
             entity_kb = {}
 
         expanded_text = _expand_query_with_kb(query_text, entity_kb)
-        sparse_indices = self._sparse_search(expanded_text, k=self.top_k)
+        sparse_indices = self._sparse_search(expanded_text, k=pool_k)
 
         # ── 3. RRF merge ──────────────────────────────────────────────────────
         merged = _rrf_merge([dense_indices, sparse_indices])
@@ -737,7 +751,7 @@ class CandidateRetriever:
         # Candidates are also aggregated per signal type by *max* (not sum), so
         # a signal type backed by many exemplars is not double-counted when
         # ``retrieve_candidates`` later sums the per-source contributions.
-        merged_top = merged[: self.top_k]
+        merged_top = merged[:pool_k]
         max_rrf = max((s for _, s in merged_top), default=0.0)
         best_by_type: Dict[SignalType, Tuple[float, str]] = {}
         for idx, rrf_score in merged_top:

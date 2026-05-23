@@ -85,6 +85,14 @@ class EmbeddingBackend:
         return bow_embed(text, self._dim)
 
     def embed_batch(self, texts: Sequence[str]) -> List[List[float]]:
+        # Use the real model's native batched encode (far faster than per-item)
+        # when available; otherwise fall back to the per-item deterministic path.
+        if self._real is not None and texts:
+            try:
+                mat = self._real.encode(list(texts), normalize_embeddings=True)
+                return [[float(x) for x in row] for row in mat]
+            except Exception:  # noqa: BLE001 - degrade rather than fail
+                logger.exception("EmbeddingBackend: batch encode failed; per-item fallback")
         return [self.embed(t) for t in texts]
 
     def __call__(self, text: str) -> List[float]:

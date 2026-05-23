@@ -166,6 +166,44 @@ def compute_row(items: List[dict]) -> Dict:
     }
 
 
+def signal_type_confusion(items: List[dict]) -> Dict:
+    """Per-class confusion + agreement from double-labelled signal_type pairs.
+
+    Returns a dict with the full confusion matrix (``matrix[a][b]`` = count of
+    items annotator A called *a* and annotator B called *b*), per-class
+    agreement rate, and the top confusable off-diagonal pairs — so guideline
+    work can target the specific classes that get conflated (e.g. the
+    security↔legal disagreement seen in the corpus).
+    """
+    matrix: Dict[str, Dict[str, int]] = {}
+    per_class_total: Dict[str, int] = {}
+    per_class_agree: Dict[str, int] = {}
+    for it in items:
+        a = it["annotator_a"]["signal_type"]
+        b = it["annotator_b"]["signal_type"]
+        matrix.setdefault(a, {})
+        matrix[a][b] = matrix[a].get(b, 0) + 1
+        per_class_total[a] = per_class_total.get(a, 0) + 1
+        if a == b:
+            per_class_agree[a] = per_class_agree.get(a, 0) + 1
+    confusable = []
+    for a, row in matrix.items():
+        for b, n in row.items():
+            if a != b:
+                confusable.append({"a": a, "b": b, "count": n})
+    confusable.sort(key=lambda d: d["count"], reverse=True)
+    per_class_agreement = {
+        c: round(per_class_agree.get(c, 0) / per_class_total[c], 4)
+        for c in per_class_total
+    }
+    return {
+        "n": len(items),
+        "matrix": matrix,
+        "per_class_agreement": per_class_agreement,
+        "top_confusable_pairs": confusable[:10],
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -178,6 +216,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="Compute over items with week_ending >= this date.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the row without appending to the log.")
+    ap.add_argument("--confusion", type=Path, default=None,
+                    help="Write a per-class confusion + agreement report (JSON) "
+                         "to this path (computed over all selected items).")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -190,6 +231,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     row = compute_row(items)
     print(json.dumps(row, indent=2))
+
+    if args.confusion is not None:
+        conf = signal_type_confusion(items)
+        args.confusion.parent.mkdir(parents=True, exist_ok=True)
+        args.confusion.write_text(json.dumps(conf, indent=2), encoding="utf-8")
+        logger.info("wrote confusion report (%d items, %d confusable pairs) to %s",
+                    conf["n"], len(conf["top_confusable_pairs"]), args.confusion)
 
     if not args.dry_run:
         args.log.parent.mkdir(parents=True, exist_ok=True)

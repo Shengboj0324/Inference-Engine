@@ -41,13 +41,16 @@ logger = logging.getLogger("build_training_set")
 
 
 def _to_example(case: ScenarioCase, system_prompt: str) -> TrainingExample:
+    from app.evals.data_quality import score_from_case
     return TrainingExample(
         messages=build_training_messages(
             case.observations, case.gold_report, system_prompt=system_prompt,
         ),
         source=f"internal_label/{case.metadata.guideline_version}/"
                f"{case.scenario_id}",
-        quality_score=None,
+        # P1 — derive a deterministic quality score from governance signals
+        # instead of leaving it NULL (see app.evals.data_quality).
+        quality_score=score_from_case(case),
         contains_pii=False,
         anonymized=True,
     )
