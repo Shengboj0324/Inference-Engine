@@ -37,6 +37,10 @@ CPU-only stages (gates, corpus, memory, personalization, pre-flight, calibration
 md("## 1. Environment")
 code("!nvidia-smi || echo 'no GPU visible (CPU-only stages will still run)'")
 code("""# Pinned versions known to work with Llama 3.1 8B QLoRA on A100.
+# The last three are lightweight pure-Python deps that app modules import
+# eagerly on the fine-tune path (config / cache / monitoring); without them the
+# first `from app...` import raises ImportError. (torch + numpy ship with the
+# Colab GPU runtime; sentence-transformers/hnswlib are optional with fallbacks.)
 %pip install --quiet \\
     "transformers>=4.43,<4.46" \\
     "peft>=0.11,<0.13" \\
@@ -47,6 +51,9 @@ code("""# Pinned versions known to work with Llama 3.1 8B QLoRA on A100.
     "scikit-learn>=1.4" \\
     "scipy>=1.11" \\
     "pydantic>=2.5" \\
+    "pydantic-settings>=2.1" \\
+    "redis>=5.0" \\
+    "prometheus-client>=0.19" \\
     "pyyaml" """)
 code("""from google.colab import drive
 drive.mount('/content/drive')""")
